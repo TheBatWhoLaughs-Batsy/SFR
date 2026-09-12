@@ -406,8 +406,10 @@ There were two divergent `rover.ino`s. This branch carries the one the rig actua
 - Merging the two lineages is a deliberate job, not a merge conflict to resolve blindly.
 - **Yaw trim** (2.4.x): firmware runs the rear wheels at (1∓α) of the base rate; α comes
   from the Pi as `yaw` in `cfg` or a bare `trim` command. Manual α is `yaw_trim_pct`;
-  auto α is `pi/rover/yaw_control.py` closing the loop on the BNO085 heading from the
-  sensor stream. `rover_server.py` needs `stream.py` up for auto; manual works without.
+  `heading` α closes on the BNO085; `track` α cascades the LiDAR standoff into the
+  heading reference (`pi/rover/yaw_control.py`). `rover_server.py` needs `stream.py` up
+  for both; `manual` works without. **Firmware is unchanged between them** — the board
+  only ever receives a number.
   Sign convention and the invert flag are documented in `rover/config.h` and
   `yaw_control.py`; test the sign before trusting a raster to it.
 

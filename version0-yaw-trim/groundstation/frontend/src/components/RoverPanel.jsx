@@ -279,18 +279,28 @@ export default function RoverPanel({
       <Section label="Steering Trim">
         <YawModeSwitch yaw={yaw} onMode={m => sendRover({ cmd: 'rover_yaw_mode', mode: m })}
                        disabled={!roverConnected} />
-        {yaw?.mode === 'auto' ? (
-          <YawAuto yaw={yaw} onZero={() => sendRover({ cmd: 'rover_yaw_zero' })}
-                   onInvert={v => setConfig({ yaw_invert: v })} disabled={!roverConnected} />
-        ) : (
+        {yaw?.mode === 'manual' ? (
           <YawTrim value={cfg?.yaw_trim_pct} onChange={v => setConfig({ yaw_trim_pct: v })}
                    disabled={!roverConnected} />
+        ) : (
+          <YawAuto
+            yaw={yaw}
+            onZero={() => sendRover({ cmd: 'rover_yaw_zero' })}
+            onHoldStandoff={() => sendRover({ cmd: 'rover_standoff_hold' })}
+            onInvert={v => setConfig({ yaw_invert: v })}
+            onStandoffInvert={v => setConfig({ standoff_invert: v })}
+            disabled={!roverConnected} />
         )}
         <p className="text-[10px] leading-relaxed text-[#555]">
-          {yaw?.mode === 'auto'
-            ? 'The IMU heading is held at the reference. Line the rover up parallel first, then ' +
-              'press "this is parallel". The learned value is kept when you switch back to manual. ' +
-              'If the gap gets WORSE after engaging, flip the sign.'
+          {yaw?.mode === 'track'
+            ? 'The LiDAR holds the distance and the IMU holds the heading. Being too far from ' +
+              'the wall becomes a small request to point at it, which the heading loop flies. ' +
+              'Set both references with the rover where you want it. If it drives AWAY from ' +
+              'the target distance, flip the standoff sign.'
+            : yaw?.mode === 'heading'
+            ? 'The IMU heading is held at the reference — this keeps the rover PARALLEL but ' +
+              'cannot fix being in the wrong place: a knock leaves it parallel along a new ' +
+              'line. Use Track to close that. If the drift gets WORSE, flip the heading sign.'
             : 'The two rear wheels are on separate axles, so running one a few percent faster ' +
               'than the other turns the nose. Jog along the wall, watch the gap: if it closes, ' +
               'steer away from the wall; if it opens, steer toward it. One step is 1 %.'}
@@ -455,9 +465,10 @@ function JogKey({ name, held, onBegin, onEnd, disabled }) {
 function YawModeSwitch({ yaw, onMode, disabled }) {
   const mode = yaw?.mode || 'manual';
   const imuOk = !!yaw?.imu_ok;
-  const btn = (m, label) => (
+  const lidarOk = !!yaw?.lidar_ok;
+  const btn = (m, label, blocked) => (
     <button
-      onClick={() => onMode(m)} disabled={disabled || (m === 'auto' && !imuOk)}
+      onClick={() => onMode(m)} disabled={disabled || blocked}
       className={cn('flex-1 px-2 py-1.5 rounded-lg border text-[11px] font-semibold transition-all cursor-pointer',
         mode === m ? 'border-[#4aff8a]/50 bg-[#4aff8a]/10 text-[#4aff8a]'
                    : 'border-white/8 bg-[#0d0d0d] text-[#777] hover:text-white',
@@ -467,30 +478,40 @@ function YawModeSwitch({ yaw, onMode, disabled }) {
   return (
     <div className="flex flex-col gap-1">
       <div className="flex gap-1.5">
-        {btn('manual', 'Manual')}
-        {btn('auto', 'Auto · IMU')}
+        {btn('manual', 'Manual', false)}
+        {btn('heading', 'Heading', !imuOk)}
+        {btn('track', 'Track', !imuOk || !lidarOk)}
       </div>
-      {!imuOk && (
-        <span className="text-[10px] text-[#a06a2a]">
-          No heading from the IMU stream — auto is unavailable. (stream.py: is the BNO085 up?)
+      <div className="flex gap-2 text-[10px]">
+        <span className={imuOk ? 'text-[#4aff8a]/70' : 'text-[#a06a2a]'}>
+          IMU {imuOk ? 'ok' : 'no heading'}
         </span>
-      )}
+        <span className={lidarOk ? 'text-[#4aff8a]/70' : 'text-[#a06a2a]'}>
+          LiDAR {lidarOk ? 'ok' : 'no range'}
+        </span>
+        {(!imuOk || !lidarOk) && (
+          <span className="text-[#555]">— check stream.py on the Pi</span>
+        )}
+      </div>
     </div>
   );
 }
 
-// Auto: read-only view of the loop plus the two things the operator controls
-// — where "parallel" is, and the sign.
-function YawAuto({ yaw, onZero, onInvert, disabled }) {
+// Read-only view of whichever loop is running, plus the references and signs
+// the operator owns. In track mode the standoff row appears.
+function YawAuto({ yaw, onZero, onHoldStandoff, onInvert, onStandoffInvert, disabled }) {
+  const track = yaw?.mode === 'track';
   const a = yaw?.alpha ?? 0;
   const err = yaw?.error_deg ?? 0;
-  const stale = !yaw?.imu_ok;
+  const dErr = yaw?.standoff_err_mm ?? 0;
+  const imuStale = !yaw?.imu_ok;
+  const lidarStale = !yaw?.lidar_ok;
   return (
     <div className="flex flex-col gap-2 p-3 rounded-xl bg-[#0a0a0a]/50 border border-white/5">
       <div className="grid grid-cols-3 gap-2 text-center">
         <div>
           <div className="text-[9px] uppercase tracking-wider text-[#555]">alpha</div>
-          <div className={cn('text-sm font-mono', stale ? 'text-[#a06a2a]' : 'text-[#4aff8a]')}>
+          <div className={cn('text-sm font-mono', imuStale ? 'text-[#a06a2a]' : 'text-[#4aff8a]')}>
             {a > 0 ? '+' : ''}{a}%
           </div>
         </div>
@@ -501,19 +522,46 @@ function YawAuto({ yaw, onZero, onInvert, disabled }) {
           </div>
         </div>
         <div>
-          <div className="text-[9px] uppercase tracking-wider text-[#555]">learned bias</div>
-          <div className="text-sm font-mono text-[#aaa]">{(yaw?.bias ?? 0) > 0 ? '+' : ''}{(yaw?.bias ?? 0).toFixed(1)}%</div>
+          <div className="text-[9px] uppercase tracking-wider text-[#555]">
+            {track ? 'standoff err' : 'learned bias'}
+          </div>
+          <div className={cn('text-sm font-mono',
+            track ? (Math.abs(dErr) > 15 ? 'text-[#ff6a6a]' : 'text-white') : 'text-[#aaa]')}>
+            {track
+              ? `${dErr > 0 ? '+' : ''}${dErr.toFixed(0)} mm`
+              : `${(yaw?.bias ?? 0) > 0 ? '+' : ''}${(yaw?.bias ?? 0).toFixed(1)}%`}
+          </div>
         </div>
       </div>
-      {stale && (
+      {imuStale && (
         <span className="text-[10px] text-[#a06a2a] text-center">
           IMU stale — holding the last alpha, not steering.
         </span>
       )}
-      <NudgeButton onClick={onZero} disabled={disabled || stale}>this is parallel · re-zero heading</NudgeButton>
-      <Check label="Flip sign (auto made it worse)" checked={!!yaw?.invert} onChange={onInvert} disabled={disabled} />
-      <div className="text-[9px] text-[#444] font-mono text-center">
+      {track && lidarStale && (
+        <span className="text-[10px] text-[#a06a2a] text-center">
+          LiDAR stale — holding heading only, distance is not being corrected.
+        </span>
+      )}
+      <NudgeButton onClick={onZero} disabled={disabled || imuStale}>
+        this is parallel · re-zero heading
+      </NudgeButton>
+      {track && (
+        <NudgeButton onClick={onHoldStandoff} disabled={disabled || lidarStale}>
+          hold this distance{yaw?.standoff_mm != null ? ` · ${yaw.standoff_mm.toFixed(0)} mm` : ''}
+        </NudgeButton>
+      )}
+      <Check label="Flip heading sign (it made the drift worse)"
+             checked={!!yaw?.invert} onChange={onInvert} disabled={disabled} />
+      {track && (
+        <Check label="Flip standoff sign (it drives away from the target)"
+               checked={!!yaw?.standoff_invert} onChange={onStandoffInvert} disabled={disabled} />
+      )}
+      <div className="text-[9px] text-[#444] font-mono text-center leading-relaxed">
         yaw {yaw?.yaw_deg == null ? '—' : yaw.yaw_deg.toFixed(2)}° · ref {yaw?.yaw_ref_deg == null ? '—' : yaw.yaw_ref_deg.toFixed(2)}° · board holds {yaw?.board_pct ?? '—'}%
+        {track && (
+          <><br />range {yaw?.standoff_mm == null ? '—' : `${yaw.standoff_mm.toFixed(0)} mm`} · target {yaw?.standoff_ref_mm == null ? '—' : `${yaw.standoff_ref_mm.toFixed(0)} mm`} · lean {(yaw?.psi_deg ?? 0).toFixed(2)}°</>
+        )}
       </div>
     </div>
   );

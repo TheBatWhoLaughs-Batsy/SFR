@@ -253,33 +253,58 @@ wheels on separate axles — right (4/7) and left (12/13). Nothing steers. The c
 when the rear pair turn at different rates, and that is how drift is corrected: see
 "Yaw trim" below.
 
-### Yaw trim — closed loop from the BNO085 (2026-09-12)
+### Steering: three modes (2026-09-12)
 
 `pi/rover/yaw_control.py`. `rover_server.py` subscribes to the sensor stream
-(`--sensors-url`, default `ws://127.0.0.1:9001`) and takes `yaw_deg` from it — the
-BNO085's **game rotation vector** (gyro + accel fusion, no magnetometer, so the steppers
-cannot disturb it; heading is relative to the chip's last reset and drifts slowly). In
-**auto** mode (`rover_yaw_mode`, a command not a config key, so it never survives a
-restart) the loop runs on every board status frame:
+(`--sensors-url`, default `ws://127.0.0.1:9001`) for both `yaw_deg` and `lidar`.
 
-    e     = wrap(yaw − yaw_ref)             deg, CCW positive
-    alpha = Kp·e·dir + bias, clamped ±30    dir = sign of horizontal travel
-    bias += Ki·e·dir·dt                     learns the standing drift
+| mode | feedback | fixes | cannot fix |
+|---|---|---|---|
+| `manual` | none | — | — |
+| `heading` | IMU | travelling slanted | being on the **wrong line** |
+| `track` | IMU + LiDAR | both | — |
 
-and sends `trim` to the board at most 4 Hz, only on change, only while moving
-horizontally; a stale IMU (>1 s) holds the last alpha. `yaw_ref` is captured when auto
-engages and by `rover_yaw_zero` ("this is parallel"). Auto is seeded with the manual
-value; switching back to manual keeps the learned alpha as the new manual value. `yaw_kp`,
-`yaw_ki`, `yaw_invert` are config. **If auto makes the drift worse, flip `yaw_invert`** —
-that is the IMU's mounting sense, and the docstring in `yaw_control.py` shows it
-diverging within seconds when wrong. Simulated against a reversing-drift plant with 0.03°
-IMU noise: learns the rig's −2.5 % bias exactly, worst error ~1° during learning, 0.07°
-steady, ~3 trim sends/s.
+**Why `track` exists.** Heading is unobservable in position. Holding heading keeps the
+rover parallel, so any disturbance that shoves it sideways leaves it running perfectly
+parallel along a *new*, permanently offset line. Observed on the rig; inherent, not a bug.
+`track` cascades the LiDAR standoff into the heading reference:
 
-**Measured on the rig 2026-09-12:** open-loop needs −3 % going right and −2 % going
-left. That decomposes into a −2.5 % reversing part (wheel mismatch) and a ±0.5 %
-non-reversing part (floor/cable); the latter accumulates across a raster, which is why
-the loop exists.
+    d_err = standoff − standoff_ref                     mm, + is too far
+    psi   = clamp(−Kd·d_err·travel·s, ±psi_max)         deg, heading offset
+    e     = wrap(yaw − (yaw_ref + psi))                 deg
+    alpha = clamp(Kp·e·dir + bias)                      percent
+    bias += Ki·e·dir·dt
+
+Being too far becomes a small request to point at the wall, which the inner loop flies.
+**`dir` appears twice, for different reasons**: inner, because the same alpha yaws the
+chassis the opposite way in reverse; outer, because a given heading moves the rover
+sideways the opposite way in reverse. Both automatic. The outer loop is **P-only on
+purpose** — heading→lateral is an integrator, so P already drives the error to zero, and
+a second integrator would fight the inner loop's `bias` for the same authority.
+
+Simulated (6 passes, drift −2.5 %, 0.03° IMU noise, 8 mm LiDAR noise) — after a 40 mm
+sideways shove: `heading` settles **75.5 mm** off the line and stays there; `track`
+returns to **0.0 mm**. Kd sweep: 0.02–0.20 all converge; **0.05 is the default**.
+
+**Degradation is deliberate.** Stale IMU → hold alpha, steer nothing. Stale or implausible
+LiDAR → `track` silently behaves as `heading` (straight, not distance-corrected) rather
+than steering on a bad range. LiDAR samples are deduped by `lidar_seq` (measurements, not
+polls), gated to 40–2000 mm, EMA-filtered, and a single >120 mm jump is rejected unless
+three in a row (then re-acquire).
+
+**Two sign checks on the rig, one flag each, both in the panel.** Engage `heading`: if the
+drift gets worse → `yaw_invert`. Engage `track` offset from the wall: if it drives away
+from the target instead of back → `standoff_invert`. The simulation shows a wrong
+standoff sign diverging from 260 mm to 489 mm in a single pass, so it is obvious, not
+subtle.
+
+Config: `yaw_kp/ki/invert`, `standoff_kd/max_deg/deadband_mm/invert/ref_mm`
+(`standoff_ref_mm` 0 = capture on engage). Mode is a *command* (`rover_yaw_mode`), never
+persisted — the references do not survive a restart either.
+
+**Measured on the rig 2026-09-12:** open-loop needs −3 % right, −2 % left → a −2.5 %
+reversing part (wheel mismatch) plus ±0.5 % non-reversing (floor/cable). The latter
+accumulates across a raster, which is why the loops exist.
 
 ### Yaw trim (firmware 2.4.0, 2026-09-12)
 
@@ -358,7 +383,7 @@ Pi and groundstation are testable without the rig.
 - [x] Rover jog control + position tracking from the controller's own step counter
 - [x] Rover automated grid raster (drives the C-Scan panel's grid; Scan Mode = Rover)
 - [x] Rover yaw trim — open-loop differential rear wheels, Pi-owned value, panel control (2.4.0)
-- [x] Rover yaw closed-loop from the BNO085 game rotation vector (`yaw_control.py`, panel Manual/Auto)
+- [x] Rover steering: `manual` / `heading` (IMU) / `track` (IMU + LiDAR cascade)
 - [x] BNO085 init failure diagnosed: handshake loops were rate-capped below the sensor's
       own report rate, so a sensor left streaming by a previous run starved them. Fixed in
       `bno085.py` (silence features first, drain to empty, handle oversized packets);
