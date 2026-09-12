@@ -1,0 +1,832 @@
+import { saftFocusedProfile, metricOnProfile, gateDepths, dasCFProfile, dmasCFProfile } from './saft';
+import { computeComplexRangeProfile } from './rangeProfile';
+import { windowFn } from './imagingEffects';
+
+const SPEED_OF_LIGHT = 299792458;
+
+// C-scan grid geometry.
+//
+// A C-scan is a rectangular raster of B-scan positions over the wall. Capture
+// follows a boustrophedon ("snake") path so the operator never has to lift and
+// return: start at the bottom-left cell, sweep right along the bottom row, step
+// up one row, sweep back right-to-left, step up, sweep left-to-right, and so on
+// until the grid is full.
+//
+//   iy=2  ┌───◄───◄───◄───┐
+//   iy=1  └───►───►───►───┘
+//   iy=0  ┌───◄───◄───◄───┘        (iy=0 captured first, left-to-right)
+//         ix=0 ............ hCount-1
+//
+// Each captured position stores its own grid_ix / grid_iy, so the plan view
+// stays correct even if the grid dimensions are edited part-way through a scan.
+
+// Snake path: capture order index -> grid cell. Row 0 is the bottom row and
+// runs left-to-right; every subsequent row reverses.
+export function cellForIndex(index, hCount) {
+  const h = Math.max(1, hCount);
+  const iy = Math.floor(index / h);
+  const along = index % h;
+  return { ix: iy % 2 === 0 ? along : h - 1 - along, iy };
+}
+
+// Inverse of cellForIndex.
+export function indexForCell(ix, iy, hCount) {
+  const h = Math.max(1, hCount);
+  const along = iy % 2 === 0 ? ix : h - 1 - ix;
+  return iy * h + along;
+}
+
+// Physical offset of a cell from the bottom-left corner of the grid, in cm.
+export function cellPosition(ix, iy, hStep, vStep) {
+  return { xCm: ix * hStep, yCm: iy * vStep };
+}
+
+// Everything the panel shows about the swept rectangle.
+export function gridStats({ hCount, hStep, vCount, vStep }) {
+  const h = Math.max(1, hCount);
+  const v = Math.max(1, vCount);
+  const width = hStep * (h - 1);
+  const height = vStep * (v - 1);
+  return {
+    total: h * v,
+    width,
+    height,
+    area: width * height,
+    // Sampling is only meaningful once there is more than one line in that axis.
+    hSampled: h > 1,
+    vSampled: v > 1,
+  };
+}
+
+// Gated intensity of one position's range profile, in dB. This is the value a
+// C-scan cell is coloured by: the depth axis collapsed to a single number over
+// the slice the operator selected.
+//
+// Works unchanged on a magnitude-difference profile (bg_sub_mode 'magnitude'),
+// where the per-bin values are dB ratios rather than absolute levels:
+//   - peak: the largest change in the gate -- this is the detector statistic
+//     the 2026-08-28 target A/B actually found the target with (+4.4 dB).
+//   - mean: the average change.
+//   - energy: 10*log10(mean(10^(db/10))), i.e. the mean POWER ratio, since
+//     lin*lin with lin = 10^(db/20) is exactly 10^(db/10). The same expression
+//     is a mean power in absolute mode and a mean power ratio in diff mode, so
+//     no special case is needed.
+export function gatedIntensity(magnitudes, distances, gateStartM, gateEndM, metric) {
+  if (!magnitudes || !distances) return -Infinity;
+  let peak = -Infinity;
+  let sumLin = 0;
+  let sumDb = 0;
+  let count = 0;
+
+  for (let j = 0; j < magnitudes.length && j < distances.length; j++) {
+    if (distances[j] < gateStartM || distances[j] > gateEndM) continue;
+    const db = magnitudes[j];
+    if (db > peak) peak = db;
+    const lin = Math.pow(10, db / 20);
+    sumLin += lin * lin;
+    sumDb += db;
+    count++;
+  }
+  if (count === 0) return -Infinity;
+
+  if (metric === 'energy') return 10 * Math.log10(sumLin / count + 1e-12);
+  if (metric === 'mean') return sumDb / count;
+  return peak;
+}
+
+// A cell whose background could not be resolved is INVALID, not zero. Colouring
+// it like any other cell is the worst available failure: an un-subtracted
+// spectrum sits 20-30 dB above its subtracted neighbours, so it both reads as a
+// huge target and single-handedly sets the dynamic colour limits for the whole
+// grid. These statuses are set by applyBscanBg and consumed here and by the
+// displays, which draw invalid cells in their own colour and exclude them from
+// every scale computation.
+export const BG_STATUS = {
+  OFF: 'off',                  // no background selected, or subtraction disabled
+  OK: 'ok',
+  CLAMPED: 'clamped',          // model applied, but the standoff is outside its span
+  NO_STANDOFF: 'no_standoff',  // model needs a standoff and the cell has none
+  NO_REF: 'no_ref',            // reference selected but unusable
+  SIZE_MISMATCH: 'size_mismatch',
+  NO_SUPERFIT_CELL: 'no_superfit_cell',
+};
+
+// Did the background actually get applied to this cell? 'off' is not an error --
+// nothing was asked for -- but it must not be mixed into a scale with cells that
+// WERE subtracted, so the caller checks the whole population, not each cell.
+export function bgFailed(status) {
+  return status != null && status !== BG_STATUS.OK
+    && status !== BG_STATUS.OFF && status !== BG_STATUS.CLAMPED;
+}
+
+export const BG_STATUS_TEXT = {
+  [BG_STATUS.OFF]: 'no background applied',
+  [BG_STATUS.OK]: 'background applied',
+  [BG_STATUS.CLAMPED]: 'MODEL CLAMPED — standoff outside the captured span',
+  [BG_STATUS.NO_STANDOFF]: 'INVALID — no lidar standoff, model cannot be evaluated',
+  [BG_STATUS.NO_REF]: 'INVALID — reference sweep unusable',
+  [BG_STATUS.SIZE_MISMATCH]: 'INVALID — background numSteps does not match this sweep',
+  [BG_STATUS.NO_SUPERFIT_CELL]: 'INVALID — no Super Fit reference for this cell',
+};
+
+// ── Per-cell values, focused or not ────────────────────────────────────────
+//
+// ONE function producing the number every plan-view cell is coloured by, used
+// by buildCscanGrid (which draws them) and by computeGridScales (which sets the
+// colour limits from them). They used to call gatedIntensity separately; with
+// focusing in the picture that duplication would mean the grid could be drawn
+// with values the scale was not computed from, which is silently a wrong image
+// rather than a crash.
+//
+// FOCUSING IS PER ROW, and only along the row. A C-scan row is a line of
+// positions at one height, which is exactly the geometry lib/saft.js's
+// back-projection assumes; rows are focused independently of each other and
+// never contribute across rows. That is deliberate rather than a simplification
+// -- CLAUDE.md's 2026-08-30 rover diagnosis measured the vertical axis to be a
+// completely different animal from the horizontal one (moving 200 mm sideways
+// costs a few dB of background correlation, moving 150 mm up destroys it
+// entirely, because the standoff walks ~10 mm), so summing across rows would be
+// combining traces that do not describe the same wall.
+//
+// Neighbours are addressed by GRID COLUMN, not by position in the array, so a
+// row with holes in it (an undone cell, a partial raster) still gets the right
+// spacing instead of closing the gap up.
+//
+// A cell whose background failed contributes to nothing: it is un-subtracted
+// and sits 20-30 dB above its neighbours, so letting it into an aperture would
+// smear that error across every cell within half an aperture of it.
+// Focused values, cached per GRID ROW and keyed on the params object's identity.
+//
+// A WeakMap so changing any focus/gate/metric setting (which produces a new
+// params object -- App memoises one) drops the whole cache with it, and so that
+// a params object nobody holds any more takes its cache away. Rows are keyed by
+// grid_iy inside it, and validated by comparing the RECORD IDENTITIES the row is
+// made of, so a stale entry cannot survive a cell being re-captured.
+const FOCUS_CACHE = new WeakMap();
+
+export function computeCellValues(scanData, params) {
+  const gateStartM = params.gateStart / 100;
+  const gateEndM = params.gateEnd / 100;
+  const { metric } = params;
+  const out = new Array(scanData.length).fill(-Infinity);
+  const focus = !!params.focusEnabled && params.focusAperture >= 1;
+
+  if (!focus) {
+    for (let i = 0; i < scanData.length; i++) {
+      const pos = scanData[i];
+      if (!pos) continue;
+      out[i] = gatedIntensity(pos.magnitudes, pos.distances, gateStartM, gateEndM, metric);
+    }
+    return out;
+  }
+
+  const stepM = (params.hStep > 0 ? params.hStep : 1) / 100;
+  const halfAp = Math.floor(params.focusAperture / 2);
+  const method = params.focusMethod || 'saft';
+  const gamma = params.focusGamma != null ? params.focusGamma : 1.0;
+  const coherent = method === 'das_cf' || method === 'dmas_cf';
+
+  let makeWin = null;
+  let kStart = 0;
+  if (coherent) {
+    makeWin = windowFn(params.windowType || 'rectangular', params.kaiserBeta != null ? params.kaiserBeta : 3);
+    kStart = 2 * Math.PI * (params.startFreqHz || 2e9) / SPEED_OF_LIGHT;
+  }
+
+  const rows = new Map();
+  for (let i = 0; i < scanData.length; i++) {
+    const pos = scanData[i];
+    if (!pos || !pos.magnitudes || !pos.distances) continue;
+    if (bgFailed(pos.bg_status)) continue;
+    const iy = pos.grid_iy != null ? pos.grid_iy : 0;
+    let row = rows.get(iy);
+    if (!row) { row = []; rows.set(iy, row); }
+    row.push({
+      i,
+      pos,
+      n: pos.grid_ix != null ? pos.grid_ix : i,
+      magnitudes: pos.magnitudes,
+      distances: pos.distances,
+    });
+  }
+
+  let cache = FOCUS_CACHE.get(params);
+  if (!cache) { cache = new Map(); FOCUS_CACHE.set(params, cache); }
+
+  for (const [iy, traces] of rows) {
+    traces.sort((a, b) => a.n - b.n);
+
+    // A row whose records are the same objects, in the same order, has the same
+    // focused values -- because focusing is PER ROW and only along it, so a row
+    // has no dependency on anything outside itself. That is the invariant this
+    // reuses, and it is the one that matters during a continuous raster: the
+    // live flush rewrites bscanData at 4 Hz, but only the row being driven has
+    // changed, and the completed rows above it were being re-back-projected
+    // every time. Measured on a 1515-cell grid: 46 ms -> ~3 ms for a flush that
+    // touched one row.
+    const prev = cache.get(iy);
+    if (prev && prev.traces.length === traces.length
+        && traces.every((t, k) => prev.traces[k] === t.pos)) {
+      for (let k = 0; k < traces.length; k++) out[traces[k].i] = prev.values[k];
+      continue;
+    }
+
+    // The depth axis is the record's own, so a gate that falls outside it gives
+    // no depths and every cell in the row reads "outside gate" -- the same
+    // answer gatedIntensity gives, rather than a focused image of nothing.
+    const depths = gateDepths(traces[0].distances, gateStartM, gateEndM);
+    if (depths.length === 0) { cache.delete(iy); continue; }
+
+    // The complex profiles the coherent methods need, computed only for a row
+    // that is actually being recomputed -- they are one IFFT per trace and were
+    // previously built for every row on every call, cache hit or not.
+    if (coherent) {
+      for (const t of traces) {
+        const p = t.pos;
+        if (!p.h_cal_real || !p.h_cal_imag) continue;
+        const ns = p.h_cal_real.length;
+        const cp = computeComplexRangeProfile(
+          p.h_cal_real, p.h_cal_imag, ns, p.step_size, p.range_offset, makeWin(ns));
+        t.cre = cp.re;
+        t.cim = cp.im;
+        t.cdists = cp.distances;
+      }
+    }
+
+    const values = new Array(traces.length);
+    for (let k = 0; k < traces.length; k++) {
+      let profile;
+      if (method === 'das_cf') {
+        profile = dasCFProfile(traces, k, depths, stepM, halfAp, gamma, kStart);
+      } else if (method === 'dmas_cf') {
+        profile = dmasCFProfile(traces, k, depths, stepM, halfAp, gamma, kStart);
+      } else {
+        profile = saftFocusedProfile(traces, k, depths, stepM, halfAp);
+      }
+      values[k] = metricOnProfile(profile, metric);
+      out[traces[k].i] = values[k];
+    }
+    cache.set(iy, { traces: traces.map(t => t.pos), values });
+  }
+  return out;
+}
+
+// Fill the grid with gated intensities. Returns a hCount x vCount array indexed
+// [iy * hCount + ix], holding null where nothing has been captured yet. A cell
+// that was captured but has no range bin inside the gate keeps its entry with a
+// non-finite value, so the display can tell "empty" from "gated out"; a cell
+// whose background failed is flagged invalid and contributes to no scale.
+// `cellValues` is optional and is the SAME array computeCellValues would
+// return -- pass it when the caller already has one. It used to be computed
+// here AND in computeGridScales AND again on every animation frame, and with
+// Focus on it is the dominant term in all three: a SAFT back-projection over
+// the aperture, per cell, per gate depth (measured, 1515 cells: 47.3 ms).
+// Computing it once per update and handing it to both is worth more than any
+// micro-optimisation inside it.
+export function buildCscanGrid(scanData, params, cellValues) {
+  const { hCount, vCount } = params;
+  const h = Math.max(1, hCount);
+  const v = Math.max(1, vCount);
+  const cells = new Array(h * v).fill(null);
+
+  let min = Infinity;
+  let max = -Infinity;
+
+  const values = cellValues || computeCellValues(scanData, params);
+
+  for (let i = 0; i < scanData.length; i++) {
+    const pos = scanData[i];
+    // Positions imported from a v4 (linear) B-scan carry no grid indices, so
+    // lay them out along the snake path the current grid describes.
+    const cell = (pos.grid_ix != null && pos.grid_iy != null)
+      ? { ix: pos.grid_ix, iy: pos.grid_iy }
+      : cellForIndex(i, h);
+    if (cell.ix < 0 || cell.ix >= h || cell.iy < 0 || cell.iy >= v) continue;
+
+    const invalid = bgFailed(pos.bg_status);
+    const value = invalid ? NaN : values[i];
+    cells[cell.iy * h + cell.ix] = { value, pos, order: i, invalid, status: pos.bg_status };
+    if (invalid || !isFinite(value)) continue;
+    if (value < min) min = value;
+    if (value > max) max = value;
+  }
+
+  return { cells, hCount: h, vCount: v, min, max, filled: cells.filter(Boolean).length };
+}
+
+// ── Shared colour scale ────────────────────────────────────────────────────
+//
+// ONE set of colour limits for the whole panel, computed from every captured
+// cell rather than from one grid's gated scalars and one row's bins separately.
+// Before this the two panes disagreed by construction: the C-scan grid stretched
+// min..max of the gated values across all cells, while the B-scan pane stretched
+// min..max of every bin in the SELECTED ROW ONLY (and included the unsubtracted
+// background row in that, which crushed every residual into the bottom few
+// percent of the colormap). The same colour meant two different dB in two
+// images shown side by side, and clicking to another row silently re-scaled the
+// one on the right. Now a colour means one dB everywhere.
+//
+// The population is every bin the B-scan pane actually draws -- the whole
+// profile, over all valid cells -- so the two panes are literally scaled to the
+// same pixels. Gated cell values are aggregates over a subset of those bins, so
+// they land inside the same range by construction.
+//
+// Limits are PERCENTILES, not min/max. A range profile has deep interference
+// nulls; after background subtraction it has more of them, and a single bin at
+// -140 dB would otherwise set the bottom of the scale and flatten everything
+// above it. p1..p99.9 keeps a genuine bright return (the top ~5 samples of a
+// 60-cell grid) while ignoring the nulls.
+const SCALE_P_LO = 0.01;
+const SCALE_P_HI = 0.999;
+
+// Percentile limits from an already-collected population of dB values. Sorts in
+// place, so hand it a scratch buffer.
+//
+// A Float64Array sorts NUMERICALLY with no comparator, which is 3.3x faster than
+// the plain-Array-plus-comparator this used to be (measured, 174k values -- the
+// population of a 101x15 grid: 49.4 ms -> 14.8 ms) and gives bit-identical
+// limits, a sort being a sort. The comparator branch is kept because a plain
+// Array sorts LEXICOGRAPHICALLY without one, which would be silently wrong.
+function limitsFrom(vals) {
+  if (vals.length === 0) return { min: -90, max: -20, n: 0, degenerate: true };
+
+  if (ArrayBuffer.isView(vals)) vals.sort(); else vals.sort((a, b) => a - b);
+  const at = (p) => vals[Math.min(vals.length - 1, Math.max(0, Math.round(p * (vals.length - 1))))];
+  let min = at(SCALE_P_LO);
+  let max = at(SCALE_P_HI);
+
+  // Degenerate populations are real and must not produce a divide-by-zero
+  // rainbow: subtracting a Super Fit reference from the very grid it was taken
+  // from gives an exactly-zero residual in every bin (20*log10(1e-12) = -240 dB
+  // everywhere), which is a useful "this is the same data" signal rather than an
+  // error, but there is nothing to stretch.
+  const degenerate = !(max - min > 0.5);
+  if (degenerate) {
+    const mid = (max + min) / 2;
+    min = mid - 0.5;
+    max = mid + 0.5;
+  }
+  return { min, max, n: vals.length, degenerate };
+}
+
+// Does this cell get to vote on a colour scale, and over how many bins? A cell
+// whose background failed is excluded -- it is un-subtracted and would set the
+// top of the scale on its own.
+function cellBinCount(pos) {
+  if (!pos || !pos.magnitudes || !pos.distances) return 0;
+  if (bgFailed(pos.bg_status)) return 0;
+  return Math.min(pos.magnitudes.length, pos.distances.length);
+}
+
+// BOTH bin-domain colour scales in one pass: global, and one per grid row.
+//
+// They were two functions walking the same 174k-value population separately,
+// each building a plain Array by `push` and sorting it with a comparator. This
+// collects into preallocated Float64Arrays (sized from the bin counts, which are
+// known without touching an element, then trimmed to the finite ones) and sorts
+// natively. Measured on a 1515-cell grid: 31.0 + 18.3 ms -> 16 ms for both.
+// The limits are unchanged -- same population, same percentiles, same sort order.
+export function computeBinScales(scanData) {
+  // Pass 1: upper bounds, from lengths only. Non-finite bins are rare, so the
+  // buffers are trimmed rather than counted exactly.
+  let cap = 0;
+  const rowCap = new Map();
+  for (const pos of scanData) {
+    const n = cellBinCount(pos);
+    if (!n) continue;
+    cap += n;
+    const iy = pos.grid_iy != null ? pos.grid_iy : 0;
+    rowCap.set(iy, (rowCap.get(iy) || 0) + n);
+  }
+
+  const all = new Float64Array(cap);
+  let ai = 0;
+  const rows = new Map();
+  for (const [iy, n] of rowCap) rows.set(iy, { buf: new Float64Array(n), i: 0 });
+
+  // Pass 2: fill. Global and per-row share the walk, which is the other half of
+  // what the two separate functions were paying for.
+  for (const pos of scanData) {
+    const n = cellBinCount(pos);
+    if (!n) continue;
+    const r = rows.get(pos.grid_iy != null ? pos.grid_iy : 0);
+    const mags = pos.magnitudes;
+    for (let i = 0; i < n; i++) {
+      const v = mags[i];
+      if (!isFinite(v)) continue;
+      all[ai++] = v;
+      r.buf[r.i++] = v;
+    }
+  }
+
+  const rowLimits = new Map();
+  for (const [iy, r] of rows) rowLimits.set(iy, limitsFrom(r.buf.subarray(0, r.i)));
+  return { global: limitsFrom(all.subarray(0, ai)), rows: rowLimits };
+}
+
+// ONE set of colour limits for the whole panel. Thin wrapper: call
+// computeBinScales directly when both scopes are wanted, which is the normal
+// case and half the work.
+export function computeSharedScale(scanData) {
+  return computeBinScales(scanData).global;
+}
+
+// PER-ROW colour limits: the same percentile treatment, but with the population
+// restricted to one grid row. Keyed by grid_iy, so it survives either capture
+// order (the hand snake climbs from the bottom-left, the rover snake descends
+// from the top-left, and both write the same indices).
+//
+// Why it exists: the global scale is the honest one -- a colour means one dB
+// everywhere -- but on a wall whose standoff varies row to row the wall return
+// itself sets the limits, and every row but the loudest is crushed into the
+// bottom of the colormap. Scoping to a row gives up cross-row comparability to
+// get contrast back inside each one. Both are useful; neither is a better
+// version of the other, which is why it is a toggle rather than a replacement.
+//
+// Data with no grid indices (an imported linear scan) all lands in row 0, so
+// per-row is identical to global there.
+export function computeRowScales(scanData) {
+  return computeBinScales(scanData).rows;
+}
+
+// UNLINKED colour limits for the plan view: the population is the GATED CELL
+// VALUES -- the scalars the grid actually draws -- rather than every bin of
+// every profile.
+//
+// The difference is the whole point of the toggle. The linked scale is built
+// from all bins, gate or no gate, so narrowing the gate onto a quiet depth does
+// not move it: the cells all drop into the bottom of a range still set by the
+// wall return, and the grid goes near-uniformly dark exactly when it is finally
+// being asked the interesting question. Scaling the grid within its own gated
+// values restores the contrast, at the cost of the guarantee the linked scale
+// exists to provide -- a colour then means one dB in the plan view and a
+// different dB in the B-scan beside it, so both panes flag it.
+//
+// Returns global and per-row limits together, because the two scope choices
+// need the same population and it is one pass either way. Cells with no bin
+// inside the gate are skipped, not floored: they are drawn as "gated out" in
+// their own colour and have no value to contribute.
+export function computeGridScales(scanData, params, cellValues) {
+  const all = [];
+  const byRow = new Map();
+  // The same values the grid draws, focusing included -- see computeCellValues.
+  // Shared with buildCscanGrid when the caller passes it in; see there.
+  const values = cellValues || computeCellValues(scanData, params);
+
+  for (let i = 0; i < scanData.length; i++) {
+    const pos = scanData[i];
+    if (!pos || !pos.magnitudes || !pos.distances) continue;
+    if (bgFailed(pos.bg_status)) continue;
+    const v = values[i];
+    if (!isFinite(v)) continue;
+    all.push(v);
+    const iy = pos.grid_iy != null ? pos.grid_iy : 0;
+    let vals = byRow.get(iy);
+    if (!vals) { vals = []; byRow.set(iy, vals); }
+    vals.push(v);
+  }
+
+  const rows = new Map();
+  for (const [iy, vals] of byRow) rows.set(iy, limitsFrom(vals));
+  return { global: limitsFrom(all), rows };
+}
+
+// Roll the per-cell background statuses up into something the panel can show.
+export function bgDiagnostics(scanData) {
+  const counts = {};
+  let invalid = 0;
+  let clamped = 0;
+  let applied = 0;
+  for (const pos of scanData) {
+    const st = pos && pos.bg_status != null ? pos.bg_status : BG_STATUS.OFF;
+    counts[st] = (counts[st] || 0) + 1;
+    if (bgFailed(st)) invalid++;
+    else if (st === BG_STATUS.CLAMPED) { clamped++; applied++; }
+    else if (st === BG_STATUS.OK) applied++;
+  }
+  return { counts, invalid, clamped, applied, total: scanData.length };
+}
+
+// ── Rover raster ───────────────────────────────────────────────────────────
+//
+// Driven by the gantry rather than by hand, the natural origin is the TOP-LEFT
+// corner: the rover sweeps the top row left-to-right, drops one row, sweeps
+// back right-to-left, and so on downwards. That is the mirror image of the
+// hand-held order above, which starts bottom-left and climbs.
+//
+//   row 0 (iy = vCount-1)  ORIGIN ──►───►───►──┐   captured first
+//   row 1 (iy = vCount-2)  ┌──◄───◄───◄────────┘
+//   row 2 (iy = vCount-3)  └──►───►───►──┐
+//
+// Cell coordinates stay in the display's frame (iy = 0 is the bottom row) so
+// the plan view, the export and everything downstream are identical whichever
+// way the raster was driven. Only the capture ORDER differs.
+export function roverCellForIndex(index, hCount, vCount) {
+  const h = Math.max(1, hCount);
+  const v = Math.max(1, vCount);
+  const row = Math.floor(index / h);      // 0 = top row = the origin's row
+  const along = index % h;
+  return { ix: row % 2 === 0 ? along : h - 1 - along, iy: v - 1 - row };
+}
+
+// Capture order for whichever mode is driving the raster.
+export function orderedCellForIndex(index, hCount, vCount, scanMode) {
+  return scanMode === 'rover'
+    ? roverCellForIndex(index, hCount, vCount)
+    : cellForIndex(index, hCount);
+}
+
+// How full each grid ROW is, indexed by rowFromTop (0 = the row the origin
+// sits on, which is iy = vCount-1). A continuous raster emits a row whole, so
+// this -- not a flat capture count -- is what a resume has to read.
+//
+// Counting DISTINCT columns rather than records: re-scanning a row that was
+// stopped part way through re-emits columns it already holds, and two records
+// for one cell is one cell, not two.
+export function roverRowFill(scanData, params) {
+  const h = Math.max(1, params.hCount);
+  const v = Math.max(1, params.vCount);
+  const seen = Array.from({ length: v }, () => new Set());
+  for (const pos of scanData || []) {
+    if (pos == null || pos.grid_ix == null || pos.grid_iy == null) continue;
+    const row = v - 1 - pos.grid_iy;            // rowFromTop
+    if (row < 0 || row >= v) continue;
+    if (pos.grid_ix < 0 || pos.grid_ix >= h) continue;
+    seen[row].add(pos.grid_ix);
+  }
+  return seen.map(s => s.size);
+}
+
+// The row a continuous raster should (re)start on: the first that is not FULL.
+//
+// Resuming on a count of non-empty rows is what silently abandoned a row that
+// was stopped part way through -- the partial row counted as done and the next
+// session began below it, leaving a half-empty row in the middle of the grid
+// with nothing on screen saying so. Measured on the simulator: stopping mid
+// row 1 of a 3-row grid harvested 6 of 11 cells, and the resume started on
+// row 2.
+export function firstIncompleteRoverRow(scanData, params) {
+  const h = Math.max(1, params.hCount);
+  const fill = roverRowFill(scanData, params);
+  for (let r = 0; r < fill.length; r++) if (fill[r] < h) return r;
+  return fill.length;          // every row is full
+}
+
+// Rover-frame target of a grid cell, in mm.
+//
+// `origin` is where the rover has to stand for the grid's top-left corner, in
+// the rover's own frame (x grows right, y grows up). The grid extends right and
+// DOWNWARD from there, so a cell's y is below the origin by however many rows
+// it sits above the bottom of the grid. Steps are cm in the params and mm on
+// the rover, hence the tens.
+export function cellRoverTarget(ix, iy, params, origin) {
+  const v = Math.max(1, params.vCount);
+  return {
+    x_mm: origin.x + ix * params.hStep * 10,
+    y_mm: origin.y - (v - 1 - iy) * params.vStep * 10,
+  };
+}
+
+// The rectangle the rover has to reach, in its own frame. Used to check the
+// grid fits inside the soft limits before a single move is issued -- there are
+// no endstops, so finding out half way through is not an option.
+export function gridRoverExtent(params, origin) {
+  const stats = gridStats(params);
+  return {
+    xMin: origin.x,
+    xMax: origin.x + stats.width * 10,
+    yMin: origin.y - stats.height * 10,
+    yMax: origin.y,
+  };
+}
+
+// ── Continuous row traverse ─────────────────────────────────────────────────
+//
+// A continuous raster drives a whole row in ONE move and bins the sweeps that
+// land along the way, instead of stopping at every cell. See lib/roverTrack.js
+// for why that is now the right thing to do and what bounds it.
+
+// How far past each end of a row the traverse runs, in mm.
+//
+// Two things have to fall OUTSIDE the grid, or they corrupt the cells at the
+// ends of every row:
+//
+//  * THE RAMPS. Position between two status frames is interpolated linearly,
+//    which is exact at constant velocity and wrong by half an acceleration
+//    term while accelerating -- 2.07 mm at 500 mm/s^2 over one 91 ms status
+//    gap, which at a 5 mm pitch is most of a cell. `v^2/2a` is the distance
+//    the ramp itself occupies.
+//  * THE LAST STATUS GAP. A sweep is only binned once a status frame arrives
+//    that brackets it in time (the track never extrapolates), so the final
+//    ~91 ms of a traverse resolves after the rover has already stopped. The
+//    margin makes sure that stretch is overrun rather than grid.
+//
+//  * HALF A CELL PITCH. Cells are keyed by `Math.round((x - originX)/pitch)`,
+//    so everything within half a pitch of the first column's centre lands IN
+//    that column -- including the rig standing still at the row's entry point
+//    waiting for the traverse command to reach the board, and the whole ramp.
+//    An overrun shorter than half a pitch therefore does not put the run-up
+//    outside the grid at all, it files it into the end columns. Measured on
+//    the simulator at 20 mm/s over a 50 mm pitch (overrun 10.4 mm against a
+//    25 mm half-pitch): the end cells absorbed stationary and ramping sweeps
+//    and every cell's reported position came out 7 mm short of its centre.
+//
+// Cheap either way: 35.6 mm at 25 mm/s, 40 mm at 100 mm/s on a 50 mm pitch --
+// a few tenths of a second per row against a row that takes tens of seconds.
+export function traverseOverrun(speedMmS, accelMmS2, hStepMm = 0) {
+  const v = Math.max(0, Number(speedMmS) || 0);
+  const a = Math.max(1, Number(accelMmS2) || 500);
+  const pitch = Math.max(0, Number(hStepMm) || 0);
+  const ramp = (v * v) / (2 * a);
+  const margin = Math.max(10, v * 0.2);
+  // The binning clearance is a floor on the whole overrun, not an addition to
+  // it: the ramp may well already be longer than half a pitch.
+  return Math.max(ramp + margin, pitch / 2 + margin);
+}
+
+// Wall-clock seconds for a single-axis move of `distanceMm`, under the
+// trapezoidal profile the firmware ramps with (motion_core.h). Triangular when
+// the move is too short to reach the axis speed, which the VERTICAL axis
+// usually is: at 25 mm/s and 100 mm/s^2 it takes 6.25 mm just to ramp up and
+// back down, so a 5 mm row step never reaches full speed.
+//
+// This matters because the row change is entirely vertical and vertical is the
+// slow axis. A snake ends row N at `lastX + overrun` and starts row N+1 at
+// `firstX + overrun`, which is the SAME point -- so the move between rows has
+// no X component at all, and its cost is this function plus the arrival gate.
+export function axisMoveSeconds(distanceMm, maxSpeedMmS, accelMmS2) {
+  const d = Math.abs(Number(distanceMm) || 0);
+  const v = Math.max(0.1, Number(maxSpeedMmS) || 25);
+  const a = Math.max(1, Number(accelMmS2) || 100);
+  if (d <= 0) return 0;
+  const rampDist = (v * v) / a;          // accelerate up and back down
+  return d >= rampDist
+    ? (2 * v) / a + (d - rampDist) / v
+    : 2 * Math.sqrt(d / a);
+}
+
+// Seconds to cover `distanceMm` from REST, accelerating to `maxSpeedMmS` and
+// staying there -- no deceleration, because this is the run-up into a row, not
+// a move that stops at the far end.
+//
+// This is the settling a continuous row gets FOR FREE. The traverse starts
+// `overrunMm` outside the grid, so the rig spends this long accelerating and
+// running before the first cell is reached: ~0.45 s at 25 mm/s, 0.40 s at 100,
+// 0.50 s at 150. All of it after the vertical step-down has completed, all of
+// it outside the cells. A static settle on top is redundant unless the mast is
+// actually seen to ring, which is why the extra-settle default is 0.
+export function accelDistanceSeconds(distanceMm, maxSpeedMmS, accelMmS2) {
+  const d = Math.max(0, Number(distanceMm) || 0);
+  const v = Math.max(0.1, Number(maxSpeedMmS) || 25);
+  const a = Math.max(1, Number(accelMmS2) || 500);
+  if (d <= 0) return 0;
+  const accelDist = (v * v) / (2 * a);
+  return d >= accelDist ? v / a + (d - accelDist) / v : Math.sqrt((2 * d) / a);
+}
+
+// Geometry of one continuous row traverse, in the rover's frame.
+//
+// `rowFromTop` counts rows in CAPTURE order (0 = the origin's row, the top
+// one), matching roverCellForIndex: even rows run left to right, odd rows run
+// back right to left. Cell coordinates stay in the display frame, so `iy`
+// still counts up from the bottom and everything downstream is unchanged.
+export function rowTraverse(rowFromTop, params, origin, overrunMm = 0) {
+  const h = Math.max(1, params.hCount);
+  const v = Math.max(1, params.vCount);
+  const r = Math.max(0, Math.min(v - 1, rowFromTop | 0));
+  const dir = r % 2 === 0 ? 1 : -1;
+  const iy = v - 1 - r;
+  const stepMm = params.hStep * 10;
+  const xAt = (ix) => origin.x + ix * stepMm;
+  const firstX = xAt(dir > 0 ? 0 : h - 1);
+  const lastX = xAt(dir > 0 ? h - 1 : 0);
+  return {
+    rowFromTop: r,
+    iy,
+    dir,
+    y_mm: origin.y - r * params.vStep * 10,
+    firstX,
+    lastX,
+    entryX: firstX - dir * overrunMm,
+    exitX: lastX + dir * overrunMm,
+  };
+}
+
+// The rectangle a CONTINUOUS raster actually reaches: the grid plus the
+// overrun at both ends of every row. Checked against the soft limits before a
+// move is issued, exactly like gridRoverExtent -- there are no endstops, and
+// `move_to_mm` clamps silently while still reporting the move `completed`, so
+// a traverse hanging over the end of a rail would raster a row that is not the
+// one on screen and pile duplicate sweeps into the cell at the limit.
+export function gridRoverExtentContinuous(params, origin, overrunMm = 0) {
+  const ext = gridRoverExtent(params, origin);
+  return { ...ext, xMin: ext.xMin - overrunMm, xMax: ext.xMax + overrunMm };
+}
+
+// ── Plan-view layout ────────────────────────────────────────────────────────
+//
+// Shared by the C-scan plan view and by the B-scan pane below it, so the two
+// images line up column for column: the B-scan places each position at the x of
+// the grid cell it was captured at, which is only possible if both derive that
+// x from one function.
+//
+// `projection` selects the scale and, to scale, the placement:
+//   { toScale: false }                              fit the grid inside the plot box
+//   { toScale: true, pxPerCm, leftPx, topPx }       exact scale, exact placement
+//
+// To-scale exists for projecting the plan view back onto the wall it was swept
+// over. Its whole point is that the mapping does NOT depend on the pane size,
+// so the operator tunes one constant here plus the projector's own zoom and the
+// image lands on the real geometry. A fitted scale would silently re-scale
+// whenever the window or the pane split changed, which is exactly what makes an
+// aligned projection drift.
+//
+// `leftPx` / `topPx` place the grid's top-left corner relative to the top-left
+// of the VIEWPORT -- the whole area right of the sidebar -- not of this canvas.
+// `canvasOffset` is where this canvas sits inside that viewport, and subtracting
+// it is what makes the placement hold still when the Live Sweep pane appears or
+// a row's B-scan opens underneath: the canvas moves, the grid does not. Measured
+// from the canvas instead, every pane change would slide the projected image.
+export const CSCAN_PAD = { top: 24, bottom: 38, left: 52, right: 64 };
+
+export function cscanLayout(w, h, params, projection, canvasOffset) {
+  const pad = CSCAN_PAD;
+  const plotW = w - pad.left - pad.right;
+  const plotH = h - pad.top - pad.bottom;
+
+  const hCount = Math.max(1, params.hCount);
+  const vCount = Math.max(1, params.vCount);
+  // A single line in an axis still needs a finite cell size to draw.
+  const cellSpanX = params.hStep > 0 ? params.hStep : 1;
+  const cellSpanY = params.vStep > 0 ? params.vStep : 1;
+  const spanX = hCount * cellSpanX;
+  const spanY = vCount * cellSpanY;
+
+  const fitScale = Math.min(plotW / spanX, plotH / spanY);
+  const toScale = !!(projection && projection.toScale)
+    && Number.isFinite(projection.pxPerCm) && projection.pxPerCm > 0;
+  const scale = toScale ? projection.pxPerCm : fitScale;
+
+  const gridW = spanX * scale;
+  const gridH = spanY * scale;
+
+  // Fitted, the grid is centred in the plot box and the axes get their margins.
+  // To scale it is placed explicitly and may go anywhere on the canvas, so the
+  // clip box is the whole canvas -- reserving margins there would silently
+  // forbid placements the operator asked for.
+  const off = canvasOffset || { x: 0, y: 0 };
+  const leftPx = Number.isFinite(projection && projection.leftPx) ? projection.leftPx : 0;
+  const topPx = Number.isFinite(projection && projection.topPx) ? projection.topPx : 0;
+
+  const originX = toScale ? leftPx - off.x : pad.left + (plotW - gridW) / 2;
+  // Vertical grows upward: iy = 0 sits at the BOTTOM of the grid box, so the
+  // placed TOP edge is originY - gridH.
+  const originY = toScale ? topPx - off.y + gridH : pad.top + (plotH + gridH) / 2;
+
+  const clip = toScale
+    ? { x: 0, y: 0, w, h }
+    : { x: pad.left, y: pad.top, w: plotW, h: plotH };
+
+  return {
+    pad, plotW, plotH, scale, fitScale, toScale, gridW, gridH, originX, originY,
+    clip, canvasOffset: off,
+    cellW: cellSpanX * scale, cellH: cellSpanY * scale,
+    // True when any part of the grid falls outside the box that can show it --
+    // too big, or placed past an edge. The plan view clips and says so rather
+    // than re-fitting, because re-fitting is the silent re-scaling this mode
+    // exists to avoid.
+    overflows: toScale && (
+      originX < clip.x - 0.5 || originX + gridW > clip.x + clip.w + 0.5
+      || originY - gridH < clip.y - 0.5 || originY > clip.y + clip.h + 0.5),
+  };
+}
+
+// Which population the PLAN VIEW's dynamic colour limits come from.
+//
+// Linked, both panes read one set of limits over every bin of every cell, so a
+// colour means the same dB in the grid and in the B-scan beside it. Unlinked,
+// the grid scales within its own GATED cell values instead -- the only way to
+// keep contrast when the gate is narrowed onto a quiet depth -- and the two
+// colour bars stop agreeing, which both of them say on screen.
+//
+// Shared so the panel, the B-scan pane and the projector window cannot pick
+// differently; three copies of this choice would drift, and the projected
+// image disagreeing with the monitor is exactly the failure that would not be
+// noticed until it was on the wall.
+// `focused` forces the unlinked population whatever the toggle says. A focused
+// cell value is a back-projected SUM over an aperture, not a bin of any
+// profile, so it is systematically above the bin-domain limits the linked scale
+// is built from -- linked, every cell would saturate at the top of the colormap
+// the moment focus was switched on. The B-scan pane is NOT focused (focusing is
+// a plan-view reduction, not a change to the records), so it keeps the bin
+// scale and the two genuinely disagree; `effectiveLink` is what both displays
+// are given so they say so.
+export function planViewScales(scaleLink, gridScales, sharedScale, rowScales, focused) {
+  const unlinked = !!gridScales && (focused || scaleLink === 'independent');
+  return {
+    unlinked,
+    effectiveLink: unlinked ? 'independent' : 'linked',
+    global: unlinked ? gridScales.global : sharedScale,
+    rows: unlinked ? gridScales.rows : rowScales,
+  };
+}

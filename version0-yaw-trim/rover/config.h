@@ -1,0 +1,193 @@
+// Rover firmware configuration -- pins, mechanism, and defaults.
+//
+// Everything here is a compile-time DEFAULT. Speeds, accelerations and soft
+// limits are all settable at runtime from the groundstation and persisted, so
+// changing how the rig behaves does not mean reflashing. Only the pin map and
+// the mechanism geometry are genuinely fixed by hardware.
+#pragma once
+
+// ── CNC Shield V3 pin map ───────────────────────────────────────────────────
+// The shield's four driver sockets are labelled X/Y/Z/A. Which socket drives
+// which AXIS is a wiring fact, recorded below under "axis assignment".
+#define PIN_X_STEP   3
+#define PIN_X_DIR    6
+#define PIN_Y_STEP   2
+#define PIN_Y_DIR    5
+#define PIN_Z_STEP   4
+#define PIN_Z_DIR    7
+#define PIN_A_STEP  12
+#define PIN_A_DIR   13
+// Shared driver enable for all four sockets, ACTIVE LOW.
+#define PIN_ENABLE   8
+
+// ── Axis assignment ─────────────────────────────────────────────────────────
+// Confirmed on the rig 2026-08-28 by driving each field and watching the head:
+//
+//   VERTICAL   (up/down)     <- shield socket X          -- leadscrew
+//   HORIZONTAL (left/right)  <- shield sockets Y, Z, A   -- three ganged wheels
+//
+// Note this is the opposite of what the original stepper_testrig2.py header
+// claimed. Trust this comment; it was measured.
+#define AXIS_V 0
+#define AXIS_H 1
+#define NUM_AXES 2
+
+// ── Mechanism ───────────────────────────────────────────────────────────────
+// 200-step motors at 1/8 microstepping.
+#define STEPS_PER_REV 1600.0f
+
+// Vertical: 2 mm pitch x 4 start = 8 mm of travel per revolution.
+#define V_MM_PER_REV 8.0f
+#define V_STEPS_PER_MM (STEPS_PER_REV / V_MM_PER_REV)          // 200.0 exactly
+
+// Horizontal: 66 mm drive wheels (measured; an older comment said 70 -- it was
+// wrong). This one is not exact and is expected to be CALIBRATED at runtime:
+// drive a known long distance, measure it, and scale. The groundstation has a
+// workflow for that, and the corrected value lives on the Pi.
+#define H_WHEEL_DIAMETER_MM 66.0f
+#define H_MM_PER_REV (3.14159265f * H_WHEEL_DIAMETER_MM)       // 207.345
+#define H_STEPS_PER_MM (STEPS_PER_REV / H_MM_PER_REV)          // 7.7166
+
+// ── Direction sense ─────────────────────────────────────────────────────────
+// The firmware defines the coordinate frame for the whole system: POSITIVE
+// steps mean UP on the vertical axis and RIGHT on the horizontal one, matching
+// the groundstation's +X-right / +Y-up convention (which in turn matches the
+// C-scan grid, whose vertical index grows upward).
+//
+// These two flags are the only place that convention meets the wiring. The old
+// firmware drove UP on a negative value and LEFT on a negative value, so the
+// vertical sense is flipped here and the horizontal one is not. Previously this
+// lived on the Pi as invert_x/invert_y; it belongs here, so that step counts on
+// the wire mean the same thing to everyone.
+// Both verified on the rig 2026-08-29 by nudging each axis and watching the
+// head. Y was correct as shipped; X was reversed and is now inverted too.
+#define V_DIR_INVERT false
+#define H_DIR_INVERT true
+// Per-motor flip for the three ganged horizontal wheel motors, on top of
+// H_DIR_INVERT. Set true for whichever socket's wheel runs backwards.
+#define H_INVERT_Y true
+#define H_INVERT_Z true
+#define H_INVERT_A false
+
+// ── Motion defaults, in mm ──────────────────────────────────────────────────
+// Chosen against the real travel (vertical 1 m, horizontal 4 m) so that the
+// stop distance stays small next to a ~100 mm scan span. Stop distance is
+// v^2/(2a): vertical 3.1 mm at full speed and 1.1 mm at jog speed, horizontal
+// 22.5 mm and 3.6 mm.
+//
+// Jog speeds were raised from 5/20 on 2026-08-29 -- held keys felt sluggish next
+// to a nudge, which runs at the much higher max speed. Use a nudge for fine
+// placement; the jog is for getting somewhere.
+#define V_MAX_SPEED_MM_S   25.0f
+#define V_JOG_SPEED_MM_S   15.0f
+#define V_ACCEL_MM_S2     100.0f
+
+#define H_MAX_SPEED_MM_S  150.0f
+#define H_JOG_SPEED_MM_S   60.0f
+#define H_ACCEL_MM_S2     500.0f
+
+// ── Soft limits, in mm ──────────────────────────────────────────────────────
+// There are no endstops on this rig, so these are the ONLY thing standing
+// between a jog and the end of the rail. They are enforced here as well as on
+// the Pi deliberately: the Pi can crash or lose its link, the board cannot.
+// Defaults keep a buffer inside the true mechanical travel.
+#define V_MIN_MM 150.0f      // set from the rig's usable travel, 2026-08-29
+#define V_MAX_MM 850.0f
+#define H_MIN_MM   0.0f
+#define H_MAX_MM 3900.0f     // 4 m of travel, 100 mm of headroom
+
+// ── Timing ──────────────────────────────────────────────────────────────────
+// Step pulses are generated in a fixed-frequency timer ISR, so WiFi servicing
+// in the main loop can never disturb them -- the whole reason the previous
+// firmware had to go deaf while moving.
+//
+// 20 kHz gives 50 us per tick. The budget is set by digitalWrite, which costs
+// roughly a microsecond on this core: a worst-case tick writes 4 step pins low,
+// 4 high (the horizontal axis has three ganged motors) and up to 2 direction
+// pins, so ~10 us of a 50 us budget. Direct port writes would allow a faster
+// ISR; that is the upgrade path if step timing ever proves rough.
+//
+// The fastest axis needs 5000 steps/s (vertical at 25 mm/s) = 4 ticks per step,
+// so an individual interval can quantise by up to 25%. The phase accumulator
+// keeps the AVERAGE rate exact regardless, and average rate is what position
+// depends on -- a stepper's mechanical time constant absorbs the rest.
+#define ISR_HZ 20000.0f
+
+// Ramp updates (accelerate / decelerate / limit checks) run inside the same ISR
+// but only every ISR_HZ/RAMP_HZ ticks, so the trapezoid costs little.
+#define RAMP_HZ 1000.0f
+
+// ── Safety ──────────────────────────────────────────────────────────────────
+// A continuous jog runs until told to stop, so a lost link must not leave the
+// rover driving. The groundstation refreshes the jog while a key is held; if
+// refreshes stop arriving for this long the board decelerates on its own.
+#define JOG_WATCHDOG_MS 500
+
+// Below this speed a decelerating axis is simply stopped, and a move still
+// short of its target creeps at this rate rather than approaching it
+// asymptotically -- that is what guarantees it lands on the exact step.
+#define MIN_SPEED_STEPS_S 20.0f
+
+// A static IP sidesteps DHCP entirely. Uncomment and set these if the board ever
+// associates but fails to get a lease -- the classic symptom is that it works
+// until it is power-cycled and then only comes back after a ROUTER restart,
+// because the AP is still holding a stale lease for its MAC. Pick an address
+// outside the router's DHCP pool.
+//
+// #define USE_STATIC_IP
+#define STATIC_IP      192, 168, 1,  77
+#define STATIC_GATEWAY 192, 168, 1,   1
+#define STATIC_SUBNET  255, 255, 255, 0
+#define STATIC_DNS     192, 168, 1,   1
+
+// How long to wait for a DHCP lease before treating the attempt as failed and
+// starting over. Associating is not the same as being on the network.
+#define DHCP_TIMEOUT_MS 12000
+
+// If the WebSocket stays down this long while WiFi is up, the client is assumed
+// wedged and is torn down and restarted. Without this, a rover_server restart on
+// the Pi -- which happens routinely during development -- can leave the board
+// sitting there with a live WiFi link and a socket that never comes back, and
+// the only remedy is a power cycle.
+#define WS_RECONNECT_FORCE_MS 10000
+
+// ── Protocol / networking ───────────────────────────────────────────────────
+#define FIRMWARE_VERSION "2.4.1"
+
+// ── Yaw trim: differential drive of the rear wheels (added 2.4.0) ───────────
+// Wheel layout, like an auto-rickshaw: one wheel in front, two at the rear.
+//   socket Y = FRONT wheel (single)
+//   socket Z = REAR RIGHT wheel
+//   socket A = REAR LEFT wheel
+// All three are driven; none steers. The chassis yaws when the two rear
+// wheels turn at different rates, so a persistent drift away from parallel is
+// corrected by running one rear wheel a little faster than the other. The
+// front wheel and the axis position both run at the base rate.
+//
+// Trim is a signed percentage of the base rate, pushed by the Pi in `cfg` as
+// "yaw" (the Pi persists it; the board does not). Convention:
+//   yaw > 0  ->  LEFT rear (A) faster, RIGHT rear (Z) slower  ->  nose turns RIGHT
+//   yaw < 0  ->  the opposite                                 ->  nose turns LEFT
+// If the rig turns the wrong way for the sign, flip YAW_TRIM_INVERT rather
+// than re-learning the panel.
+#define YAW_TRIM_MAX_PCT 30
+#define YAW_TRIM_INVERT false
+
+// ── Link self-healing: the ONLY change from 2.0.0 ───────────────────────────
+// Set LINK_STALL_MS to 0 and this build IS 2.0.0.
+#define LINK_STALL_MS 30000
+#define LINK_STALL_MAX_MS 300000
+#define LINK_HARD_RESET_EVERY 3
+#define WIFI_RESET_SETTLE_MS 600
+#define STATUS_INTERVAL_MS 50        // 20 Hz position feedback
+#define CMD_QUEUE_DEPTH 4            // lets the Pi pipeline raster moves
+// 2.4.0: 256 -> 320. A cfg at the extremes of the Pi's CONFIG_BOUNDS plus the
+// new "yaw" field measures 264 bytes; the everyday cfg is ~210. 64 bytes of
+// stack, and the Pi's BOARD_RX_LIMIT is raised to match.
+#define RX_BUFFER_SIZE 320
+#define TX_BUFFER_SIZE 384
+
+// Position is saved to emulated EEPROM only after motion has been settled this
+// long, so a jog does not write flash once per step.
+#define PERSIST_SETTLE_MS 3000
+#define PERSIST_MAGIC 0x52565231UL   // "RVR1"
