@@ -63,8 +63,11 @@
 // head. Y was correct as shipped; X was reversed and is now inverted too.
 #define V_DIR_INVERT false
 #define H_DIR_INVERT true
-// Per-motor flip for the three ganged horizontal wheel motors, on top of
-// H_DIR_INVERT. Set true for whichever socket's wheel runs backwards.
+
+// Per-motor flip for the three ganged horizontal wheel motors, applied on
+// top of H_DIR_INVERT. The rear pair face each other, so they do not all
+// take the same DIR level. Set true for whichever socket runs backwards, and
+// re-verify by nudging 1 mm and watching after any driver is reseated.
 #define H_INVERT_Y true
 #define H_INVERT_Z true
 #define H_INVERT_A false
@@ -144,28 +147,81 @@
 // starting over. Associating is not the same as being on the network.
 #define DHCP_TIMEOUT_MS 12000
 
-// If the WebSocket stays down this long while WiFi is up, the client is assumed
-// wedged and is torn down and restarted. Without this, a rover_server restart on
-// the Pi -- which happens routinely during development -- can leave the board
-// sitting there with a live WiFi link and a socket that never comes back, and
-// the only remedy is a power cycle.
+// ── Network recovery ladder ─────────────────────────────────────────────────
+// See the long note above serviceNetwork() in rover.ino for why this is a
+// ladder. In short: WiFi.status() is the modem's opinion of itself, it latches
+// at WL_CONNECTED after the AP goes away without a clean deauth, and a firmware
+// that trusts it can never re-associate. Each rung below is only reached when
+// every rung above it has already failed.
+
+// Rung 1. If the WebSocket stays down this long while WiFi claims to be up, the
+// client is assumed wedged and is torn down and restarted. Without this, a
+// rover_server restart on the Pi -- which happens routinely during development
+// -- can leave the board sitting there with a live WiFi link and a socket that
+// never comes back.
 #define WS_RECONNECT_FORCE_MS 10000
 
-// ── Protocol / networking ───────────────────────────────────────────────────
-#define FIRMWARE_VERSION "2.4.1"
+// Rung 2. After this many fruitless socket restarts, stop believing the status
+// register and ask the network itself (see NET_USE_PING). ~30 s at the interval
+// above, which is comfortably longer than any legitimate reconnect.
+#define NET_RECYCLE_AFTER_TRIES 3
 
-// ── Yaw trim: differential drive of the rear wheels (added 2.4.0) ───────────
-// Wheel layout, like an auto-rickshaw: one wheel in front, two at the rear.
-//   socket Y = FRONT wheel (single)
-//   socket Z = REAR RIGHT wheel
-//   socket A = REAR LEFT wheel
-// All three are driven; none steers. The chassis yaws when the two rear
-// wheels turn at different rates, so a persistent drift away from parallel is
-// corrected by running one rear wheel a little faster than the other. The
-// front wheel and the axis position both run at the base rate.
+// Ask the DEFAULT GATEWAY whether the network is real, rather than trusting
+// WiFi.status(). This is what separates "the Pi is switched off" (gateway
+// answers -- an everyday state, do nothing but keep knocking) from "the radio
+// is wedged" (gateway silent while the modem insists it is connected).
 //
-// Trim is a signed percentage of the base rate, pushed by the Pi in `cfg` as
-// "yaw" (the Pi persists it; the board does not). Convention:
+// Set to 0 if WiFi.ping() is unavailable on the installed core. The ladder still
+// works without it, but it can no longer tell those two apart and will recycle
+// the radio -- and eventually reset the board -- whenever the Pi is off.
+#ifndef NET_USE_PING
+#define NET_USE_PING 1
+#endif
+
+// Rung 3. No network at all for this long, with every recycle having failed, and
+// the board resets itself. This is the state the firmware could not previously
+// clear by any means, and is why the operator ended up restarting the ROUTER.
+// The reset is refused unless the rig is parked (not moving, nothing queued, no
+// latched E-stop) and the position is written to flash first, so it costs
+// nothing but the boot time. It can never be triggered merely by the Pi being
+// off, because a gateway that answers counts as a live network.
+#define NET_REBOOT_MS 300000
+
+// Consecutive failed sendTXT calls before the link is treated as dead despite
+// the library still reporting it up. 40 status frames at 20 Hz is 2 s, long
+// enough that a transient full TX buffer cannot trip it.
+#define NET_TX_FAIL_LIMIT 40
+
+// Association retry backoff, and the association timeout used from the main
+// loop. The timeout is bounded because connectWiFi() blocks: motion is
+// unaffected (it is generated in the ISR) but the board is deaf to the
+// groundstation for the duration, so it must not be tens of seconds.
+#define NET_WIFI_RETRY_MS 3000
+#define NET_WIFI_RETRY_MAX_MS 20000
+#define NET_ASSOC_TIMEOUT_MS 10000
+
+// Scan and report on every Nth failed association. A scan takes seconds and
+// disturbs an attempt, so it is not run every time -- but it is the only thing
+// that distinguishes "the AP is not there" from "the AP is refusing us", which
+// is the distinction this fault was missing for months.
+#define NET_SCAN_EVERY 4
+
+// ── Protocol / networking ───────────────────────────────────────────────────
+// ── Yaw trim: differential drive of the rear wheels (added 2.5.0) ───────────
+// Wheel layout, like an auto-rickshaw: one wheel in front, two at the rear.
+//   socket Y (pins 2/5)   = FRONT wheel (single)
+//   socket Z (pins 4/7)   = REAR RIGHT wheel
+//   socket A (pins 12/13) = REAR LEFT wheel
+// All three are driven; none steers. The chassis yaws when the two rear wheels
+// turn at different rates, so a persistent drift away from parallel is
+// corrected by running one rear wheel a little faster than the other. The
+// front wheel and the position count both run at the BASE rate, so trim never
+// disturbs the odometry -- the front wheel scrubs slightly instead.
+//
+// Trim is a signed percentage of that base rate, pushed by the Pi in `cfg` as
+// "yaw", or on its own with the `trim` command (which is what the closed loop
+// in pi/rover/yaw_control.py uses, a few times a second while moving). The Pi
+// persists it; the board does not. Convention:
 //   yaw > 0  ->  LEFT rear (A) faster, RIGHT rear (Z) slower  ->  nose turns RIGHT
 //   yaw < 0  ->  the opposite                                 ->  nose turns LEFT
 // If the rig turns the wrong way for the sign, flip YAW_TRIM_INVERT rather
@@ -173,19 +229,30 @@
 #define YAW_TRIM_MAX_PCT 30
 #define YAW_TRIM_INVERT false
 
-// ── Link self-healing: the ONLY change from 2.0.0 ───────────────────────────
-// Set LINK_STALL_MS to 0 and this build IS 2.0.0.
-#define LINK_STALL_MS 30000
-#define LINK_STALL_MAX_MS 300000
-#define LINK_HARD_RESET_EVERY 3
-#define WIFI_RESET_SETTLE_MS 600
+// 2.5.0 = 2.0.0 (the network recovery ladder) + yaw trim + the 2026-09-12
+// wiring. It is NOT the 2.4.x lineage, which carries the same yaw trim on a
+// 2.0.0 that has no ladder -- see the firmware lineage note in CLAUDE.md.
+#define FIRMWARE_VERSION "2.5.0"
 #define STATUS_INTERVAL_MS 50        // 20 Hz position feedback
 #define CMD_QUEUE_DEPTH 4            // lets the Pi pipeline raster moves
-// 2.4.0: 256 -> 320. A cfg at the extremes of the Pi's CONFIG_BOUNDS plus the
+// 2.5.0: 256 -> 320. A cfg at the extremes of the Pi's CONFIG_BOUNDS plus the
 // new "yaw" field measures 264 bytes; the everyday cfg is ~210. 64 bytes of
-// stack, and the Pi's BOARD_RX_LIMIT is raised to match.
+// stack. The Pi's BOARD_RX_LIMIT mirrors this and the two MUST agree, or an
+// oversized command is rejected with nothing but one line in the board log.
 #define RX_BUFFER_SIZE 320
 #define TX_BUFFER_SIZE 384
+
+// De-energise the drivers after this long with no motion. 0 disables the
+// feature, which is the default and the safe choice: an axis that creeps while
+// de-energised is silently in the wrong place, and with no endstop and no
+// encoder there is no way to notice or recover it short of re-declaring the
+// position by hand. Set it (from the panel) if the standstill whine or the
+// holding-current heat matters more than that. Overridden at runtime by `cfg`.
+#define IDLE_DISABLE_MS 0
+
+// Time for a driver to come out of sleep and its coil current to settle before
+// it is asked to step. The A4988 family wakes in about a millisecond.
+#define DRIVER_WAKE_MS 5
 
 // Position is saved to emulated EEPROM only after motion has been settled this
 // long, so a jog does not write flash once per step.

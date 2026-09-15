@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { cn } from '@/lib/utils';
 import { Section, InfoTile } from './Sidebar';
+import { effectiveRating } from '@/lib/sarDetect';
 
-export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled, onBgEnabledChange, svdEnabled, svdK, svdStrength, onSvdEnabledChange, onSvdKChange, onSvdStrengthChange, scaleMode, onScaleModeChange, aperture, onApertureChange, coherent, onCoherentChange, dynRange, onDynRangeChange, maxDepth, onMaxDepthChange, epsilonR, onEpsilonRChange, windowType, onWindowTypeChange, autoStandoff, onAutoStandoffChange, manualStandoffMm, onManualStandoffChange, wallThickness, onWallThicknessChange, refraction, onRefractionChange, viewMode, onViewModeChange, colormap, onColormapChange, onScanAction }) {
+export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled, onBgEnabledChange, svdEnabled, svdK, svdStrength, onSvdEnabledChange, onSvdKChange, onSvdStrengthChange, scaleMode, onScaleModeChange, aperture, onApertureChange, coherent, onCoherentChange, dynRange, onDynRangeChange, maxDepth, onMaxDepthChange, epsilonR, onEpsilonRChange, epsilonSuggestion, windowType, onWindowTypeChange, autoStandoff, onAutoStandoffChange, manualStandoffMm, onManualStandoffChange, wallThickness, onWallThicknessChange, refraction, onRefractionChange, viewMode, onViewModeChange, colormap, onColormapChange, onScanAction, detection, detectProgress, detectError, emptyRefName, onLoadEmptyRef, onClearEmptyRef, handleEnds, onHandleEndsChange, detectMode = 'pipe', onDetectModeChange }) {
   const numPositions = bscanData ? bscanData.length : 0;
 
   // How many cells carry a lidar standoff. The back-projection uses each cell's own
@@ -146,7 +147,8 @@ export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled,
               back-projection assumes, so it controls BOTH the shape of the hyperbola
               being matched (i.e. whether anything focuses at all) and the calibration
               of the depth axis. Until 2026-09-03 there was no such control and the
-              reconstruction ran at the speed of light in air. 4.5 is dry brick. */}
+              reconstruction ran at the speed of light in air. The default 5.4 is the gw2
+              bench's concrete wall; the suggestion below reads it off each scan's back wall. */}
           <EditableField
             label="εr (medium)"
             value={epsilonR}
@@ -168,11 +170,12 @@ export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled,
             </select>
           </div>
         </div>
+        <EpsilonSuggestion suggestion={epsilonSuggestion} epsilonR={epsilonR} onUse={onEpsilonRChange} />
         <div className="grid grid-cols-2 gap-2">
           {/* Operator-measured, because nothing on the rig can infer it. It is what tells
               the layered model where the dielectric STOPS -- beyond the back face it is
               air again, and a uniform-dielectric model puts anything back there at the
-              wrong depth with the wrong hyperbola curvature. 29 cm is THIS bench's wall;
+              wrong depth with the wrong hyperbola curvature. The default 15.2 cm is the gw2 bench's wall;
               re-measure it for any other. Cross-check: the back-face echo should land at
               standoff + √εr × thickness of apparent range. */}
           <EditableField
@@ -271,6 +274,27 @@ export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled,
             against the wall. Uncorrected, focus needs the standoff stable to ~3 mm.
           </div>
         )}
+        {sarResult && sarResult.standoffSource === 'lidar' && sarResult.standoffNegativeN > 0 && (
+          <div className="px-2 py-1.5 rounded-lg border border-amber-500/30 bg-amber-500/5 text-[9px] text-amber-400 leading-relaxed">
+            {sarResult.standoffNegativeN} of {sarResult.standoffN} cells recorded a negative standoff
+            (lowest {sarResult.standoffMinMm.toFixed(1)} mm). A standoff cannot be negative, so the LiDAR
+            offset in the SFCW panel is at least {Math.abs(sarResult.standoffMinMm).toFixed(1)} mm too large
+            and every depth here is shifted. Re-measure it with the aperture flat on the wall. Those cells
+            keep their negative value as a path delay, so they stay consistent with their neighbours.
+          </div>
+        )}
+        {sarResult && sarResult.positionSource === 'grid' && sarResult.missingColumns > 0 && (
+          <div className="px-1 text-[9px] text-[#555555] leading-relaxed">
+            {sarResult.missingColumns} missing column{sarResult.missingColumns === 1 ? '' : 's'} left as
+            {sarResult.missingColumns === 1 ? ' a gap' : ' gaps'} in the aperture. Positions are placed by grid column.
+          </div>
+        )}
+        {sarResult && sarResult.duplicateColumns && (
+          <div className="px-1 text-[9px] text-amber-400/80 leading-relaxed">
+            Several cells share a grid column (more than one row), so positions are taken in
+            capture order and assumed evenly spaced.
+          </div>
+        )}
         {/* The one warning that matters on a scan like rebar1.json, and the reason the
             Max Depth auto-fit is held off while it is lit: fitting to the collapsed
             depth would clear the clip banner and leave nothing on screen explaining a
@@ -355,7 +379,7 @@ export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled,
             bscanParams.maxDepth, where it also clipped the B-scan pane's
             display; that second job is gone and this is the only real one.
             Since 2026-09-03 it is TRUE depth into the wall, not apparent range,
-            so at er 4.5 a 30 cm setting reaches ~63 cm of apparent range. */}
+            so at er 5.4 a 30 cm setting reaches ~70 cm of apparent range. */}
         <EditableField
           label="Max Depth"
           value={maxDepth}
@@ -460,6 +484,82 @@ export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled,
         </div>
       </Section>
 
+      <Section label="Detection">
+        <div className="grid grid-cols-2 gap-1 p-0.5 rounded-lg bg-white/5 border border-white/10">
+          {[['pipe', 'Pipes'], ['seepage', 'Seepage']].map(([m, label]) => (
+            <button
+              key={m}
+              onClick={() => onDetectModeChange && onDetectModeChange(m)}
+              className={cn(
+                'px-2 py-1.5 rounded-md text-xs font-medium transition-all border',
+                detectMode === m
+                  ? 'bg-[#D1855C]/15 border-[#D1855C]/30 text-[#D1855C]'
+                  : 'border-transparent text-white/60 hover:text-white'
+              )}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {detectMode === 'seepage' ? (
+          <SeepageSummary
+            detection={detection && detection.mode === 'seepage' ? detection : null}
+            progress={detectProgress}
+            error={detectError}
+            emptyRefName={emptyRefName}
+          />
+        ) : (
+          <DetectionSummary
+            detection={detection && detection.mode !== 'seepage' ? detection : null}
+            progress={detectProgress}
+            error={detectError}
+            handleEnds={handleEnds}
+            emptyRefName={emptyRefName}
+          />
+        )}
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            onClick={() => onLoadEmptyRef && onLoadEmptyRef()}
+            className={cn(
+              'px-3 py-2 rounded-lg text-xs font-medium bg-white/5 border border-white/10 text-white/70 hover:bg-white/10 hover:text-white transition-all',
+              detectMode === 'seepage' && 'col-span-2'
+            )}
+          >
+            Load empty reference
+          </button>
+          {detectMode !== 'seepage' && (
+            <button
+              onClick={() => onHandleEndsChange && onHandleEndsChange(!handleEnds)}
+              className={cn(
+                'px-3 py-2 rounded-lg text-xs font-medium transition-all border',
+                handleEnds
+                  ? 'bg-[#D1855C]/10 border-[#D1855C]/30 text-[#D1855C]'
+                  : 'bg-white/5 border-white/10 text-white/70 hover:bg-white/10 hover:text-white'
+              )}
+            >
+              {handleEnds ? '\u25cf Handle ends' : 'Handle ends off'}
+            </button>
+          )}
+        </div>
+        {emptyRefName ? (
+          <div className="flex items-center justify-between px-2 py-1 rounded-lg border border-emerald-500/20 bg-emerald-500/5">
+            <span className="text-[9px] text-emerald-400 truncate">Reference: {emptyRefName}</span>
+            <button onClick={() => onClearEmptyRef && onClearEmptyRef()} className="text-[9px] text-white/40 hover:text-white ml-2">clear</button>
+          </div>
+        ) : (
+          <div className="px-1 text-[9px] text-[#555555] leading-relaxed">
+            {detectMode === 'seepage'
+              ? 'No empty reference loaded. Seepage mode needs one: without a same-session empty-wall scan, fixed wall features look exactly like moisture.'
+              : 'No empty reference loaded. A same-session empty-wall scan removes fixed reflectors (rig echoes, wall features) that pass every other test.'}
+          </div>
+        )}
+        <div className="px-1 text-[9px] text-[#555555] leading-relaxed">
+          {detectMode === 'seepage'
+            ? 'Seepage mode looks straight down inside the wall (3 cm below the face to 3 cm above the back face), ignores 8 cm at each end of the scan, and does not use coherence. Provisional: tuned on one seepage scan.'
+            : 'Handle ends shades the truncated-aperture zone at each end of the scan and shows markers there as unresolved. Overscan 15-20 cm past the region of interest.'}
+        </div>
+      </Section>
+
       <Section label="Data">
         {/* Same handler the C-scan panel's Import uses -- SAR reconstructs from the C-scan
             capture list, so loading one here is loading SAR's input. There is no Export:
@@ -533,6 +633,214 @@ function EditableField({ label, value, unit, onChange, min, max, disabled }) {
       )}
       {editing && (
         <div className="absolute bottom-0 left-3 right-3 h-px bg-gradient-to-r from-emerald-500 to-emerald-300 rounded-full" />
+      )}
+    </div>
+  );
+}
+
+// Permittivity suggested from the back-wall echo (lib/permittivityEstimate.js). It only
+// ever SUGGESTS: the operator's field stays the source of truth, and every candidate
+// echo is offered because the strongest one can belong to the rig rather than the wall
+// (on the gw2 bench it does -- see that file's header).
+function EpsilonSuggestion({ suggestion, epsilonR, onUse }) {
+  if (!suggestion || suggestion.status === 'no_data') return null;
+  if (suggestion.status === 'no_thickness') {
+    return (
+      <div className="px-1 text-[9px] text-[#555555] leading-relaxed">
+        Set the wall thickness to get a permittivity suggested from the back-wall echo.
+      </div>
+    );
+  }
+  const round1 = (v) => Math.round(v * 10) / 10;
+  const { best, candidates = [] } = suggestion;
+  const others = candidates.filter((c) => c !== best);
+  const inUse = best && Math.abs(epsilonR - round1(best.epsilonR)) < 1e-9;
+  return (
+    <div className="flex flex-col gap-1.5 px-2 py-1.5 rounded-lg border border-white/8 bg-white/[0.02]">
+      {best ? (
+        <>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[10px] text-white/70">
+              Back wall suggests{' '}
+              <span className="font-mono font-bold text-white">εr {round1(best.epsilonR).toFixed(1)}</span>
+            </span>
+            <button
+              onClick={() => onUse(round1(best.epsilonR))}
+              disabled={inUse}
+              className={cn(
+                'px-2 py-0.5 rounded-md text-[10px] font-medium border transition-all',
+                inUse
+                  ? 'bg-white/2 border-white/5 text-white/30 cursor-default'
+                  : 'bg-[#D1855C]/10 border-[#D1855C]/30 text-[#D1855C] hover:bg-[#D1855C]/20',
+              )}
+            >
+              {inUse ? 'In use' : 'Use'}
+            </button>
+          </div>
+          <span className="text-[9px] text-[#555555] leading-relaxed">
+            Echo {(best.separationM * 100).toFixed(1)} cm of apparent range behind the face,{' '}
+            {Math.abs(best.relDb).toFixed(0)} dB below it, through {suggestion.wallThicknessCm} cm of wall.
+          </span>
+        </>
+      ) : (
+        <span className="text-[9px] text-amber-400/80 leading-relaxed">
+          {suggestion.status === 'implausible'
+            ? 'No back-wall echo lands in the dry masonry range (εr 3–10).'
+            : 'No echo behind the face fits a back wall at this thickness.'}
+        </span>
+      )}
+      {others.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1">
+          <span className="text-[9px] text-[#555555]">Other echoes:</span>
+          {others.map((c) => (
+            <button
+              key={c.separationM}
+              onClick={() => onUse(round1(c.epsilonR))}
+              title={`${(c.separationM * 100).toFixed(1)} cm behind the face, ${Math.abs(c.relDb).toFixed(0)} dB below it`}
+              className={cn(
+                'px-1.5 py-0.5 rounded-md text-[9px] font-mono border transition-all',
+                c.plausible
+                  ? 'border-white/10 text-white/60 hover:text-white hover:bg-white/5'
+                  : 'border-white/5 text-white/30 hover:text-white/60',
+              )}
+            >
+              εr {round1(c.epsilonR).toFixed(1)}
+            </button>
+          ))}
+        </div>
+      )}
+      {best && (
+        <span className="text-[9px] text-[#555555] leading-relaxed">
+          An echo from the rig itself can look like a back wall. Check a known target lands where it physically is.
+        </span>
+      )}
+    </div>
+  );
+}
+
+
+const RATING_STYLE = {
+  confirmed: 'text-[#4ade80] border-[#4ade80]/40 bg-[#4ade80]/10',
+  probable: 'text-amber-400 border-amber-400/40 bg-amber-400/10',
+  unresolved: 'text-white/50 border-white/20 bg-white/5',
+  reference: 'text-white/30 border-white/10 bg-transparent',
+};
+
+// Seepage mode (lib/seepageDetect.js): in-wall patches, not point targets.
+const PATCH_STYLE = {
+  moisture: 'text-sky-300 border-sky-400/40 bg-sky-400/10',
+  unverified: 'text-amber-400 border-amber-400/40 bg-amber-400/10',
+};
+const PATCH_LABEL = { moisture: 'possible moisture', unverified: 'unverified patch' };
+function SeepageSummary({ detection, progress, error, emptyRefName }) {
+  if (progress !== null && progress !== undefined) {
+    return (
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] uppercase tracking-wider text-sky-300 font-medium">Detecting...</span>
+        <span className="text-[10px] font-mono text-white/60">{Math.round(progress * 100)}%</span>
+      </div>
+    );
+  }
+  if (error) return <div className="px-1 text-[9px] text-red-400">Detection failed: {error}</div>;
+  if (!detection) return <div className="px-1 text-[9px] text-[#555555]">No seepage detection yet. Needs a scan with h_cal.</div>;
+  const shown = detection.patches.filter((p) => p.rating !== 'reference');
+  const refN = detection.patches.length - shown.length;
+  const [zA, zB] = detection.depthBand;
+  const signed = (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}`;
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="grid grid-cols-2 gap-2">
+        <InfoTile label={detection.usedReference ? 'Possible moisture' : 'Unverified patches'} value={shown.length} />
+        <InfoTile label="Matched empty" value={detection.usedReference ? refN : '-'} />
+      </div>
+      {!detection.usedReference && (
+        <div className="px-1 text-[9px] text-amber-400/80 leading-relaxed">
+          No empty reference: these patches cannot be told apart from the wall&apos;s own features.
+        </div>
+      )}
+      {shown.length === 0 && (
+        <div className="px-1 text-[9px] text-[#555555]">
+          No in-wall patch above +{detection.thresholdDb} dB spanning {detection.minRows}+ row{detection.minRows === 1 ? '' : 's'} at {zA.toFixed(1)}-{zB.toFixed(1)} cm deep.
+        </div>
+      )}
+      {shown.map((p) => (
+        <div key={p.id} className={cn('flex flex-col gap-0.5 px-2 py-1.5 rounded-lg border', PATCH_STYLE[p.rating])}>
+          <div className="flex items-baseline justify-between">
+            <span className="text-[10px] font-semibold uppercase tracking-wider">{PATCH_LABEL[p.rating]}</span>
+            <span className="text-xs font-mono font-bold">{p.x0.toFixed(1)}-{p.x1.toFixed(1)} cm</span>
+          </div>
+          <div className="text-[9px] font-mono opacity-80">
+            rows {p.rows[0] + 1}-{p.rows[p.rows.length - 1] + 1} ({p.rowCount}), ~{p.depth.toFixed(1)} cm deep ({p.zMin.toFixed(1)}-{p.zMax.toFixed(1)}),
+            {' '}{signed(p.meanDb)} dB over its rows (peak {signed(p.peakDb)})
+            {p.reference ? `, empty scan also bright on ${(p.reference.frac * 100).toFixed(0)}% of it (limit 50%)` : ''}
+            {p.shadowDb != null ? `, back face ${signed(p.shadowDb)} dB` : ''}
+          </div>
+        </div>
+      ))}
+      {refN > 0 && (
+        <div className="px-1 text-[9px] text-[#555555]">
+          {refN} patch{refN === 1 ? '' : 'es'} also present in the empty reference{emptyRefName ? ` (${emptyRefName})` : ''} and not shown.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// What the detector found, rated. Positions are cm along the scan from column 0, depth
+// is below the wall face at the panel's epsilon_r. Width is the -6 dB lateral extent of
+// the focused spot (what the marker is drawn to); the size estimate removes the ~3 cm
+// imaging resolution and floors at 1 cm, so it is approximate.
+function DetectionSummary({ detection, progress, error, handleEnds, emptyRefName }) {
+  if (progress !== null && progress !== undefined) {
+    return (
+      <div className="flex flex-col gap-1">
+        <div className="flex items-center justify-between">
+          <span className="text-[10px] uppercase tracking-wider text-emerald-400 font-medium">Detecting...</span>
+          <span className="text-[10px] font-mono text-white/60">{Math.round(progress * 100)}%</span>
+        </div>
+        <div className="h-1 w-full rounded-full bg-white/5 overflow-hidden">
+          <div className="h-full bg-emerald-500 rounded-full transition-[width] duration-100" style={{ width: `${progress * 100}%` }} />
+        </div>
+      </div>
+    );
+  }
+  if (error) return <div className="px-1 text-[9px] text-red-400">Detection failed: {error}</div>;
+  if (!detection) return <div className="px-1 text-[9px] text-[#555555]">No detection yet. Needs a scan with h_cal.</div>;
+  const rated = detection.targets.map((t) => ({ ...t, eff: effectiveRating(t, handleEnds) }));
+  const shown = rated.filter((t) => t.eff !== 'none' && t.eff !== 'reference');
+  const refN = rated.filter((t) => t.eff === 'reference').length;
+  const nC = shown.filter((t) => t.eff === 'confirmed').length;
+  const nP = shown.filter((t) => t.eff === 'probable').length;
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="grid grid-cols-2 gap-2">
+        <InfoTile label="Confirmed" value={nC} />
+        <InfoTile label="Probable" value={nP} />
+      </div>
+      {shown.length === 0 && (
+        <div className="px-1 text-[9px] text-[#555555]">Nothing above the detection thresholds in {detection.rowsTotal} row{detection.rowsTotal === 1 ? '' : 's'}.</div>
+      )}
+      {shown.map((t) => (
+        <div key={t.x} className={cn('flex flex-col gap-0.5 px-2 py-1.5 rounded-lg border', RATING_STYLE[t.eff])}>
+          <div className="flex items-baseline justify-between">
+            <span className="text-[10px] font-semibold uppercase tracking-wider">{t.eff}</span>
+            <span className="text-xs font-mono font-bold">{t.x.toFixed(1)} cm</span>
+          </div>
+          <div className="text-[9px] font-mono opacity-80">
+            depth {t.depth.toFixed(1)} cm, width {t.widthCm != null ? t.widthCm.toFixed(1) : '-'} cm (est. {t.sizeEstCm != null ? t.sizeEstCm.toFixed(0) : '-'} cm),
+            {' '}{t.testsPassed}/6 tests, {t.rows}/{t.rowsTotal} rows, {t.prominenceDb.toFixed(0)} dB prominent
+            {Math.abs(t.driftCm || 0) > 3.2 ? `, leans ${t.leanDeg.toFixed(1)}° (${t.xBottom.toFixed(1)} to ${t.xTop.toFixed(1)} cm)` : ''}
+            {t.eff === 'unresolved' ? ', inside the end zone' : ''}
+          </div>
+        </div>
+      ))}
+      {refN > 0 && (
+        <div className="px-1 text-[9px] text-[#555555]">
+          {refN} feature{refN === 1 ? '' : 's'} matched the empty reference{emptyRefName ? ` (${emptyRefName})` : ''} and {refN === 1 ? 'is' : 'are'} not shown as targets.
+        </div>
+      )}
+      {detection.rowsTotal === 1 && (
+        <div className="px-1 text-[9px] text-amber-400/80">Single-row scan: the row-support test is trivial, so probable ratings are weaker than on a multi-row scan.</div>
       )}
     </div>
   );

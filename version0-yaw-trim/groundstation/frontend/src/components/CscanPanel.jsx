@@ -7,6 +7,7 @@ import { orderedCellForIndex, gridStats, gridRoverExtent, gridRoverExtentContinu
 import { samplingFor, NOMINAL_SWEEP_MS } from '@/lib/roverTrack';
 import { MIN_MOVE_MS } from '@/hooks/useRoverScan';
 import { listDisplays } from './ProjectorWindow';
+import { pipeOverlay } from '@/lib/detectionOverlay';
 
 const LIDAR_AVG_WINDOW = 20;
 
@@ -33,8 +34,8 @@ export default function CscanPanel({
   scaleScope, onScaleScopeChange, rowScales, showGate, onShowGateChange,
   scaleLink, onScaleLinkChange, gridScales, liveDiag,
   projection, onProjectionChange, projector, onProjectorChange,
+  detection, detectProgress, detectMode, emptyRefName, handleEnds,
   smooth, onSmoothChange, colormap, onColormapChange,
-  keepSweeps, onKeepSweepsChange, memory,
   roverConnected, roverStatus, sendRover, roverScan, roverRowStats, sweepPeriodMs,
   originAnchor,
 }) {
@@ -98,6 +99,10 @@ export default function CscanPanel({
   const canActivate = isConnected && sdrConnected;
   const captured = scanData.length;
   const stats = gridStats(params);
+  // Status for Projection source = SAR detections. Counts only, so no capture test here.
+  const detOverlay = pipeOverlay(detection, params, handleEnds, null,
+    { includeProbable: !!(projection && projection.showProbable) });
+  const rowsWithData = new Set(scanData.filter(p => p && Number.isFinite(p.grid_iy)).map(p => p.grid_iy)).size;
   // Plan-view scale and placement, defaulted so the panel still renders if the
   // prop is absent.
   const proj = projection || { toScale: false, pxPerCm: 8, leftPx: 60, topPx: 80 };
@@ -794,12 +799,16 @@ export default function CscanPanel({
               {continuous && scanning && roverRowStats && (
                 <span className={cn(
                   'text-[10px] leading-relaxed',
-                  roverRowStats.maxHoleRun > 1 ? 'text-amber-400/80' : 'text-white/40',
+                  roverRowStats.maxHoleRun > 1 || roverRowStats.timebase === 'pi'
+                    ? 'text-amber-400/80' : 'text-white/40',
                 )}>
                   Row {roverRowStats.filled}/{roverRowStats.total} cells
                   {' · '}{roverRowStats.perCell.toFixed(1)} sweeps/cell
                   {roverRowStats.maxHoleRun > 0 && ` · hole ${roverRowStats.maxHoleRun}`}
                   {roverRowStats.dropped > 0 && ` · ${roverRowStats.dropped} over cap`}
+                  {/* The Pi or firmware sends no board clock, so positions are
+                      timed on arrival and WiFi jitter can leave holes. */}
+                  {roverRowStats.timebase === 'pi' && ' · no board clock: arrival-timed'}
                 </span>
               )}
             </div>
@@ -1010,12 +1019,14 @@ export default function CscanPanel({
         </button>
       </Section>
 
-      {/* Plan-view focusing. Same synthetic-aperture kernel the 2D Map uses
-          (lib/saft.js, one implementation), applied to each grid ROW on its
-          own -- a row is a line of positions at one height, which is the
-          geometry the back-projection assumes. It reduces each cell to a
-          colour differently; it does not touch the B-scan pane, whose traces
-          stay exactly as recorded. */}
+      {/* Plan-view focusing, applied to each grid ROW on its own -- a row is a
+          line of positions at one height, which is the geometry the
+          back-projection assumes. SAFT is the same incoherent kernel the 2D
+          Map uses (lib/saft.js, one implementation); DAS+CF and DMAS+CF are
+          coherent (phase-based) alternatives available only here, since they
+          need a complex range profile the 2D Map's magnitude-only traces
+          don't carry. All three reduce each cell to a colour differently; none
+          touch the B-scan pane, whose traces stay exactly as recorded. */}
       <Section label="Focus">
         <button
           onClick={() => update('focusEnabled', !focusEnabled)}
@@ -1212,6 +1223,63 @@ export default function CscanPanel({
           scale is the one that can be aligned, because the mapping stops
           depending on the pane size. */}
       <Section label="Projection">
+        {/* What the plan view and the projector window draw. SAR detections shows the
+            scanned cells plus the SAR panel's confirmed pipes, and nothing else. */}
+        <div className="grid grid-cols-2 gap-1.5">
+          {[['grid', 'Grid'], ['detections', 'SAR detections']].map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => onProjectionChange(p => ({ ...p, source: key }))}
+              className={cn(
+                'px-2 py-1.5 rounded-lg text-[10px] font-semibold transition-all border',
+                (proj.source === 'detections' ? 'detections' : 'grid') === key
+                  ? 'bg-[#22d3ee]/10 border-[#22d3ee]/40 text-[#22d3ee]'
+                  : 'bg-white/5 border-white/10 text-white/50 hover:text-white/80',
+              )}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {proj.source === 'detections' && (
+          <div className="space-y-1.5">
+            <button
+              onClick={() => onProjectionChange(p => ({ ...p, showProbable: !p.showProbable }))}
+              className={cn(
+                'w-full px-3 py-1.5 rounded-lg text-[10px] font-semibold transition-all border',
+                proj.showProbable
+                  ? 'bg-[#fbbf24]/10 border-[#fbbf24]/40 text-[#fbbf24]'
+                  : 'bg-white/5 border-white/10 text-white/50 hover:text-white/80',
+              )}
+            >
+              {proj.showProbable ? '● Probable pipes shown (amber)' : 'Show probable pipes'}
+            </button>
+            {detectMode === 'seepage' ? (
+              <div className="px-2 py-1.5 rounded-lg bg-[#f59e0b]/5 border border-[#f59e0b]/30 text-[9px] text-[#f59e0b] leading-relaxed">
+                The SAR panel's detection is in Seepage mode. Switch it to Pipes to project pipes.
+              </div>
+            ) : (
+              <div className="px-2 text-[9px] text-white/50 leading-relaxed">
+                {detectProgress != null
+                  ? `Detecting… ${Math.round(detectProgress * 100)}%`
+                  : !detection
+                    ? 'No detection yet (needs 2+ captured cells in a row).'
+                    : detOverlay.reason === 'geometry'
+                      ? 'Detection is from a different grid pitch; waiting for it to re-run.'
+                      : `${detOverlay.confirmed} confirmed pipe${detOverlay.confirmed === 1 ? '' : 's'}${proj.showProbable ? ` · ${detOverlay.probable} probable` : ''} · rows ${detOverlay.rowsUsed.length} of ${rowsWithData}`}
+                {detection && detOverlay.hiddenAtEnds > 0 && ` · ${detOverlay.hiddenAtEnds} at the scan ends not shown`}
+                <div className="text-white/30">Updates after each row. Detection settings are in the SAR panel.</div>
+              </div>
+            )}
+            {!emptyRefName && detectMode !== 'seepage' && (
+              <div className="px-2 py-1.5 rounded-lg bg-[#f59e0b]/5 border border-[#f59e0b]/30 text-[9px] text-[#f59e0b] leading-relaxed">
+                No empty reference loaded. Fixed wall features (a crevice, rig echoes) can show as
+                confirmed pipes. Load one in the SAR panel.
+              </div>
+            )}
+          </div>
+        )}
+
         <button
           onClick={() => onProjectionChange({ ...proj, toScale: !proj.toScale })}
           className={cn(
@@ -1750,44 +1818,6 @@ export default function CscanPanel({
       </Section>
 
       <Section label="Data">
-        {/* Raw-sweep retention. Every look taken at a cell is stored so the
-            coherent/incoherent toggle stays live against recorded data and the
-            export carries them -- but they are 65-94% of a long scan's memory
-            (measured, 1515 cells: 18.7 MB at 8 looks/cell, 33.8 at 18, 102.3 at
-            64, against a flat 6.5 MB stripped), and that same memory is what the
-            export has to serialise into one JSON string.
-
-            Freeing them keeps the coherent mean, the range profile and every
-            provenance field, so nothing MEASURED is lost -- only incoherent
-            averaging and the per-look export. Turning it off is retroactive,
-            because the cells already captured are where the memory is; turning
-            it back on cannot restore what was freed. */}
-        <button
-          onClick={() => onKeepSweepsChange && onKeepSweepsChange(!keepSweeps)}
-          className={cn(
-            'w-full px-3 py-2 rounded-lg text-xs font-medium transition-all border',
-            keepSweeps
-              ? 'bg-[#6B9BD2]/10 border-[#6B9BD2]/40 text-[#6B9BD2]'
-              : 'bg-amber-500/10 border-amber-500/40 text-amber-400',
-          )}
-        >
-          {keepSweeps ? '● Keep raw sweeps' : 'Free raw sweeps'}
-        </button>
-        {memory && memory.cells > 0 && (
-          <div className="grid grid-cols-2 gap-2">
-            <InfoTile label="Looks" value={String(memory.looks)}
-              sub={memory.stored < memory.looks ? `${memory.stored} still held` : 'all held'} />
-            <InfoTile label="Scan RAM" value={`${memory.mb.toFixed(1)} MB`}
-              sub={memory.fullMb - memory.mb > 0.5 ? `${memory.fullMb.toFixed(1)} MB if held` : null}
-              warn={memory.mb > 60} />
-          </div>
-        )}
-        {!keepSweeps && procParams && procParams.avgMode === 'incoherent' && (
-          <div className="px-2 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/20 text-[9px] leading-relaxed text-amber-300/80">
-            Averaging is set to incoherent, but cells with their raw looks freed can
-            only be combined coherently — those cells ignore the setting.
-          </div>
-        )}
         <div className="grid grid-cols-2 gap-2">
           <button
             onClick={() => onScanAction('export')}

@@ -79,7 +79,7 @@ const ADC_COLD_COUNTS = 60;
 const LIDAR_CARRY_MS = 1000;      // must match App.jsx
 const STALE_DEBOUNCE_MS = 2000;
 
-export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcwStatus, sendSdr, params, onParamsChange, coherenceResult, adcPeak, rangeScale, onRangeScaleChange, scaleRange, onScaleRangeChange, getDynamicScale, lidarMm, bgModel, bgRef, bgCapturing, onCaptureBg, onLoadBgModel, onClearBg, bgSubMode, onBgSubModeChange,
+export default function SfcwPanel({ rangeOffsetMismatch, emptySweeps, isConnected, sdrConnected, sfcwRunning, sfcwStatus, sendSdr, params, onParamsChange, coherenceResult, adcPeak, rangeScale, onRangeScaleChange, scaleRange, onScaleRangeChange, getDynamicScale, lidarMm, bgModel, bgRef, bgCapturing, onCaptureBg, onLoadBgModel, onClearBg, bgSubMode, onBgSubModeChange,
   bgDiag, bgStats, onResetBgStats, lidarProvenance, lidarOffsetMm, onLidarOffsetChange }) {
   const { startFreq, stopFreq, stepSize, numBuffers, settleCount, tx1Gain, rx1Gain, tx2Gain, rx2Gain, rangeOffset } = params;
   const [coherenceRunning, setCoherenceRunning] = useState(false);
@@ -105,6 +105,16 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
   useEffect(() => {
     if (coherenceResult) setCoherenceRunning(false);
   }, [coherenceResult]);
+
+  // Never stay on "Running..." forever: 100 sweeps take ~2-3 s, and the
+  // server refuses the request outright while a sweep is running (its
+  // 'error' reply is routed into coherenceResult by App.jsx). 30 s is far
+  // beyond any legitimate run.
+  useEffect(() => {
+    if (!coherenceRunning) return undefined;
+    const t = setTimeout(() => setCoherenceRunning(false), 30000);
+    return () => clearTimeout(t);
+  }, [coherenceRunning]);
 
   useEffect(() => {
     if (lidarMm == null) return;
@@ -300,6 +310,27 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
           min={0}
           max={10}
         />
+        {/* A Pi on an older branch can ignore the pushed offset and keep its own default
+            (0.5 on several). App.jsx records this panel's value on every result and
+            re-pushes; this says it is happening, because it means the Pi needs updating. */}
+        {rangeOffsetMismatch && (
+          <div className="px-2 py-1.5 rounded-lg border border-amber-500/30 bg-amber-500/5 text-[9px] text-amber-400 leading-relaxed">
+            The Pi is sweeping with a range offset of {rangeOffsetMismatch.pi} m and has not taken
+            this panel's {rangeOffsetMismatch.panel} m. Results are recorded with the panel's value and
+            the tab that started the sweep re-sends it every 5 s. If this persists, another open tab or
+            groundstation is pushing a different offset.
+          </div>
+        )}
+        {/* sweep_mode 'dsp': a failed FPGA read comes back as an all-zero sweep, which
+            App.jsx drops before anything displays or records it. This says so. */}
+        {emptySweeps?.count > 0 && (
+          <div className="px-2 py-1.5 rounded-lg border border-amber-500/30 bg-amber-500/5 text-[9px] text-amber-400 leading-relaxed">
+            {emptySweeps.count} empty DSP sweep{emptySweeps.count === 1 ? '' : 's'} dropped this run
+            (the FPGA read failed; nothing was displayed or recorded from them). The Pi console says
+            why. If it climbs with every sweep, run check_bit6.py: the loaded FPGA image is probably
+            not v15, e.g. after a power cycle.
+          </div>
+        )}
       </Section>
 
       {/* Distance */}
@@ -417,6 +448,13 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
           range-profile noise floor for every step at once — keep RX2 peak in the green band.
         </span>
         <AdcHeadroom adcPeak={adcPeak} />
+        {/* dsp mode never sees raw samples, so there is no ADC peak to show. */}
+        {!adcPeak && sfcwStatus?.sweep_mode === 'dsp' && (
+          <span className="text-[9px] text-[#bb8800] leading-tight px-1 pt-0.5">
+            ADC headroom is not measured in dsp sweep mode (the FPGA returns results, not
+            samples). Set and check gains in nios mode first.
+          </span>
+        )}
       </Section>
 
       {/* Sweep Info */}
@@ -623,9 +661,14 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
               : 'bg-white/2 border border-white/5 text-white/20 cursor-not-allowed'
           )}
         >
-          {coherenceRunning ? 'Running (3 sweeps)...' : 'Run Coherence Test'}
+          {coherenceRunning ? 'Running (100 sweeps)...' : 'Run Coherence Test'}
         </button>
-        {coherenceResult && (
+        {coherenceResult?.error && (
+          <div className="mt-2 text-[10px] text-[#f59e0b] px-1">
+            {coherenceResult.error}
+          </div>
+        )}
+        {coherenceResult && !coherenceResult.error && (
           <div className="mt-2 space-y-1">
             <div className="grid grid-cols-2 gap-2">
               <InfoTile
@@ -636,11 +679,27 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
                 label="Correlation"
                 value={coherenceResult.avg_correlation?.toFixed(3)}
               />
+              <InfoTile
+                label="Min corr"
+                value={coherenceResult.min_correlation?.toFixed(3)}
+              />
+              <InfoTile
+                label="S_repeat"
+                value={Number.isFinite(coherenceResult.s_repeat_db)
+                  ? `${coherenceResult.s_repeat_db.toFixed(1)} dB`
+                  : '--'}
+              />
             </div>
             <div className="text-[9px] text-[#555] px-1 space-y-0.5">
-              <div>Repeatability: {coherenceResult.repeatability?.map(r => r.toFixed(3)).join(', ')}</div>
-              <div>Correlation: {coherenceResult.correlation?.map(c => c.toFixed(3)).join(', ')}</div>
-              <div className="text-[#777] mt-1">1.0 = perfect, {'>'} 0.9 = good</div>
+              <div>
+                {coherenceResult.num_sweeps} of {coherenceResult.requested_sweeps ?? coherenceResult.num_sweeps} sweeps scored
+                {coherenceResult.sweep_cores && (
+                  <> ({Object.entries(coherenceResult.sweep_cores).map(([k, v]) => `${k}: ${v}`).join(', ')})</>
+                )}
+              </div>
+              <div className="text-[#777] mt-1">
+                correlation 1.0 = perfect, {'>'} 0.9 = good; S_repeat: signal over adjacent-sweep difference
+              </div>
             </div>
           </div>
         )}

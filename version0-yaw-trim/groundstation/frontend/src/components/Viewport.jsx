@@ -1,7 +1,8 @@
-import { useState, useRef, useEffect } from 'react';
+import { useRef, useEffect, useState, lazy, Suspense } from 'react';
 import { cn } from '@/lib/utils';
-import { Activity, Radio, Radar, ScanLine, Grid3x3, Map, Zap, Brain, FlaskConical, Move, X, Layers } from 'lucide-react';
+import { Activity, Radio, Radar, ScanLine, Grid3x3, Map, Zap, Brain, FlaskConical, Move, X, ChevronLeft, ChevronRight, Box, Locate } from 'lucide-react';
 import ImuDisplay from './ImuDisplay';
+import { HandheldPositionReadout, HandheldLidarReadout, ImuReadout } from './HandheldReadouts';
 import WaveformDisplay from './WaveformDisplay';
 import ReceiverDisplay from './ReceiverDisplay';
 import FftDisplay from './FftDisplay';
@@ -13,8 +14,11 @@ import MapDisplay from './MapDisplay';
 import BgModelDisplay from './BgModelDisplay';
 import ImagingDisplay from './ImagingDisplay';
 import RoverDisplay from './RoverDisplay';
-import TomoDisplay from './TomoDisplay';
+import HandheldScanDisplay from './HandheldScanDisplay';
 import { planViewScales } from '@/lib/cscanGrid';
+
+// three.js is only pulled in when the operator opens the 3D view.
+const SarWall3D = lazy(() => import('./SarWall3D'));
 
 // What the automated raster is doing, for the badge over the plan view.
 const ROVER_PHASE_TEXT = {
@@ -27,6 +31,7 @@ const ROVER_PHASE_TEXT = {
 export default function Viewport({
   activePanel,
   isConnected,
+  sweepPeriodMs,
   imuData,
   txActive,
   rxActive,
@@ -48,6 +53,7 @@ export default function Viewport({
   bscanBgSubMode,
   cscanSharedScale,
   bscanParams,
+  cscanFocusParams,
   bscanCapturing,
   roverScan,
   bscanScaleMode,
@@ -61,15 +67,21 @@ export default function Viewport({
   bscanScaleLink,
   cscanRowScales,
   cscanGridScales,
-  cscanCellValues,
   sarResult,
   sarProgress,
   sarScaleMode,
   sarDynRange,
   sarViewMode,
   sarColormap,
-  tomoResult,
-  tomoProgress,
+  sarDetection,
+  sarDetectProgress,
+  sarHandleEnds,
+  sarRows,
+  sarActiveRow,
+  onSarRowStep,
+  cscanSelectedCell: selectedCell,
+  onCscanSelectCell,
+  onCscanCloseRow,
   mapBscanData,
   mapGateStart,
   mapGateEnd,
@@ -87,13 +99,18 @@ export default function Viewport({
   roverStatus,
   roverTrail,
   roverLog,
+  handheldPose,
+  hhScanData,
+  hhScanParams,
+  hhScanReady,
 }) {
-  // Which C-scan cell the B-scan pane is showing the row for; null follows the
-  // most recent capture.
-  // Null means the C-scan plan view has the whole viewport to itself, which is
-  // the default: the grid is the image, and the B-scan is a detail view of one
-  // row of it that the operator opens by clicking a cell and closes again.
-  const [selectedCell, setSelectedCell] = useState(null);
+  // SAR panel: image vs 3D digital twin of the wall. Off by default.
+  const [sar3d, setSar3d] = useState(false);
+  // `selectedCell` (the cscanSelectedCell prop) is which C-scan cell the B-scan
+  // pane is showing the row for. It lives in App.jsx because the SAR panel follows
+  // the selected row. Null means the C-scan plan view has the whole viewport to
+  // itself, which is the default: the grid is the image, and the B-scan is a detail
+  // view of one row of it that the operator opens by clicking a cell and closes again.
   // The plan view's current layout, published every frame so the B-scan pane
   // below can put each position under the grid cell it came from.
   const cscanLayoutRef = useRef(null);
@@ -104,7 +121,20 @@ export default function Viewport({
   const cscanRootRef = useRef(null);
   // Called unconditionally, before any of the per-panel early returns -- hooks cannot
   // live inside those branches. Idles to null whenever the SFCW pane is not the one up.
-  const sweepRate = useSweepRate(sfcwResult, activePanel === 'sfcw' && (sfcwRunning || !!sfcwResult));
+  // The sweep rate is measured in App.jsx from EVERY sfcw_result, before the
+  // ~20 Hz live-display throttle. It must not be derived from `sfcwResult` here:
+  // that state is only set inside the throttle gate, so this header would report
+  // the DISPLAY rate while claiming to report the radar's. The two alias badly --
+  // a 50 ms gate against a 27.9 ms sweep passes exactly every other one, so a
+  // healthy 35.9 Hz radar read 17.9 Hz, which is indistinguishable from the
+  // ~18 Hz a board that has reverted to the stock FPGA image actually runs at
+  // (see CLAUDE.md, "The 18 Hz regression"). That collision cost a real
+  // debugging session: the FPGA was reloaded, the wire measured at 35.9 Hz, and
+  // the readout did not move. Keep this on the unthrottled measurement.
+  const sweepActive = activePanel === 'sfcw' && (sfcwRunning || !!sfcwResult);
+  const sweepRate = (sweepActive && sweepPeriodMs > 0)
+    ? { ms: sweepPeriodMs, hz: 1000 / sweepPeriodMs }
+    : null;
 
   if (!activePanel) {
     return (
@@ -122,23 +152,72 @@ export default function Viewport({
     );
   }
 
-  if (activePanel === 'imu') {
+  if (activePanel === 'handheldscan') {
+    const live = isConnected && !!handheldPose?.connected;
+    const posLive = handheldPose?.pos?.x != null && handheldPose?.pos?.y != null;
     return (
       <div className="flex-1 flex flex-col h-screen overflow-hidden bg-black">
-        <div className="relative flex flex-col min-h-0" style={{ flex: '1 1 0%' }}>
-          <PaneHeader icon={Activity} label="IMU Orientation" active={isConnected && !!imuData} color="orange" />
+        <PaneHeader
+          icon={ScanLine}
+          label="Handheld Scan"
+          active={live}
+          color="cyan"
+          meta={hhScanParams
+            ? `${hhScanParams.hCount}×${hhScanParams.vCount} cells · ${hhScanData?.length ?? 0} captured`
+            : null}
+        />
+        <div className="flex-1 min-h-0 relative">
+          <HandheldScanDisplay
+            scanData={hhScanData || []}
+            params={hhScanParams}
+            pose={handheldPose}
+            ready={!!hhScanReady}
+          />
+          {!posLive && (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <span className="text-xs text-[#333333] uppercase tracking-widest font-medium">
+                No handheld position
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (activePanel === 'handheld') {
+    const live = isConnected && !!imuData;
+    const imuLive = live && !!imuData?.accel;
+    // Quadrants: position | IMU orientation / LiDARs | IMU values.
+    return (
+      <div className="flex-1 grid grid-cols-2 grid-rows-2 h-screen overflow-hidden bg-black">
+        <div className="relative flex flex-col min-h-0 border-r border-b border-white/5">
+          <PaneHeader icon={Locate} label="Position From Origin" active={live} color="cyan" />
+          <div className="flex-1 min-h-0">
+            {handheldPose && <HandheldPositionReadout pose={handheldPose} />}
+          </div>
+        </div>
+        <div className="relative flex flex-col min-h-0 border-b border-white/5">
+          <PaneHeader icon={Activity} label="IMU Orientation" active={imuLive} color="orange" />
           <div className="flex-1 min-h-0 relative overflow-hidden">
-            {isConnected && imuData && (
-              <div className="absolute inset-0 pointer-events-none">
-                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[60%] h-[60%] bg-[#D1855C]/5 blur-[80px] rounded-full" />
-              </div>
-            )}
             <ImuDisplay imuData={imuData} />
-            {!imuData && (
+            {!imuLive && (
               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                 <span className="text-xs text-[#333333] uppercase tracking-widest font-medium">No IMU data</span>
               </div>
             )}
+          </div>
+        </div>
+        <div className="relative flex flex-col min-h-0 border-r border-white/5">
+          <PaneHeader icon={Locate} label="LiDARs" active={live} color="cyan" />
+          <div className="flex-1 min-h-0">
+            {handheldPose && <HandheldLidarReadout pose={handheldPose} />}
+          </div>
+        </div>
+        <div className="relative flex flex-col min-h-0">
+          <PaneHeader icon={Activity} label="IMU" active={imuLive} color="orange" />
+          <div className="flex-1 min-h-0">
+            <ImuReadout imuData={imuData} />
           </div>
         </div>
       </div>
@@ -460,25 +539,25 @@ export default function Viewport({
               )}
               <CscanDisplay
                 scanData={bscanData}
-                params={bscanParams}
+                params={cscanFocusParams}
                 capturing={bscanCapturing}
                 sfcwProgress={sfcwProgress}
                 scaleMode={bscanScaleMode}
                 scaleRange={bscanScaleRange}
                 sharedScale={cscanScaleGlobal}
                 rowScales={cscanScaleRows}
-                cellValues={cscanCellValues}
                 scaleScope={bscanScaleScope}
                 scaleLink={effectiveLink}
                 subMode={bscanBgSubMode}
                 nextIndex={roverScan?.active ? roverScan.index : bscanData.length}
                 selectedCell={activeCell}
-                onSelectCell={(c) => setSelectedCell(prev =>
-                  (prev && prev.ix === c.ix && prev.iy === c.iy) ? null : c)}
+                onSelectCell={onCscanSelectCell}
                 scanMode={bscanParams.scanMode}
                 projection={cscanProjection}
                 smooth={cscanSmooth}
                 colormap={cscanColormap}
+                detection={sarDetection}
+                handleEnds={sarHandleEnds}
                 onLayout={publishCscanLayout}
                 rootRef={cscanRootRef}
               />
@@ -492,7 +571,7 @@ export default function Viewport({
               label={rowLabel}
               active={rowData.length > 0}
               color="cyan"
-              action={{ icon: X, title: 'Close row — back to full-screen grid', onClick: () => setSelectedCell(null) }}
+              action={{ icon: X, title: 'Close row — back to full-screen grid', onClick: onCscanCloseRow }}
             />
             <div className="flex-1 min-h-0 relative overflow-hidden">
               <BscanDisplay
@@ -530,60 +609,89 @@ export default function Viewport({
     return (
       <div className="flex-1 flex flex-col h-screen overflow-hidden bg-black">
         <div className="relative flex flex-col min-h-0" style={{ flex: '1 1 0%' }}>
-          <PaneHeader icon={Grid3x3} label="SAR Reconstruction" active={!!sarResult} color="orange" />
+          <PaneHeader
+            icon={Grid3x3}
+            label={sar3d
+              ? 'Wall Digital Twin'
+              : (sarActiveRow !== null && sarRows.length > 1
+                ? `SAR Reconstruction · Row ${sarActiveRow + 1}`
+                : 'SAR Reconstruction')}
+            active={!!sarResult}
+            color="orange"
+          />
           <div className="flex-1 min-h-0 relative overflow-hidden">
             {sarResult && (
               <div className="absolute inset-0 pointer-events-none">
                 <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[60%] h-[60%] bg-[#D1855C]/4 blur-[80px] rounded-full" />
               </div>
             )}
-            <SarDisplay
-              sarResult={sarResult}
-              sarProgress={sarProgress}
-              scaleMode={sarScaleMode}
-              dynRange={sarDynRange}
-              viewMode={sarViewMode}
-              colormap={sarColormap}
-            />
-            {!sarResult && sarProgress === null && (
+            {sar3d ? (
+              <Suspense fallback={<div className="absolute inset-0 flex items-center justify-center text-xs text-white/40">Loading 3D view...</div>}>
+                <SarWall3D
+                  detection={sarDetection}
+                  detectProgress={sarDetectProgress}
+                  vStep={bscanParams.vStep}
+                  handleEnds={sarHandleEnds}
+                />
+              </Suspense>
+            ) : (
+              <SarDisplay
+                sarResult={sarResult}
+                sarProgress={sarProgress}
+                scaleMode={sarScaleMode}
+                dynRange={sarDynRange}
+                viewMode={sarViewMode}
+                colormap={sarColormap}
+                detection={sarDetection}
+                activeRow={sarActiveRow}
+                handleEnds={sarHandleEnds}
+              />
+            )}
+            {!sar3d && !sarResult && sarProgress === null && (
               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                 <span className="text-xs text-[#333333] uppercase tracking-widest font-medium">No SAR image — need ≥2 B-scan positions</span>
               </div>
             )}
           </div>
-        </div>
-      </div>
-    );
-  }
-
-  if (activePanel === 'tomo') {
-    return (
-      <div className="flex-1 flex flex-col h-screen overflow-hidden bg-black">
-        <div className="relative flex flex-col min-h-0" style={{ flex: '1 1 0%' }}>
-          <PaneHeader icon={Layers} label="TomoSAR 3D" active={!!tomoResult} color="purple" />
-          <div className="flex-1 min-h-0 relative overflow-hidden">
-            {tomoResult && (
-              <div className="absolute inset-0 pointer-events-none">
-                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[60%] h-[60%] bg-purple-500/4 blur-[80px] rounded-full" />
+          {/* Row stepper for a multi-row C-scan. SAR reconstructs one row at a time
+              (the one selected on the C-scan); these walk through the rows that hold
+              data, ending at either end rather than wrapping. A footer strip rather
+              than an overlay, so it never covers the axis labels or colour bar. */}
+          {(sarRows.length > 1 || sarResult || sarDetection) && (() => {
+            const idx = sarRows.indexOf(sarActiveRow);
+            const atFirst = idx <= 0;
+            const atLast = idx >= sarRows.length - 1;
+            const btn = 'p-1 rounded-md transition-colors disabled:opacity-25 disabled:cursor-not-allowed text-white/60 enabled:hover:text-white enabled:hover:bg-white/10';
+            return (
+              <div className="flex items-center justify-end gap-2 px-4 py-1.5 border-t border-white/5 bg-[#050505]/80 shrink-0">
+                {sarRows.length > 1 && (
+                  <>
+                    <span className="text-[10px] font-mono tabular-nums text-white/40">
+                      Row {sarActiveRow + 1} · {idx + 1} of {sarRows.length}
+                    </span>
+                    <button type="button" className={btn} disabled={atFirst || sar3d} title="Previous row"
+                      onClick={() => onSarRowStep(-1)}>
+                      <ChevronLeft size={14} strokeWidth={2} />
+                    </button>
+                    <button type="button" className={btn} disabled={atLast || sar3d} title="Next row"
+                      onClick={() => onSarRowStep(1)}>
+                      <ChevronRight size={14} strokeWidth={2} />
+                    </button>
+                  </>
+                )}
+                {/* The 3D digital twin places every CONFIRMED detection as a cylinder in a
+                    to-scale cuboid of the scanned patch; it uses all rows at once, so the
+                    row arrows are disabled while it is shown. */}
+                <button type="button" onClick={() => setSar3d((v) => !v)}
+                  title={sar3d ? 'Back to the SAR image' : '3D view of the wall and detected pipes'}
+                  className={cn('flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-medium border transition-colors',
+                    sar3d ? 'bg-[#4ade80]/10 border-[#4ade80]/30 text-[#4ade80]' : 'bg-white/5 border-white/10 text-white/60 hover:text-white hover:bg-white/10')}>
+                  <Box size={12} strokeWidth={2} />
+                  3D view
+                </button>
               </div>
-            )}
-            <TomoDisplay tomoResult={tomoResult} />
-            {!tomoResult && tomoProgress === 0 && (
-              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                <span className="text-xs text-[#333333] uppercase tracking-widest font-medium">No TomoSAR image — need ≥2 positions</span>
-              </div>
-            )}
-            {tomoProgress > 0 && tomoProgress < 1 && (
-              <div className="absolute bottom-4 left-4 right-4 pointer-events-none">
-                <div className="h-1 w-full rounded-full bg-white/5 overflow-hidden">
-                  <div
-                    className="h-full bg-purple-500 rounded-full transition-[width] duration-100"
-                    style={{ width: `${tomoProgress * 100}%` }}
-                  />
-                </div>
-              </div>
-            )}
-          </div>
+            );
+          })()}
         </div>
       </div>
     );
@@ -627,34 +735,6 @@ export default function Viewport({
 // Live sweep cadence, measured from the Pi's own timestamps rather than from render
 // timing, so it reports what the radar is actually doing and not how fast React redrew.
 // Median of the adjacent differences, so one dropped or stalled frame does not move it.
-const SWEEP_RATE_WINDOW = 12;
-
-function useSweepRate(result, active) {
-  const buf = useRef([]);
-  const lastTs = useRef(null);
-  const [rate, setRate] = useState(null);
-
-  useEffect(() => {
-    if (!active) { buf.current = []; lastTs.current = null; setRate(null); }
-  }, [active]);
-
-  useEffect(() => {
-    const t = result && result.timestamp;
-    if (!t || t === lastTs.current) return;
-    lastTs.current = t;
-    buf.current.push(t);
-    if (buf.current.length > SWEEP_RATE_WINDOW) buf.current.shift();
-    if (buf.current.length < 3) return;
-    const d = [];
-    for (let i = 1; i < buf.current.length; i++) d.push(buf.current[i] - buf.current[i - 1]);
-    d.sort((a, b) => a - b);
-    const med = d[d.length >> 1];
-    if (med > 0) setRate({ ms: med * 1000, hz: 1 / med });
-  }, [result]);
-
-  return rate;
-}
-
 function PaneHeader({ icon: Icon, label, active, color, meta, action }) {
   const colorMap = {
     orange: { accent: '#D1855C', to: '#E5A986' },

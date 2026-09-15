@@ -237,7 +237,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--seconds', type=float, default=40.0, help='run length (default 40)')
     ap.add_argument('--label', default='lidar', help='label for this run')
-    ap.add_argument('--port', default='/dev/ttyAMA3', help='serial port')
+    ap.add_argument('--port', default='/dev/ttyAMA2',
+                    help='serial port (default: the forward/standoff head)')
     ap.add_argument('--json', default=None, help='write results + raw series to this JSON')
     args = ap.parse_args()
 

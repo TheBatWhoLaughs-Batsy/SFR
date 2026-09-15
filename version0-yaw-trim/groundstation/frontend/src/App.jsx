@@ -4,9 +4,9 @@ import Sidebar from './components/Sidebar';
 import Viewport from './components/Viewport';
 import CscanDisplay from './components/CscanDisplay';
 import { svdFilter } from './lib/svd';
+import { estimateWallPermittivity } from './lib/permittivityEstimate';
 import { useSarWorker } from './hooks/useSarWorker';
-import { useTomoSarWorker } from './hooks/useTomoSarWorker';
-import { tomoGridCell } from './lib/tomoGrid';
+import { useSarDetect } from './hooks/useSarDetect';
 import { useBgModelWorker } from './hooks/useBgModelWorker';
 import { inferBgModel } from './lib/bgModelInfer';
 import { computeCaptureStats } from './lib/bgCaptureStats';
@@ -14,12 +14,25 @@ import { createContinuousAccum } from './lib/bgContinuous';
 import { createRowCollector } from './lib/roverTrack';
 import { computeRangeProfile } from './lib/rangeProfile';
 import { applyBscanBg, bgForStandoff, backgroundFor, coherentMean } from './lib/bscanBg';
-import { computeBinScales, computeCellValues, computeGridScales, bgDiagnostics, planViewScales } from './lib/cscanGrid';
+import { computeSharedScale, computeRowScales, computeGridScales, bgDiagnostics, planViewScales } from './lib/cscanGrid';
 import { cellForIndex, orderedCellForIndex, BG_STATUS, BG_STATUS_TEXT, roverRowFill } from './lib/cscanGrid';
 import { useRoverScan } from './hooks/useRoverScan';
 import { useRoverBgScan } from './hooks/useRoverBgScan';
 import { DEFAULT_PARAMS as IMAGING_DEFAULT_PARAMS } from './lib/imagingEffects';
 import ProjectorWindow from './components/ProjectorWindow';
+import { decodeSfcwBinary } from './lib/sfcwWire';
+import {
+  loadHandheldOrigin, saveHandheldOrigin, loadHandheldAssignment, saveHandheldAssignment,
+  loadHandheldAverageMs, saveHandheldAverageMs, createLidarHistory, computeHandheldPosition,
+  loadHandheldMount, saveHandheldMount, loadHandheldTiltEnabled, saveHandheldTiltEnabled,
+  HANDHELD_AXES, lidarsByUart, originFromPose,
+} from './lib/handheldPose';
+import { createMountCalibrator } from './lib/handheldTilt';
+import { captureReadiness, filledCells, cellForPosition, positionSpread } from './lib/handheldScan';
+
+// The SDR socket asks the Pi for sfcw_result as binary frames (see the connect effect
+// and lib/sfcwWire.js). Module-level so the hook sees one stable options object.
+const SDR_WS_OPTIONS = { decodeBinary: decodeSfcwBinary };
 
 const SPEED_OF_LIGHT = 299792458;
 
@@ -31,7 +44,28 @@ const SPEED_OF_LIGHT = 299792458;
 // this repo before with duplicated kernels (CFAR, SAFT), and here the failure
 // would be invisible: both grids would still render, disagreeing about what a
 // cell contains.
-function buildCellRecord({ sweeps, meta, cell, grid, rover, target, roverXStd, keepSweeps = true }) {
+// Readings older than this are dropped from the lidar/pose accumulators before a
+// sweep reads them, which bounds both arrays without needing a clear-on-stop
+// hook anywhere. Generous on purpose: the job is to exclude the IDLE period, not
+// to trim a legitimately slow sweep, and the slowest sweep this system has ever
+// run is ~550 ms (2026-08-20, 151 steps) against 28-230 ms today. A reading 2 s
+// old is in any case already past LIDAR_CARRY_MS -- past the age at which App
+// itself calls the standoff stale -- so it cannot belong to the sweep being
+// recorded.
+const ACCUM_WINDOW_MS = 2000;
+// Prune is by AGE; this only says how often to bother doing it, so that an idle
+// tab cannot accumulate without bound between sweeps. Comfortably above what
+// either accumulator holds in one window (~40 lidar, ~100 pose), so it never
+// fires during normal sweeping.
+const ACCUM_PRUNE_AT = 512;
+
+function pruneAccum(ref, nowMs) {
+  if (ref.current.length <= ACCUM_PRUNE_AT) return;
+  const cutoff = nowMs - ACCUM_WINDOW_MS;
+  ref.current = ref.current.filter(r => r.t >= cutoff);
+}
+
+function buildCellRecord({ sweeps, meta, cell, grid, rover, target, roverXStd }) {
   const meanSweep = coherentMean(sweeps, meta.num_steps);
   const mean = (vals) => (vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null);
   const stand = sweeps.map(w => w.lidar_standoff_mm).filter(v => v != null);
@@ -52,20 +86,7 @@ function buildCellRecord({ sweeps, meta, cell, grid, rover, target, roverXStd, k
     distances: meta.distances,
     // EVERY look, not just the mean: coherent-vs-incoherent is a display
     // control and has to stay flippable against recorded data.
-    //
-    // Dropped when the panel's retention toggle is set to free raw sweeps. They
-    // are 65-94% of a long scan's memory -- measured over 1515 cells (101x15):
-    // 8.4 MB at 1 sweep/cell, 18.7 at 8, 33.8 at 18, 102.3 at 64, against a flat
-    // 6.5 MB with them stripped -- and the ONLY things that read them are the
-    // incoherent average (lib/bscanBg.js cellSweeps) and the v7 export. The
-    // coherent mean below, the Pi's own profile and every provenance field
-    // survive either way, so the measurement does not.
-    //
-    // `sweep_count` is written in BOTH modes, so how many looks went into the
-    // mean is still on the record when the looks themselves are gone. Without it
-    // a freed cell is indistinguishable from a genuine single-sweep one.
-    ...(keepSweeps ? { sweeps } : null),
-    sweep_count: sweeps.length,
+    sweeps,
     // The COHERENT mean, because everything that reads h_cal without knowing
     // about `sweeps` -- SAR, the BG-model trainer, Super Fit, svdFilter, the
     // export -- must see the averaged cell.
@@ -75,6 +96,10 @@ function buildCellRecord({ sweeps, meta, cell, grid, rover, target, roverXStd, k
     step_size: meta.step_size,
     start_freq: meta.start_freq,
     range_offset: meta.range_offset,
+    // Present only when the Pi swept with a different offset than the panel and the
+    // sfcw_result guard corrected it. Kept so an export shows the disagreement: a
+    // header saying 0.378 over cells silently recorded at 0.5 is how rod1.json hid it.
+    ...(meta.range_offset_pi != null && { range_offset_pi: meta.range_offset_pi }),
     lidar_standoff_mm: standMean,
     lidar_n: sweeps.reduce((a, w) => a + (w.lidar_n || 0), 0),
     lidar_std: stand.length > 1
@@ -103,19 +128,6 @@ function buildCellRecord({ sweeps, meta, cell, grid, rover, target, roverXStd, k
 }
 
 const ROVER_TRAIL_MAX = 2000;
-
-// Caps on the two accumulators that a sweep drains and averages into its
-// provenance. They are emptied by the `sfcw_result` handler, so with the sensor
-// stream up and NO sweep running they grew without bound -- ~16 lidar
-// measurements and ~50 pose samples a second, for as long as the tab was open.
-//
-// Both are far above what a sweep can ever collect (at the 36 Hz NIOS sweep a
-// window holds well under one lidar measurement and one or two pose samples, and
-// even a 550 ms host-driven sweep holds ~9 and ~28), so the cap cannot bite in
-// operation and `lidar_n` stays an honest count. Oldest-first, so what survives
-// is the part of the window nearest the sweep.
-const LIDAR_ACCUM_MAX = 256;
-const POSE_ACCUM_MAX = 512;
 const ROVER_LOG_MAX = 120;
 
 function runPhaseUnwindTest(samples, sfcwParams) {
@@ -257,6 +269,119 @@ export default function App() {
   const [imuRate, setImuRate] = useState(0);
   const imuCountRef = useRef(0);
   const [lidarMm, setLidarMm] = useState(null);
+
+  // Handheld + IMU panel. Origin: each axis's LiDAR distance (mm) at the declared
+  // origin, as {x, y, z}. Groundstation-only -- the Pi streams distances and
+  // holds no origin. All three handheld settings persist per browser.
+  const [handheldOrigin, setHandheldOrigin] = useState(() => loadHandheldOrigin());
+  const handleHandheldOriginChange = useCallback((next) => {
+    setHandheldOrigin(next);
+    saveHandheldOrigin(next);
+  }, []);
+  // Which UART each direction's LiDAR is on ({fwd, right, down} -> 'uartN').
+  // Re-wiring changes which distance each axis reads, so the old origin would
+  // be a different LiDAR's distance: it is cleared.
+  const [handheldAssignment, setHandheldAssignment] = useState(() => loadHandheldAssignment());
+  // Mirrored into a ref so handleImuMessage can read the current wiring without
+  // taking it as a dependency -- that callback is the websocket's handler and
+  // re-creating it churns the subscription at the sensor rate.
+  const handheldAssignmentRef = useRef(handheldAssignment);
+  handheldAssignmentRef.current = handheldAssignment;
+  const handleHandheldAssignmentChange = useCallback((next) => {
+    setHandheldAssignment(next);
+    saveHandheldAssignment(next);
+    setHandheldOrigin(null);
+    saveHandheldOrigin(null);
+  }, []);
+  // Averaging window for the handheld distances (AVERAGE_WINDOWS_MS), over a
+  // per-LiDAR history that handleImuMessage feeds with every packet. Display
+  // only: the radar standoff is not averaged here.
+  const [handheldAvgMs, setHandheldAvgMs] = useState(() => loadHandheldAverageMs());
+  const handleHandheldAvgMsChange = useCallback((ms) => {
+    setHandheldAvgMs(ms);
+    saveHandheldAverageMs(ms);
+  }, []);
+  const handheldHistoryRef = useRef(null);
+  if (!handheldHistoryRef.current) handheldHistoryRef.current = createLidarHistory();
+
+  // Tilt compensation: where each beam points relative to the IMU (the mount
+  // calibration), and whether to apply it. Both persist per browser. A null
+  // mount is not "off" -- handheldPose falls back to the nominal mount, which is
+  // nearly as good for the obliquity term; see handheldTilt.js.
+  const [handheldMount, setHandheldMount] = useState(() => loadHandheldMount());
+  const [handheldTilt, setHandheldTilt] = useState(() => loadHandheldTiltEnabled());
+  const handleHandheldTiltChange = useCallback((on) => {
+    setHandheldTilt(on);
+    saveHandheldTiltEnabled(on);
+  }, []);
+  const handleHandheldMountChange = useCallback((m) => {
+    setHandheldMount(m);
+    saveHandheldMount(m);
+  }, []);
+
+  // A calibration run. The collector is a REF fed by every sensor packet at
+  // 50 Hz; only a 250 ms interval publishes progress, for the same reason the
+  // BG-model continuous accumulator does -- a per-packet setState would
+  // re-render the sidebar 50 times a second to move a counter.
+  const handheldCalRef = useRef(null);
+  const [handheldCal, setHandheldCal] = useState(null);
+  const publishCal = useCallback(() => {
+    const run = handheldCalRef.current;
+    if (!run) return;
+    setHandheldCal({
+      active: true,
+      elapsedS: (Date.now() - run.startedAt) / 1000,
+      counts: run.cal.counts(),
+      coverage: run.cal.coverage(),
+      result: null,
+    });
+  }, []);
+  const handheldCalStart = useCallback(() => {
+    if (handheldCalRef.current) clearInterval(handheldCalRef.current.timer);
+    handheldCalRef.current = {
+      cal: createMountCalibrator(HANDHELD_AXES),
+      startedAt: Date.now(),
+      timer: setInterval(publishCal, 250),
+    };
+    setHandheldCal({ active: true, elapsedS: 0, counts: {}, coverage: null, result: null });
+  }, [publishCal]);
+  const handheldCalFinish = useCallback(() => {
+    const run = handheldCalRef.current;
+    if (!run) return;
+    clearInterval(run.timer);
+    handheldCalRef.current = null;
+    // The result is SHOWN, not applied. Every way this can go wrong produces a
+    // confident-looking answer (a single-axis wobble is a genuine gauge freedom
+    // and lands up to 95 deg out), so the operator sees the quality gates before
+    // anything replaces a working calibration.
+    setHandheldCal({
+      active: false,
+      elapsedS: (Date.now() - run.startedAt) / 1000,
+      counts: run.cal.counts(),
+      coverage: null,
+      result: run.cal.solve(),
+    });
+  }, []);
+  const handheldCalCancel = useCallback(() => {
+    if (handheldCalRef.current) clearInterval(handheldCalRef.current.timer);
+    handheldCalRef.current = null;
+    setHandheldCal(null);
+  }, []);
+  // A tab closed mid-run must not leave the interval running.
+  useEffect(() => () => {
+    if (handheldCalRef.current) clearInterval(handheldCalRef.current.timer);
+  }, []);
+
+  // One computation shared by the panel and the viewport.
+  const hhPoseRef = useRef(null);
+  const handheldPose = useMemo(() => computeHandheldPosition(
+    imuData, handheldOrigin, handheldAssignment,
+    {
+      history: handheldHistoryRef.current, windowMs: handheldAvgMs,
+      mount: handheldMount, tilt: handheldTilt,
+    },
+  ), [imuData, handheldOrigin, handheldAssignment, handheldAvgMs, handheldMount, handheldTilt]);
+  hhPoseRef.current = handheldPose;
   // Provenance of the standoff used for the most recent sweep (Phase 0.1/0.2):
   // { lidar_standoff_mm, lidar_n, lidar_std, lidar_offset_mm, roll_deg, pitch_deg }
   const [sfcwLidarProvenance, setSfcwLidarProvenance] = useState(null);
@@ -282,6 +407,28 @@ export default function App() {
   // SFCW state
   const [sfcwRunning, setSfcwRunning] = useState(false);
   const [sfcwStatus, setSfcwStatus] = useState(null);
+  // Set while the Pi reports a range_offset different from the panel's; see the guard
+  // at the top of the sfcw_result handler. { pi, panel } or null.
+  const [sfcwRangeOffsetMismatch, setSfcwRangeOffsetMismatch] = useState(null);
+  const rangeOffsetGuardRef = useRef({ piValue: null, panelValue: null, lastPush: -Infinity });
+  // Empty DSP sweeps dropped this run; see isEmptyDspSweep in the sfcw_result handler.
+  // { count } or null. The ref counts every one; the state is published at most every 500 ms.
+  const [sfcwEmptySweeps, setSfcwEmptySweeps] = useState(null);
+  const emptySweepRef = useRef({ count: 0, pubAt: -Infinity });
+  // sendSfcwParams is defined after handleSdrMessage (it needs sendSdr, which the
+  // websocket hook returns for that handler), so the handler reaches it through a ref.
+  const sendSfcwParamsRef = useRef(null);
+  // True while a sweep THIS tab started is running. Only the owner re-pushes params
+  // from the range-offset guard, so two tabs whose panels differ cannot fight.
+  const sfcwOwnerRef = useRef(false);
+  // Set on every (re)connect; the first sfcw_status (which the server sends straight
+  // after accepting the socket) decides whether this tab may push its params.
+  const connectPushPendingRef = useRef(false);
+  // Last sfcw_status running flag, so ownership is cleared on the running->stopped
+  // TRANSITION only. A plain `!running` test would clear it immediately: starting a
+  // sweep sends params and then sfcw_start, and the Pi answers the params with a
+  // running:false status that arrives after this tab has already claimed ownership.
+  const sfcwRunningPrevRef = useRef(false);
   const [sfcwResult, setSfcwResult] = useState(null);
   const [sfcwProgress, setSfcwProgress] = useState(null);
   const [coherenceResult, setCoherenceResult] = useState(null);
@@ -526,6 +673,60 @@ export default function App() {
   const [bscanData, setBscanData] = useState([]);
   const [bscanCapturing, setBscanCapturing] = useState(false);
   const [bscanBgRef, setBscanBgRef] = useState(null);
+
+  // Handheld Scan panel: its own grid and its own captured cells, kept SEPARATE
+  // from the C-scan's bscanData so the two panels never fight over the same
+  // records or the same capture ref. The position comes from handheldPose
+  // (three LiDARs + IMU); a capture tags the SFCW sweep-after-next as the cell
+  // the head is over, reusing the same buildCellRecord + coherentMean path.
+  const [hhScanData, setHhScanData] = useState([]);
+  const [hhScanCapturing, setHhScanCapturing] = useState(false);
+  const [hhCaptureProgress, setHhCaptureProgress] = useState(null);
+  const [hhAvgCount, setHhAvgCount] = useState(4);
+  const [hhAutoCapture, setHhAutoCapture] = useState(false);
+  // gateStart/gateEnd/metric are what computeCellValues colours a cell by; without
+  // them every cell is NaN and the plan view never colours. Same defaults as the
+  // C-scan. Focus is off: it needs a row of neighbours at a known pitch, which a
+  // hand-carried head does not give.
+  const [hhScanParams, setHhScanParams] = useState({
+    hCount: 8, hStep: 5, vCount: 6, vStep: 5,
+    gateStart: 2, gateEnd: 70, metric: 'peak', focusEnabled: false,
+  });
+  const [hhBeep, setHhBeep] = useState(true);
+  // What the last capture did, for the panel: { kind: 'captured'|'aborted', cell, why, t }.
+  const [hhLastEvent, setHhLastEvent] = useState(null);
+  const hhCaptureRef = useRef(null);
+  const hhScanParamsRef = useRef(hhScanParams);
+  hhScanParamsRef.current = hhScanParams;
+  const hhBeepRef = useRef(hhBeep);
+  hhBeepRef.current = hhBeep;
+
+  // A short tone the operator can hear with their eyes on the wall, not the
+  // screen. Captured = a rising pair; aborted = one low note. Web Audio,
+  // created lazily on first use so autoplay policy is satisfied by the click
+  // that started the sweep.
+  const hhAudioRef = useRef(null);
+  const hhTone = useCallback((kind) => {
+    if (!hhBeepRef.current) return;
+    try {
+      if (!hhAudioRef.current) hhAudioRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      const ac = hhAudioRef.current;
+      const play = (hz, at, ms) => {
+        const o = ac.createOscillator();
+        const g = ac.createGain();
+        o.frequency.value = hz;
+        o.type = 'sine';
+        g.gain.setValueAtTime(0.0001, ac.currentTime + at);
+        g.gain.exponentialRampToValueAtTime(0.15, ac.currentTime + at + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + at + ms / 1000);
+        o.connect(g).connect(ac.destination);
+        o.start(ac.currentTime + at);
+        o.stop(ac.currentTime + at + ms / 1000 + 0.02);
+      };
+      if (kind === 'captured') { play(660, 0, 70); play(990, 0.09, 90); }
+      else play(220, 0, 160);
+    } catch { /* no audio available; the panel still shows the event */ }
+  }, []);
   const [bscanBgModel, setBscanBgModel] = useState(null);
   const [bscanBgCapturing, setBscanBgCapturing] = useState(false);
   const [bgApplied, setBgApplied] = useState(true);
@@ -584,12 +785,21 @@ export default function App() {
   // subtraction adds energy instead of removing it, which manufactures targets.
   // Hence the geometry stamp on new models (handleBgModelAction 'build') and the
   // out-of-span reporting in sfcwProcessed below.
+  //
+  // 2026-09-13: 131.475 mm, from the gw2 bench model. Its nearest knot was captured with
+  // the antenna flush on the wall and read -28.525 mm under the 160 mm offset the browser
+  // held then, so flush = 160 - 28.525. No buffer is subtracted: a flush antenna should
+  // read ~0 +/- 0.7 mm of LiDAR noise, and the SAR panel tolerates that. The storage key
+  // is VERSIONED because a saved value always beats the default: the operator's browser
+  // held 160 under the old key, which is how gw2 and rod1.json were recorded 28.5 mm
+  // short even though the code default was already 132.
+  const LIDAR_OFFSET_KEY = 'lidar_antenna_offset_mm_v2';
   const [lidarOffsetMm, setLidarOffsetMmState] = useState(() => {
-    const v = parseFloat(localStorage.getItem('lidar_antenna_offset_mm'));
-    return Number.isFinite(v) ? v : 132;
+    const v = parseFloat(localStorage.getItem(LIDAR_OFFSET_KEY));
+    return Number.isFinite(v) ? v : 131.475;
   });
   const setLidarOffsetMm = useCallback((v) => {
-    localStorage.setItem('lidar_antenna_offset_mm', String(v));
+    localStorage.setItem(LIDAR_OFFSET_KEY, String(v));
     setLidarOffsetMmState(v);
   }, []);
   const lidarOffsetRef = useRef(lidarOffsetMm);
@@ -601,6 +811,13 @@ export default function App() {
   // packets repeat the previous reading. Averaging the repeats would understate
   // the spread and silently weight each reading by how long it happened to be
   // held, so `lidar_n` and `lidar_std` recorded on each sweep would be fiction.
+  // Entries are { mm, t }, pruned by age -- see ACCUM_WINDOW_MS. They used to
+  // be bare numbers and were cleared ONLY in the sfcw_result handler, so with no
+  // sweep running the array grew at the measurement rate for as long as the tab
+  // was open: a slow leak, and worse, the first sweep of the next session got a
+  // standoff averaged over the entire idle period -- i.e. over wherever the head
+  // happened to be while it was being carried into place -- reported with an
+  // `lidar_n` in the thousands that made it look exceptionally well measured.
   const lidarAccumRef = useRef([]);
   const lidarLastSeqRef = useRef(null);
   // Most recent GENUINELY-FRESH reading and when it arrived. Needed because the
@@ -632,9 +849,11 @@ export default function App() {
     gateStart: 2,
     gateEnd: 70,
     metric: 'peak',
-    // Plan-view focusing (SAFT), per row. Same kind of setting as metric and
-    // the gate -- it changes how a record is reduced to a colour, not the
-    // record -- so it lives here and rides along in the export.
+    // Plan-view focusing, per row. Same kind of setting as metric and the
+    // gate -- it changes how a record is reduced to a colour, not the record
+    // -- so it lives here and rides along in the export. 'saft' is the
+    // original incoherent kernel; 'das_cf' / 'dmas_cf' are coherent
+    // (phase-aware) alternatives weighted by CF^focusGamma (lib/saft.js).
     focusEnabled: false,
     focusAperture: 7,
     focusMethod: 'saft',
@@ -717,7 +936,6 @@ export default function App() {
     setBscanData(prev => [
       ...prev.filter(d => !replaced.has(`${d.grid_ix},${d.grid_iy}`)),
       ...cells.map(c => buildCellRecord({
-        keepSweeps: cscanKeepSweepsRef.current,
         sweeps: c.sweeps,
         meta: c.meta,
         cell: { ix: c.ix, iy: c.iy },
@@ -825,6 +1043,11 @@ export default function App() {
       pxPerCm: px > 0 ? px : 8,
       leftPx: num('cscan_left_px', 60),
       topPx: num('cscan_top_px', 80),
+      // What the plan view and the projector draw: 'grid' (cell values through the
+      // colormap) or 'detections' (the SAR panel's confirmed pipes over the scanned area).
+      source: localStorage.getItem('cscan_projection_source') === 'detections' ? 'detections' : 'grid',
+      // With source = detections, also draw the SAR panel's PROBABLE pipes, in a second colour.
+      showProbable: localStorage.getItem('cscan_projection_probable') === 'true',
     };
   });
   // Plan-view smoothing. Purely a DISPLAY choice -- it resamples the same cell
@@ -837,48 +1060,6 @@ export default function App() {
   const setCscanSmooth = useCallback((v) => {
     localStorage.setItem('cscan_smooth', String(!!v));
     setCscanSmoothState(!!v);
-  }, []);
-
-  // Raw-sweep retention for the C-scan. 'keep' is the original behaviour --
-  // every look taken at every cell stays in memory, so the coherent/incoherent
-  // toggle remains live against recorded data and the v7 export carries the
-  // looks. 'free' drops them as each cell is finalised, keeping only the
-  // coherent mean, the range profile and the provenance.
-  //
-  // The looks dominate a long scan: measured over 1515 cells (101x15), the
-  // capture list is 18.7 MB at 8 sweeps/cell, 33.8 MB at 18 and 102.3 MB at 64,
-  // against a flat 6.5 MB with them stripped. That memory is also what the
-  // export has to serialise into one JSON string, so it bounds how long a scan
-  // can get in one tab.
-  //
-  // Deliberately NOT part of `bscanParams`: it is a live property of this
-  // session, like scanMode and the projection, and must not ride along in an
-  // export as though it described the capture. Persisted so a long-scan rig
-  // does not have to re-select it every session.
-  const [cscanKeepSweeps, setCscanKeepSweepsState] = useState(
-    () => localStorage.getItem('cscan_keep_sweeps') !== 'false');
-  const cscanKeepSweepsRef = useRef(cscanKeepSweeps);
-  cscanKeepSweepsRef.current = cscanKeepSweeps;
-  const setCscanKeepSweeps = useCallback((v) => {
-    const keep = !!v;
-    localStorage.setItem('cscan_keep_sweeps', String(keep));
-    setCscanKeepSweepsState(keep);
-    // Turning retention OFF is retroactive, and has to be: the point of the
-    // control is to reclaim memory, and cells already captured are where the
-    // memory is. Nothing measured is lost -- h_cal is the coherent mean of the
-    // looks being dropped and `sweep_count` records how many there were -- but
-    // incoherent averaging and the per-look export are gone for those cells, so
-    // the panel says so. Turning it back ON cannot restore what was freed; it
-    // only applies to cells captured from then on.
-    if (!keep) {
-      setBscanData(prev => (prev.some(p => p && p.sweeps)
-        ? prev.map((p) => {
-            if (!p || !p.sweeps) return p;
-            const { sweeps, ...rest } = p;
-            return { ...rest, sweep_count: rest.sweep_count != null ? rest.sweep_count : sweeps.length };
-          })
-        : prev));
-    }
   }, []);
 
   // Which colour map the C-scan's two panes are drawn with. Both, not just the
@@ -917,6 +1098,8 @@ export default function App() {
     localStorage.setItem('cscan_px_per_cm', String(v.pxPerCm));
     localStorage.setItem('cscan_left_px', String(v.leftPx));
     localStorage.setItem('cscan_top_px', String(v.topPx));
+    localStorage.setItem('cscan_projection_source', v.source === 'detections' ? 'detections' : 'grid');
+    localStorage.setItem('cscan_projection_probable', String(!!v.showProbable));
     setCscanProjectionState(v);
   }, []);
   // 'linked' (both panes off one population of bins, so a colour means one dB
@@ -1082,59 +1265,47 @@ export default function App() {
     [bscanBgSubMode, bscanData, bscanBgSource, bgApplied, sfcwFreqParams, processedBscanData, bscanProcParams],
   );
 
-  // ONE colour scale for both panes, computed over the whole grid, plus the same
-  // percentile treatment per grid row. See computeBinScales for why these are
-  // percentile-based and why they replaced the per-grid / per-row limits the two
-  // displays used to compute independently.
-  //
-  // Both scopes come out of ONE pass. They were two memos walking the same
-  // 174k-value population separately; the per-row scale is computed even when
-  // the scope toggle is on global, so flipping it cannot make the colours lag a
-  // capture behind, and sharing the walk is what makes keeping it live free.
-  const cscanBinScales = useMemo(
-    () => computeBinScales(cscanProcessedData),
+  // ONE colour scale for both panes, computed over the whole grid. See
+  // computeSharedScale for why this is percentile-based and why it replaced the
+  // per-grid / per-row limits the two displays used to compute independently.
+  const cscanSharedScale = useMemo(
+    () => computeSharedScale(cscanProcessedData),
     [cscanProcessedData],
   );
-  const cscanSharedScale = cscanBinScales.global;
-  const cscanRowScales = cscanBinScales.rows;
 
-  // How a record becomes a colour. Split out of the memo below because it is now
-  // shared: the same object drives computeGridScales here and buildCscanGrid
-  // inside both CscanDisplay instances.
-  const cscanCellParams = useMemo(() => ({
-    gateStart: bscanParams.gateStart,
-    gateEnd: bscanParams.gateEnd,
-    metric: bscanParams.metric,
-    hStep: bscanParams.hStep,
-    focusEnabled: bscanParams.focusEnabled,
-    focusAperture: bscanParams.focusAperture,
-    focusMethod: bscanParams.focusMethod,
-    focusGamma: bscanParams.focusGamma,
-    windowType: bscanProcParams.windowType,
-    kaiserBeta: bscanProcParams.kaiserBeta,
-    startFreqHz: sfcwParams.startFreq * 1e6,
-  }), [bscanParams.gateStart, bscanParams.gateEnd, bscanParams.metric,
-    bscanParams.hStep, bscanParams.focusEnabled, bscanParams.focusAperture,
-    bscanParams.focusMethod, bscanParams.focusGamma,
-    bscanProcParams.windowType, bscanProcParams.kaiserBeta, sfcwParams.startFreq]);
+  // The same percentile treatment, one population per grid row. Computed
+  // unconditionally rather than behind the scope toggle: it is O(bins) over the
+  // grid, the same pass computeSharedScale already makes, and keeping it live
+  // means flipping the toggle cannot make the colours lag a capture behind.
+  const cscanRowScales = useMemo(
+    () => computeRowScales(cscanProcessedData),
+    [cscanProcessedData],
+  );
 
-  // The one gated scalar per cell that the plan view colours by -- and the most
-  // expensive thing in this chain when Focus is on, because it is then a SAFT
-  // back-projection over the aperture, per cell, per gate depth (measured, 1515
-  // cells: 47.3 ms). It used to be computed inside computeGridScales AND inside
-  // buildCscanGrid AND again on every animation frame of BOTH CscanDisplay
-  // instances. Computed once here and handed to all of them.
-  const cscanCellValues = useMemo(
-    () => computeCellValues(cscanProcessedData, cscanCellParams),
-    [cscanProcessedData, cscanCellParams],
+  // bscanParams plus the two other settings the coherent focus kernels
+  // (das_cf / dmas_cf) need but that live in different state: the window
+  // (bscanProcParams, shared with the Live Sweep controls) and the sweep's
+  // start frequency (sfcwParams, needed for the phase term 2*k_start*R).
+  // computeCellValues is the single source of a cell's colour, called both
+  // to draw the grid and to compute its scale -- both call sites use THIS
+  // object so a coherent-mode image can never be drawn with different
+  // window/frequency assumptions than the scale it is drawn against.
+  const cscanFocusParams = useMemo(
+    () => ({
+      ...bscanParams,
+      windowType: bscanProcParams.windowType,
+      kaiserBeta: bscanProcParams.kaiserBeta,
+      startFreqHz: sfcwParams.startFreq * 1e6,
+    }),
+    [bscanParams, bscanProcParams.windowType, bscanProcParams.kaiserBeta, sfcwParams.startFreq],
   );
 
   // The plan view's own population: one gated scalar per cell, global and
   // per-row. Depends on the gate and the metric, which the bin-domain scales do
   // not -- that asymmetry IS the unlinked mode.
   const cscanGridScales = useMemo(
-    () => computeGridScales(cscanProcessedData, cscanCellParams, cscanCellValues),
-    [cscanProcessedData, cscanCellParams, cscanCellValues],
+    () => computeGridScales(cscanProcessedData, cscanFocusParams),
+    [cscanProcessedData, cscanFocusParams],
   );
 
   // Which of those the plan view actually draws with. Shared with the viewport
@@ -1202,37 +1373,6 @@ export default function App() {
 
   const cscanBgDiag = useMemo(() => bgDiagnostics(cscanProcessedData), [cscanProcessedData]);
 
-  // Roughly what the capture list is costing, so the retention toggle is a
-  // decision with a number on it rather than a guess. Per-cell and per-look
-  // costs are MEASURED (node, --expose-gc, 1515-cell grids at 1/8/18/64 looks
-  // per cell): a stripped cell is a flat 4.3 KB -- almost all of it the Pi's
-  // 204-bin profile and its distance axis -- and each stored look adds 1.01 KB,
-  // constant across every size tried. It is an estimate of the RAW list only;
-  // the derived copies (processedBscanData, sarProcessedData, the SAR worker's
-  // clone) cost again on top.
-  const cscanMemory = useMemo(() => {
-    let looks = 0;
-    let stored = 0;
-    for (const p of bscanData) {
-      if (!p) continue;
-      const n = Array.isArray(p.sweeps) && p.sweeps.length
-        ? p.sweeps.length : (p.sweep_count > 0 ? p.sweep_count : 1);
-      looks += n;
-      if (Array.isArray(p.sweeps)) stored += p.sweeps.length;
-    }
-    const CELL_KB = 4.3;
-    const LOOK_KB = 1.01;
-    return {
-      cells: bscanData.length,
-      looks,
-      stored,
-      mb: (bscanData.length * CELL_KB + stored * LOOK_KB) / 1024,
-      // What it would cost if every look taken were still held -- the number the
-      // toggle is being traded against.
-      fullMb: (bscanData.length * CELL_KB + looks * LOOK_KB) / 1024,
-    };
-  }, [bscanData]);
-
   // 2D Map state
   const [mapGateStart, setMapGateStart] = useState(2);
   const [mapGateEnd, setMapGateEnd] = useState(15);
@@ -1258,7 +1398,10 @@ export default function App() {
   // display (removed; that pane now draws the whole profile) and bounding SAR's
   // output grid. Only the second is a real parameter, and it belongs here: it
   // sets the extent and the cost of the reconstruction, not what a display shows.
-  const [sarMaxDepth, setSarMaxDepth] = useState(70);
+  // Default 40 cm (2026-09-13): the gw2 bench's 15.2 cm wall plus the space just behind
+  // it, where its targets sit. Well inside what a sweep reaches there (~60 cm), so the
+  // auto-fit below, which only ever pulls a CLIPPED request down, leaves it alone.
+  const [sarMaxDepth, setSarMaxDepth] = useState(20);
   // Where the per-position standoff comes from. Auto (the default) reads each cell's
   // own recorded lidar standoff, which is what makes an imprecise rig imageable --
   // corrected, focus survives 30 mm of standoff scatter; uncorrected it needs 3 mm.
@@ -1278,19 +1421,23 @@ export default function App() {
   // the hyperbola it matched had the wrong curvature and its depth axis read sqrt(er)
   // too deep. 4.5 = dry brick, cross-checked against a real scan (29 cm wall, back
   // face at 63.2 cm apparent -> er 4.68).
-  const [sarEpsilonR, setSarEpsilonR] = useState(4.5);
+  // Default 5.4 (2026-09-13): the gw2 bench's 15.2 cm concrete wall, from its back-wall
+  // echo (35.2 cm of apparent range behind the face on rod1.json) and confirmed by the
+  // rod focusing immediately behind the wall. The panel suggests a value per scan.
+  const [sarEpsilonR, setSarEpsilonR] = useState(5.4);
   // Rectangular, not the Hanning that used to be hardcoded in the worker: measured
   // target coherence 0.654 rect / 0.627 kaiser b3 / 0.615 hanning on a real scan.
   const [sarWindowType, setSarWindowType] = useState('rectangular');
   // Operator-measured wall thickness, in cm. 29 is THIS bench's wall -- re-measure for
   // any other. It is what tells the layered model where the dielectric stops; 0 disables
   // the layered path entirely.
-  const [sarWallThickness, setSarWallThickness] = useState(29);
+  // Default 15.2 cm (2026-09-13): the gw2 bench's wall. It was 29, an earlier bench.
+  const [sarWallThickness, setSarWallThickness] = useState(15.2);
   // Layered air/wall/air ray tracing with Snell at both faces, against the straight-ray
-  // model that adds the standoff as a pure delay. Defaults OFF so the existing image
-  // stays the A/B baseline; once the layered one is confirmed better on real data this
-  // toggle should go and it becomes unconditional.
-  const [sarRefraction, setSarRefraction] = useState(false);
+  // model that adds the standoff as a pure delay. Defaults ON since 2026-09-13: on
+  // rod1.json the straight ray loses the rod entirely while the layered ray focuses it
+  // (coherence 0.70). The straight ray stays selectable as the A/B baseline.
+  const [sarRefraction, setSarRefraction] = useState(true);
   // 'split' = amplitude and coherence as two panes; 'combined' = one pane of amplitude
   // weighted by coherence.
   const [sarViewMode, setSarViewMode] = useState('split');
@@ -1300,28 +1447,82 @@ export default function App() {
   // because earlier images were read in jet. The coherence pane is NOT affected; it holds
   // its own ramp so the two split panes stay distinguishable.
   const [sarColormap, setSarColormap] = useState('inferno');
+  // Target detection (lib/sarDetect.js). The empty reference is a C-scan export of the
+  // same bench with no target, taken in the SAME session: real fixed reflectors (the gw2
+  // wall's crevice, rig echoes) pass every geometric test because they are reflectors,
+  // and only a control removes them. Not persisted; it belongs to a session.
+  const [sarEmptyRef, setSarEmptyRef] = useState(null); // { name, data } | null
+  // Ends handling is VISUAL: markers inside the truncated-aperture zone at either end
+  // are shown as unresolved and the zone is shaded. The operator overscans; nothing is
+  // added to the raster automatically.
+  const [sarHandleEnds, setSarHandleEnds] = useState(true);
+  // 'pipe' = lib/sarDetect.js (compact scatterers behind or in the wall); 'seepage' =
+  // lib/seepageDetect.js (unfocused in-wall moisture patches, provisional). Not persisted.
+  const [sarDetectMode, setSarDetectMode] = useState('pipe');
+
+  // The C-scan cell whose row the B-scan pane shows. Lives here rather than in
+  // Viewport because the SAR panel follows it: SAR is one-dimensional, so on a
+  // multi-row grid it reconstructs ONE row, and that row is the one selected on the
+  // C-scan. Null = no row open on the C-scan (the plan view has the whole area).
+  const [cscanSelectedCell, setCscanSelectedCell] = useState(null);
+  // The row SAR reconstructs. Kept separately from cscanSelectedCell because closing
+  // the C-scan's row pane must not blank the SAR image, and stepping rows from the SAR
+  // panel must not open that pane unasked.
+  const [sarRowIy, setSarRowIy] = useState(null);
+
+  // Grid rows that actually hold data, ascending (iy 0 = bottom row). Empty for a
+  // record with no grid indices (an imported linear scan), which SAR takes whole.
+  const sarRows = useMemo(() => {
+    const s = new Set();
+    for (const p of bscanData) if (Number.isFinite(p.grid_iy)) s.add(p.grid_iy);
+    return [...s].sort((a, b) => a - b);
+  }, [bscanData]);
+  // A selection that no longer exists (new scan, import, undo) falls back to the
+  // lowest row rather than showing nothing.
+  const sarActiveRow = sarRows.length === 0 ? null
+    : (sarRows.includes(sarRowIy) ? sarRowIy : sarRows[0]);
+
+  const handleCscanSelectCell = useCallback((c) => {
+    setCscanSelectedCell((prev) => ((prev && prev.ix === c.ix && prev.iy === c.iy) ? null : c));
+    setSarRowIy(c.iy);
+  }, []);
+
+  // Steps through the rows that hold data. Deliberately does NOT wrap. An open C-scan
+  // row pane moves with it, so the two panels never disagree about the current row.
+  const handleSarRowStep = useCallback((dir) => {
+    const idx = sarRows.indexOf(sarActiveRow);
+    if (idx < 0) return;
+    const nextIdx = idx + dir;
+    if (nextIdx < 0 || nextIdx >= sarRows.length) return;
+    const iy = sarRows[nextIdx];
+    setSarRowIy(iy);
+    setCscanSelectedCell((prev) => (prev ? { ...prev, iy } : prev));
+  }, [sarRows, sarActiveRow]);
+
+  // Only the active row goes to the reconstruction. Filtered BEFORE the background
+  // subtraction, which is a pure per-cell map (Super Fit is keyed by grid cell, the
+  // model by each cell's own standoff), so nothing changes but the cost. Sorted by
+  // column; the worker places positions by grid_ix either way.
+  const sarRowData = useMemo(() => {
+    if (sarActiveRow === null) return bscanData;
+    return bscanData
+      .filter((p) => p.grid_iy === sarActiveRow)
+      .sort((a, b) => a.grid_ix - b.grid_ix);
+  }, [bscanData, sarActiveRow]);
 
   const sarProcessedData = useMemo(
-    () => applyBscanBg(bscanData, { enabled: sarBgEnabled, ...bscanBgSource }, sfcwFreqParams),
-    [bscanData, bscanBgSource, sarBgEnabled, sfcwFreqParams],
+    () => applyBscanBg(sarRowData, { enabled: sarBgEnabled, ...bscanBgSource }, sfcwFreqParams),
+    [sarRowData, bscanBgSource, sarBgEnabled, sfcwFreqParams],
   );
 
   // svdFilter works on `magnitudes`, which ONLY the worker's incoherent path reads --
   // the coherent path rebuilds its profiles from h_cal and runs its own complex SVD
   // there. Running it in coherent mode was a full main-thread power iteration over
   // (positions x bins) on every SVD slider move whose result was then discarded.
-  //
-  // Gated on the panel being open for the same reason the worker is: this is a
-  // power iteration over (positions x bins) on the main thread, and it would
-  // otherwise re-run on every 4 Hz flush of a raster nobody is watching in this
-  // panel. `activePanel` is a dependency, so opening SAR re-derives the filtered
-  // input in that same render and the worker's first job already has it.
   const sarBscanInput = useMemo(() => {
-    if (!sarSvdEnabled || sarCoherent || activePanel !== 'sar' || sarProcessedData.length < 2) {
-      return sarProcessedData;
-    }
+    if (!sarSvdEnabled || sarCoherent || sarProcessedData.length < 2) return sarProcessedData;
     return svdFilter(sarProcessedData, sarSvdK, sarSvdStrength);
-  }, [sarProcessedData, sarSvdEnabled, sarCoherent, sarSvdK, sarSvdStrength, activePanel]);
+  }, [sarProcessedData, sarSvdEnabled, sarCoherent, sarSvdK, sarSvdStrength]);
 
   // SAR and the 2D Map are one-dimensional: they read the horizontal step as the
   // aperture spacing and treat the capture sequence as a line.
@@ -1350,14 +1551,63 @@ export default function App() {
     autoStandoff: sarAutoStandoff,
     manualStandoffMm: sarManualStandoffMm,
   }), [bscanParams.hStep, sarMaxDepth, sarAperture, sarCoherent, sfcwParams.startFreq, sarSvdEnabled, sarSvdK, sarSvdStrength, sarEpsilonR, sarWindowType, sarWallThickness, sarRefraction, sarAutoStandoff, sarManualStandoffMm]);
-  // Only while the SAR panel is open -- see useSarWorker.
-  const { sarResult, sarProgress } = useSarWorker(
-    sarBscanInput, sarParams, activePanel === 'sar');
+  const { sarResult, sarProgress } = useSarWorker(sarBscanInput, sarParams);
 
-  // Max Depth auto-fit. The field is TRUE depth below the wall face, so the 70 cm
-  // default asks for standoff + sqrt(4.5)*0.70 = ~157 cm of apparent range against a
-  // sweep that reaches ~74 cm -- the "clipped" warning was therefore lit permanently at
-  // defaults and carried no signal at all. Seed it once from the reconstruction's own
+  // Detection runs on the WHOLE scan (every row, raw h_cal -- it applies its own fixed
+  // clutter removal), independent of which row the display shows and of the display's
+  // SVD / window / BG toggles. Only the geometry it shares with the display is passed.
+  const sarDetectParams = useMemo(() => ({
+    stepSize: bscanParams.hStep,
+    // row spacing: the line search needs real heights to measure a lean
+    vStep: bscanParams.vStep,
+    startFreq: sfcwParams.startFreq,
+    epsilonR: sarEpsilonR,
+    wallThickness: sarWallThickness,
+    refraction: sarRefraction,
+    autoStandoff: sarAutoStandoff,
+    manualStandoffMm: sarManualStandoffMm,
+  }), [bscanParams.hStep, bscanParams.vStep, sfcwParams.startFreq, sarEpsilonR, sarWallThickness, sarRefraction, sarAutoStandoff, sarManualStandoffMm]);
+  const sarEmptyData = sarEmptyRef ? sarEmptyRef.data : null;
+  const { detection: sarDetection, detectProgress: sarDetectProgress, detectError: sarDetectError } =
+    useSarDetect(bscanData, sarEmptyData, sarDetectParams, undefined, sarDetectMode);
+
+  const handleLoadSarEmptyRef = useCallback(() => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json';
+    input.onchange = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        try {
+          const imported = JSON.parse(ev.target.result);
+          if (!imported.data || !Array.isArray(imported.data)) return;
+          setSarEmptyRef({ name: file.name, data: imported.data });
+        } catch (err) {
+          console.error('Empty reference import failed', err);
+        }
+      };
+      reader.readAsText(file);
+    };
+    input.click();
+  }, []);
+  const handleClearSarEmptyRef = useCallback(() => setSarEmptyRef(null), []);
+
+  // Permittivity suggested from the back-wall echo, shown under the SAR panel's εr
+  // field. Reads the RAW records -- sarBscanInput has the background subtracted, and a
+  // background model removes exactly the wall echoes this measures. One coherent mean
+  // and one IFFT, so it is cheap enough to follow a live raster.
+  const sarEpsilonSuggestion = useMemo(
+    () => estimateWallPermittivity(bscanData, sarWallThickness),
+    [bscanData, sarWallThickness],
+  );
+
+  // Max Depth auto-fit. The field is TRUE depth below the wall face, so the old 70 cm
+  // default asked for far more apparent range than a ~74 cm sweep contains -- the
+  // "clipped" warning was lit permanently at defaults and carried no signal at all.
+  // The default is now 40 cm, which is not clipped on the gw2 bench, so this fires only
+  // when a larger value is entered or the record reaches less. Seed it once from the reconstruction's own
   // reachable depth, which adapts to the record AND to the current epsilon_r, then get
   // out of the way: any manual edit disarms it until the next import.
   const sarDepthAutoFitRef = useRef(true);
@@ -1393,110 +1643,11 @@ export default function App() {
     setSarManualStandoffMm(v);
   }, []);
 
-  // ── TomoSAR 3D state ──────────────────────────────────────────────────────
-  const [tomoData, setTomoData] = useState([]);
-  const [tomoCapturing, setTomoCapturing] = useState(false);
-  const [tomoBgRef, setTomoBgRef] = useState(null);
-  const [tomoBgModel, setTomoBgModel] = useState(null);
-  const [tomoParams, setTomoParams] = useState({
-    xCount: 7, xStep: 5, yCount: 5, yStep: 2,
-    maxDepth: 70, tomoResolution: 30,
-    tomoWindowType: 'hanning', tomoKaiserBeta: 3,
-    tomoRangeComp: 0,
-  });
-  const tomoParamsRef = useRef(tomoParams);
-  tomoParamsRef.current = tomoParams;
-  const tomoCaptureRef = useRef(null);
-  const tomoBgCaptureRef = useRef(null);
-
-  const tomoProcessedData = useMemo(() => {
-    if (!tomoData || tomoData.length === 0) return tomoData;
-    const src = {};
-    if (tomoBgRef) { src.enabled = true; src.bgRef = tomoBgRef; }
-    else if (tomoBgModel) { src.enabled = true; src.bgModel = tomoBgModel; }
-    else { return tomoData; }
-    return applyBscanBg(tomoData, src, sfcwFreqParams);
-  }, [tomoData, tomoBgRef, tomoBgModel, sfcwFreqParams]);
-
-  const tomoInputParams = useMemo(() => ({
-    ...tomoParams,
-    startFreq: sfcwParams.startFreq,
-    stopFreq: sfcwParams.stopFreq,
-    epsilonR: sarEpsilonR,
-  }), [tomoParams, sfcwParams.startFreq, sfcwParams.stopFreq, sarEpsilonR]);
-
-  const tomoEnabled = tomoProcessedData && tomoProcessedData.length >= 2;
-  const { tomoResult, tomoProgress } = useTomoSarWorker(
-    tomoProcessedData, tomoInputParams, tomoEnabled
-  );
-
-  const handleTomoCaptureBg = useCallback(() => {
-    tomoBgCaptureRef.current = true;
-  }, []);
-
-  const handleTomoClearBg = useCallback(() => {
-    setTomoBgRef(null);
-    setTomoBgModel(null);
-  }, []);
-
-  const handleTomoAction = useCallback((action) => {
-    if (action === 'start_session') {
-      setTomoCapturing(true);
-      tomoCaptureRef.current = { armed: true };
-    } else if (action === 'stop_session') {
-      setTomoCapturing(false);
-      tomoCaptureRef.current = null;
-    } else if (action === 'add_scan') {
-      tomoCaptureRef.current = { capture: true };
-    } else if (action === 'new') {
-      setTomoData([]);
-      setTomoCapturing(false);
-      tomoCaptureRef.current = null;
-    } else if (action === 'undo') {
-      setTomoData(prev => prev.slice(0, -1));
-    } else if (action === 'export') {
-      const blob = new Blob([JSON.stringify({
-        version: 1, type: 'tomo_scan',
-        timestamp: new Date().toISOString(),
-        tomoParams, positions: tomoData,
-      })], { type: 'application/json' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `tomo_${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
-      a.click();
-      URL.revokeObjectURL(a.href);
-    } else if (action === 'import') {
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.accept = '.json';
-      input.onchange = (e) => {
-        const file = e.target.files[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = (ev) => {
-          try {
-            const obj = JSON.parse(ev.target.result);
-            if (obj.positions && Array.isArray(obj.positions)) {
-              setTomoData(obj.positions);
-              if (obj.tomoParams) setTomoParams(prev => ({ ...prev, ...obj.tomoParams }));
-            }
-          } catch { /* ignore bad file */ }
-        };
-        reader.readAsText(file);
-      };
-      input.click();
-    }
-  }, [tomoParams, tomoData]);
-
-  // 2D Map uses the same processed B-scan as the main B-scan panel, optionally
-  // with its own SVD -- and, like SAR's, only while its own panel is open. Same
-  // reason: a main-thread power iteration on every flush of a running raster.
+  // 2D Map uses the same processed B-scan as the main B-scan panel, optionally with its own SVD
   const mapBscanData = useMemo(() => {
-    if (!mapSvdEnabled || activePanel !== 'map' || processedBscanData.length < 2) {
-      return processedBscanData;
-    }
+    if (!mapSvdEnabled || processedBscanData.length < 2) return processedBscanData;
     return svdFilter(processedBscanData, mapSvdK, mapSvdStrength);
-  }, [processedBscanData, mapSvdEnabled, mapSvdK, mapSvdStrength, activePanel]);
+  }, [processedBscanData, mapSvdEnabled, mapSvdK, mapSvdStrength]);
 
   // Apply BG subtraction to the live SFCW result: model or captured reference,
   // never both. Complex (vector) subtraction in all cases.
@@ -1595,6 +1746,17 @@ export default function App() {
   // IMU WebSocket
   const handleImuMessage = useCallback((msg) => {
     imuCountRef.current++;
+    // Every packet, so the Handheld averaging window sees the full 50 Hz stream.
+    handheldHistoryRef.current.push(msg);
+    // A tilt calibration in progress reads the same stream. Distances are taken
+    // RAW here: the calibration is what defines the correction, so feeding it
+    // corrected values would be circular.
+    if (handheldCalRef.current && msg.quat && msg.lidars) {
+      const byUart = lidarsByUart(msg);
+      const d = {};
+      for (const a of HANDHELD_AXES) d[a.key] = byUart[handheldAssignmentRef.current?.[a.lidar]]?.mm;
+      handheldCalRef.current.cal.push(msg.quat, d);
+    }
     setImuData(msg);
     if (msg.lidar !== null && msg.lidar !== undefined) {
       setLidarMm(msg.lidar);
@@ -1605,9 +1767,13 @@ export default function App() {
       const seq = msg.lidar_seq;
       if (seq === undefined || seq === null || seq !== lidarLastSeqRef.current) {
         lidarLastSeqRef.current = seq;
-        lidarAccumRef.current.push(msg.lidar);
-        if (lidarAccumRef.current.length > LIDAR_ACCUM_MAX) lidarAccumRef.current.shift();
-        lidarLastFreshRef.current = { mm: msg.lidar, t: performance.now() };
+        const nowMs = performance.now();
+        lidarAccumRef.current.push({ mm: msg.lidar, t: nowMs });
+        pruneAccum(lidarAccumRef, nowMs);
+        // `piTs` is the Pi's own time.time() at the moment this MEASUREMENT
+        // appeared, the same clock sfcw_result.timestamp uses. Staleness is
+        // judged on it rather than on `t` -- see the carry test below.
+        lidarLastFreshRef.current = { mm: msg.lidar, t: nowMs, piTs: msg.lidar_ts ?? null };
         // Continuous BG capture interpolates standoff at each sweep's own
         // instant, so it needs the measurement TRACK rather than the per-sweep
         // average. `lidar_ts` is the Pi's time.time() at the moment the
@@ -1627,11 +1793,13 @@ export default function App() {
     const a = msg.accel;
     if (Array.isArray(a) && a.length === 3 && a.every(v => typeof v === 'number')) {
       const [fwd, left, up] = a;
+      const poseNow = performance.now();
       poseAccumRef.current.push({
+        t: poseNow,
         roll: Math.atan2(left, up) * 180 / Math.PI,
         pitch: Math.atan2(-fwd, Math.hypot(left, up)) * 180 / Math.PI,
       });
-      if (poseAccumRef.current.length > POSE_ACCUM_MAX) poseAccumRef.current.shift();
+      pruneAccum(poseAccumRef, poseNow);
     }
   }, []);
 
@@ -1660,7 +1828,78 @@ export default function App() {
     } else if (msg.type === 'sfcw_status') {
       setSfcwRunning(msg.running);
       setSfcwStatus(msg);
+      if (sfcwRunningPrevRef.current && !msg.running) sfcwOwnerRef.current = false;
+      if (!sfcwRunningPrevRef.current && msg.running) {
+        // A new run: the empty-sweep count describes this run only.
+        emptySweepRef.current = { count: 0, pubAt: -Infinity };
+        setSfcwEmptySweeps(null);
+      }
+      sfcwRunningPrevRef.current = !!msg.running;
+      if (connectPushPendingRef.current) {
+        connectPushPendingRef.current = false;
+        if (!msg.running) sendSfcwParamsRef.current?.();
+      }
     } else if (msg.type === 'sfcw_result') {
+      // Range offset guard. The panel is the source of truth and pushes range_offset on
+      // connect and before every sweep, but a Pi on an older branch can keep its own
+      // default: rod1.json (2026-09-12) recorded 0.5 in every cell while the panel said
+      // 0.378, which put the wall face at -9 cm and mis-ranged every SAR image. The
+      // offset only labels the range axis -- h_cal does not depend on it -- so the
+      // panel's value is stamped onto the result (the Pi's kept as range_offset_pi),
+      // the tab that started the sweep re-pushes at most every 5 s, and the SFCW panel
+      // says so.
+      {
+        const panelRo = sfcwParamsRef.current?.rangeOffset;
+        const g = rangeOffsetGuardRef.current;
+        if (typeof msg.range_offset === 'number' && typeof panelRo === 'number'
+            && Math.abs(msg.range_offset - panelRo) > 1e-6) {
+          const piRo = msg.range_offset;
+          msg.range_offset_pi = piRo;
+          msg.range_offset = panelRo;
+          if (g.piValue !== piRo || g.panelValue !== panelRo) {
+            g.piValue = piRo;
+            g.panelValue = panelRo;
+            console.warn(`[sfcw] Pi reported range_offset ${piRo} m but the panel is ${panelRo} m; recording the panel's value and re-pushing params`);
+            setSfcwRangeOffsetMismatch({ pi: piRo, panel: panelRo });
+          }
+          const now = performance.now();
+          if (sfcwOwnerRef.current && now - g.lastPush > 5000) {
+            g.lastPush = now;
+            sendSfcwParamsRef.current?.();
+          }
+        } else if (g.piValue !== null) {
+          g.piValue = null;
+          g.panelValue = null;
+          setSfcwRangeOffsetMismatch(null);
+        }
+      }
+      // Empty DSP sweep guard. In sweep_mode 'dsp' a failed FPGA read has nothing to
+      // fall back to (there is no raw stream), so the Pi sends an ALL-ZERO sweep tagged
+      // sweep_core 'fallback' to keep its cadence. Recorded, that is a cell / BG sample /
+      // SAR input of pure zeros that looks like a real measurement. Drop it here, before
+      // the display, every capture path and the lidar pairing, and count it for the
+      // SFCW panel. A 'fallback' sweep in 'nios' mode is a real standard sweep with
+      // non-zero data, so it is only dropped when every value is exactly zero.
+      {
+        const re = msg.h_cal_real;
+        const im = msg.h_cal_imag;
+        const isEmptyDspSweep = msg.sweep_core === 'fallback'
+          && Array.isArray(re) && re.length > 0 && Array.isArray(im) && im.length === re.length
+          && re.every((v, i) => v === 0 && im[i] === 0);
+        if (isEmptyDspSweep) {
+          const es = emptySweepRef.current;
+          es.count += 1;
+          if (es.count === 1) {
+            console.warn('[sfcw] dropping an empty DSP sweep (the FPGA read failed; the Pi console says why)');
+          }
+          const now = performance.now();
+          if (now - es.pubAt > 500) {
+            es.pubAt = now;
+            setSfcwEmptySweeps({ count: es.count });
+          }
+          return;
+        }
+      }
       // Averaged lidar standoff for this sweep, plus the provenance needed to
       // judge it: how many DISTINCT readings went into the mean and how far
       // they spread.
@@ -1672,7 +1911,11 @@ export default function App() {
       // are actually for is telling a bad standoff apart from a bad model when
       // a sweep does cancel poorly, which was previously impossible: lidar_n
       // near zero means the standoff is stale, not that the model is wrong.
-      const accum = lidarAccumRef.current;
+      // Drop anything that predates this sweep's plausible window before
+      // measuring it. Without this the accumulator spans the whole idle period
+      // since the last sweep (see ACCUM_WINDOW_MS at its declaration).
+      const accumCutoff = performance.now() - ACCUM_WINDOW_MS;
+      const accum = lidarAccumRef.current.filter(r => r.t >= accumCutoff).map(r => r.mm);
       const lidarN = accum.length;
       // No fresh reading this sweep is NORMAL at 15 Hz sweeps against an
       // 11-17 Hz lidar (see lidarLastFreshRef above) -- carry the last fresh
@@ -1687,8 +1930,30 @@ export default function App() {
       // reading on a static or slowly-moving rig is still sub-mm.
       const LIDAR_CARRY_MS = 1000;
       const fresh = lidarLastFreshRef.current;
+      // Age is measured on the PI'S CLOCK when both ends have it: `lidar_ts` is
+      // stamped when the measurement appeared and `msg.timestamp` when the sweep
+      // ended, both time.time() on the Pi (the same pairing bgContinuous.js
+      // relies on). It used to be performance.now() at BOTH ends -- i.e. when
+      // the browser got around to handling each packet -- which measures the
+      // browser's scheduling, not the sensor.
+      //
+      // That was a live bug, not a nicety. A main-thread stall past
+      // LIDAR_CARRY_MS (the 4 Hz live-flush derive chain measures 32-52 ms per
+      // pass over a few hundred cells, and bscanData reaches tens of MB, so GC
+      // pauses are real) made every reading look stale the moment the thread
+      // resumed -- so a C-scan at a rock-steady 200 mm, where the sensor is
+      // measurably perfect (37,211 consecutive valid reads at 300 mm), still
+      // produced scattered null standoffs and therefore scattered INVALID red-X
+      // cells. The frequency tracked browser load, which is exactly why it read
+      // as random and got worse on bigger grids.
+      //
+      // Falls back to the browser clock only when the Pi did not send a
+      // timestamp (pre-2026-08-28 stream.py, or no measurement yet this run).
+      const ageMs = (fresh && fresh.piTs != null && typeof msg.timestamp === 'number')
+        ? (msg.timestamp - fresh.piTs) * 1000
+        : (fresh ? performance.now() - fresh.t : Infinity);
       const carried = lidarN === 0 && fresh !== null
-        && (performance.now() - fresh.t) < LIDAR_CARRY_MS;
+        && ageMs >= 0 && ageMs < LIDAR_CARRY_MS;
       const avgLidarMm = lidarN > 0
         ? accum.reduce((s, v) => s + v, 0) / lidarN
         : (carried ? fresh.mm : null);
@@ -1698,7 +1963,7 @@ export default function App() {
       const standoffMm = avgLidarMm !== null ? avgLidarMm - lidarOffsetRef.current : null;
       lidarAccumRef.current = [];
 
-      const pose = poseAccumRef.current;
+      const pose = poseAccumRef.current.filter(r => r.t >= accumCutoff);
       const poseN = pose.length;
       const rollDeg = poseN > 0 ? pose.reduce((s, v) => s + v.roll, 0) / poseN : null;
       const pitchDeg = poseN > 0 ? pose.reduce((s, v) => s + v.pitch, 0) / poseN : null;
@@ -1716,11 +1981,16 @@ export default function App() {
       };
 
       // Sweep period from the PI's own timestamps -- median of the adjacent
-      // differences over a 12-sweep window, the same statistic (and for the
-      // same reason: one stalled or dropped frame must not move it) as
-      // Viewport's useSweepRate. The C-scan panel needs it to say what a given
-      // traverse speed will actually sample at, since sweep spacing is
+      // differences over a 12-sweep window (median, not mean, so one stalled or
+      // dropped frame does not move it). This is THE sweep-rate measurement:
+      // the SFCW pane header reads it, and the C-scan panel needs it to say what
+      // a given traverse speed will actually sample at, since sweep spacing is
       // v * T_sweep and everything else follows from that.
+      //
+      // It is computed HERE, above the ~20 Hz display throttle, deliberately --
+      // it must see every sweep. Viewport used to re-derive it from the
+      // throttled `sfcwResult` and so reported the display rate as the radar's;
+      // see the note in Viewport.jsx for why that was expensive.
       {
         const sp = sweepPeriodRef.current;
         if (sp.last != null) {
@@ -1745,7 +2015,7 @@ export default function App() {
       const displayNow = performance.now();
       const capturing = bscanCaptureRef.current || sfcwBgCaptureRef.current
         || bscanBgCaptureRef.current || bgModelAccumRef.current || bgModelTestRef.current
-        || tomoCaptureRef.current || tomoBgCaptureRef.current;
+        || hhCaptureRef.current;
       if (capturing || displayNow - sfcwDisplayThrottleRef.current >= 50) {
         sfcwDisplayThrottleRef.current = displayNow;
         setSfcwResult(msg);
@@ -1761,43 +2031,11 @@ export default function App() {
           num_steps: msg.num_steps,
           step_size: msg.step_size,
           range_offset: msg.range_offset,
+          range_offset_pi: msg.range_offset_pi,
           ...provenance,
         });
         sfcwBgCaptureRef.current = false;
         setSfcwBgCapturing(false);
-      }
-
-      // Tomo BG capture
-      if (tomoBgCaptureRef.current && msg.h_cal_real && msg.h_cal_imag) {
-        setTomoBgRef({
-          h_cal_real: [...msg.h_cal_real],
-          h_cal_imag: [...msg.h_cal_imag],
-          num_steps: msg.num_steps,
-          step_size: msg.step_size,
-          range_offset: msg.range_offset,
-          ...provenance,
-        });
-        tomoBgCaptureRef.current = false;
-      }
-
-      // Tomo position capture
-      if (tomoCaptureRef.current && tomoCaptureRef.current.capture && msg.h_cal_real && msg.h_cal_imag) {
-        const tp = tomoParamsRef.current;
-        const idx = tomoData.length;
-        const { ix, iy } = tomoGridCell(idx, tp.xCount, tp.yCount);
-        setTomoData(prev => [...prev, {
-          h_cal_real: [...msg.h_cal_real],
-          h_cal_imag: [...msg.h_cal_imag],
-          magnitudes: [...msg.magnitudes],
-          distances: [...msg.distances],
-          num_steps: msg.num_steps,
-          step_size: msg.step_size,
-          range_offset: msg.range_offset,
-          grid_ix: ix,
-          grid_iy: iy,
-          ...provenance,
-        }]);
-        tomoCaptureRef.current = { armed: true };
       }
 
       // C-scan capture, STEPPED (and manual). The first sweep after the button
@@ -1835,9 +2073,9 @@ export default function App() {
             step_size: msg.step_size,
             start_freq: msg.start_freq,
             range_offset: msg.range_offset,
+            range_offset_pi: msg.range_offset_pi,
           };
           setBscanData(prev => [...prev, buildCellRecord({
-            keepSweeps: cscanKeepSweepsRef.current,
             sweeps,
             meta,
             cell: tag.cell || cellForIndex(prev.length, grid.hCount),
@@ -1849,6 +2087,82 @@ export default function App() {
           bscanCaptureRef.current = null;
           setBscanCapturing(false);
           setBscanCaptureProgress(null);
+        }
+      }
+
+      // Handheld scan capture. The operator holds the head over a cell and the
+      // sweep after next is that cell (skip: 1 drops the one already in flight,
+      // which may have started before the head settled). Same fill-the-Avg-budget
+      // logic as the stepped C-scan, and the same buildCellRecord, but into the
+      // separate hhScanData so the two panels stay independent.
+      if (hhCaptureRef.current) {
+        const tag = hhCaptureRef.current;
+        const pose = hhPoseRef.current;
+        const px = pose?.pos?.x;
+        const py = pose?.pos?.y;
+        // The head is in a hand. If it has left the cell it was tagged for, or
+        // the position has dropped out, the looks so far are not this cell's --
+        // throw them away rather than file a smeared record under the wrong
+        // index. The operator hears one low note and the panel says why.
+        const here = (px != null && py != null) ? cellForPosition(px, py, hhScanParamsRef.current) : null;
+        const left = !here || here.ix !== tag.cell.ix || here.iy !== tag.cell.iy;
+        if (left) {
+          hhCaptureRef.current = null;
+          setHhScanCapturing(false);
+          setHhCaptureProgress(null);
+          setHhLastEvent({ kind: 'aborted', cell: tag.cell, t: Date.now(),
+            why: !here ? 'position lost' : 'head left the cell' });
+          hhTone('aborted');
+        } else {
+        const look = {
+          h_cal_real: msg.h_cal_real ? [...msg.h_cal_real] : null,
+          h_cal_imag: msg.h_cal_imag ? [...msg.h_cal_imag] : null,
+          timestamp: msg.timestamp,
+          ...provenance,
+          hh_x_mm: px, hh_y_mm: py,
+        };
+        if (tag.skip > 0) {
+          tag.skip -= 1;
+        } else if (tag.got.length + 1 < tag.need) {
+          tag.got.push(look);
+          setHhCaptureProgress({ got: tag.got.length, need: tag.need });
+        } else {
+          const grid = hhScanParamsRef.current;
+          const sweeps = [...tag.got, look];
+          const spread = positionSpread(sweeps.map(w => ({ x: w.hh_x_mm, y: w.hh_y_mm })));
+          const meta = {
+            magnitudes: [...msg.magnitudes],
+            distances: [...msg.distances],
+            num_steps: msg.num_steps,
+            step_size: msg.step_size,
+            start_freq: msg.start_freq,
+            range_offset: msg.range_offset,
+            range_offset_pi: msg.range_offset_pi,
+          };
+          // Replace any existing record for this cell rather than appending a
+          // duplicate, so re-capturing a cell overwrites it.
+          setHhScanData(prev => {
+            const rec = {
+              ...buildCellRecord({
+                sweeps, meta, cell: tag.cell, grid,
+                rover: null, target: null, roverXStd: null,
+              }),
+              // Where the hand actually held the head, and how still: the mean
+              // position of the looks and their spread. Kept beside the cell
+              // index for the same reason the rover keeps rover_x_mm.
+              hh_x_mm: spread.x, hh_y_mm: spread.y, hh_xy_std_mm: spread.std,
+              hh_tilt_deg: pose?.axes?.z?.tiltDeg ?? null,
+            };
+            const at = prev.findIndex(p => p.grid_ix === tag.cell.ix && p.grid_iy === tag.cell.iy);
+            if (at >= 0) { const next = prev.slice(); next[at] = rec; return next; }
+            return [...prev, rec];
+          });
+          hhCaptureRef.current = null;
+          setHhScanCapturing(false);
+          setHhCaptureProgress(null);
+          setHhLastEvent({ kind: 'captured', cell: tag.cell, t: Date.now(), looks: sweeps.length });
+          hhTone('captured');
+        }
         }
       }
 
@@ -1874,6 +2188,7 @@ export default function App() {
             step_size: msg.step_size,
             start_freq: msg.start_freq,
             range_offset: msg.range_offset,
+            range_offset_pi: msg.range_offset_pi,
           },
         });
         publishRowStats();
@@ -1887,6 +2202,7 @@ export default function App() {
           num_steps: msg.num_steps,
           step_size: msg.step_size,
           range_offset: msg.range_offset,
+          range_offset_pi: msg.range_offset_pi,
           ...provenance,
         });
         bscanBgCaptureRef.current = false;
@@ -1901,6 +2217,7 @@ export default function App() {
           num_steps: msg.num_steps,
           step_size: msg.step_size,
           range_offset: msg.range_offset,
+          range_offset_pi: msg.range_offset_pi,
           timestamp: msg.timestamp,
         });
         setBgModelAccumCount(accum.samples.length);
@@ -1927,6 +2244,7 @@ export default function App() {
           num_steps: msg.num_steps,
           step_size: msg.step_size,
           range_offset: msg.range_offset,
+          range_offset_pi: msg.range_offset_pi,
           timestamp: msg.timestamp,
         });
       }
@@ -1962,11 +2280,23 @@ export default function App() {
     } else if (msg.type === 'coherence_result') {
       setCoherenceResult(msg);
       setSfcwRunning(false);
+    } else if (msg.type === 'error' && msg.message) {
+      // sdr_server's refusal of a command (e.g. "Stop sweep before running
+      // coherence test"). Surface it on the coherence panel, which is the
+      // only sender of commands it refuses this way, so its button does not
+      // sit on "Running..." with nothing said.
+      setCoherenceResult({ type: 'coherence_result', error: msg.message });
     }
   }, []);
 
   const sdrUrl = piIp ? `ws://${piIp}:9003` : null;
-  const { status: sdrConnectionStatus, send: sendSdr, connect: connectSdr, disconnect: disconnectSdr } = useWebSocket(sdrUrl, handleSdrMessage);
+  const { status: sdrConnectionStatus, send: sendSdr, connect: connectSdr, disconnect: disconnectSdr } = useWebSocket(sdrUrl, handleSdrMessage, SDR_WS_OPTIONS);
+  // Children get this instead of sendSdr so a sweep started from the SFCW panel's own
+  // button also marks this tab as its owner.
+  const sendSdrTracked = useCallback((m) => {
+    if (m && m.cmd === 'sfcw_start') sfcwOwnerRef.current = true;
+    sendSdr(m);
+  }, [sendSdr]);
 
   // Rover WebSocket (port 9002). The Pi is the only place rover position lives
   // -- it dead-reckons from what it commanded and we mirror it, so a browser
@@ -1974,14 +2304,18 @@ export default function App() {
   const handleRoverMessage = useCallback((msg) => {
     if (msg.type === 'rover_status') {
       setRoverStatus(msg);
-      // Feed the position track that a continuous raster bins against. Stamped
-      // with the PI's ingest time of the board frame, which is the same clock
-      // sfcw_result.timestamp uses -- so the association never touches a
-      // browser clock or either websocket's own delivery latency. Pushed for
-      // every frame whether or not a raster is running, so the history is
-      // already there the moment a row opens.
+      // Feed the position track that a continuous raster bins against. Each
+      // position carries the board's own measurement time (board_ms) beside the
+      // Pi's receipt time (last_status_at, the clock sfcw_result.timestamp is
+      // on); the track fits one to the other and keys on the measurement, so
+      // WiFi jitter and stalls cannot move a sweep's position. See
+      // lib/roverTrack.js. Pushed for every frame whether or not a raster is
+      // running, so the history and the clock fit are already warm when a row
+      // opens.
       if (typeof msg.last_status_at === 'number'
-          && roverCollectorRef.current.pushStatus({ t: msg.last_status_at, x: msg.x_mm, y: msg.y_mm })
+          && roverCollectorRef.current.pushStatus({
+            t: msg.last_status_at, boardMs: msg.board_ms, x: msg.x_mm, y: msg.y_mm,
+          })
           && roverCollectorRef.current.isOpen()) {
         publishRowStats();
       }
@@ -2028,10 +2362,25 @@ export default function App() {
       range_offset: p.rangeOffset,
     });
   }, [sendSdr]);
+  sendSfcwParamsRef.current = sendSfcwParams;
 
+  // Push on (re)connect ONLY when the Pi is idle. It used to push unconditionally, and
+  // since 2026-09-10 the Pi evicts a client that stops draining (a throttled background
+  // tab) and the browser reconnects within 500 ms -- so a background tab re-pushed
+  // ITS panel over the sweep another tab was running, again and again. A tab holding
+  // 0.5 (an old build, or one that had imported a pre-2026-09-07 scan) is the most
+  // likely way rod1.json and one&zero.json were swept at 0.5, and gains or settle
+  // would have been overridden the same way. Pushing while idle loses nothing:
+  // whoever starts the next sweep pushes its full set first.
   useEffect(() => {
-    if (sdrConnectionStatus === 'connected') sendSfcwParams();
-  }, [sdrConnectionStatus, sendSfcwParams]);
+    if (sdrConnectionStatus !== 'connected') return;
+    connectPushPendingRef.current = true;
+    // Ask for sweep results as binary frames on every (re)connect: roughly half the
+    // bytes (no Pi range profile, h_cal as float64) and no JSON parse of the arrays.
+    // A Pi that predates this ignores the command and keeps sending JSON, and the
+    // socket decodes both, so nothing depends on the Pi supporting it.
+    sendSdr({ cmd: 'sfcw_binary', enabled: true });
+  }, [sdrConnectionStatus, sendSdr]);
 
   // ── Rover-driven C-scan raster ─────────────────────────────────────────
   //
@@ -2042,6 +2391,7 @@ export default function App() {
   const startSfcwSweep = useCallback(() => {
     if (sfcwRunning) return;
     sendSfcwParams();
+    sfcwOwnerRef.current = true;
     sendSdr({ cmd: 'sfcw_start' });
   }, [sfcwRunning, sendSfcwParams, sendSdr]);
 
@@ -2058,6 +2408,125 @@ export default function App() {
     };
     setBscanCapturing(true);
   }, [bscanProcParams.avgCount]);
+
+  // ── Handheld scan handlers ─────────────────────────────────────────────
+  // The head is hand-carried, so there is no motion to command: a capture just
+  // tags the sweep-after-next as whichever cell the operator is holding over.
+  const requestHhCapture = useCallback((cell) => {
+    if (!cell || hhCaptureRef.current) return;
+    hhCaptureRef.current = {
+      cell, skip: 1, need: Math.max(1, hhAvgCount), got: [],
+    };
+    setHhScanCapturing(true);
+    setHhCaptureProgress({ got: 0, need: Math.max(1, hhAvgCount) });
+  }, [hhAvgCount]);
+
+  const cancelHhCapture = useCallback((why) => {
+    if (!hhCaptureRef.current) return;
+    const cell = hhCaptureRef.current.cell;
+    hhCaptureRef.current = null;
+    setHhScanCapturing(false);
+    setHhCaptureProgress(null);
+    if (why) setHhLastEvent({ kind: 'aborted', cell, t: Date.now(), why });
+  }, []);
+
+  // Start = sweep on (if it is not) AND auto-capture armed. Pause = disarm only,
+  // the sweep keeps running so resume is instant. Stop = sweep off and disarm.
+  const handleHhStart = useCallback(() => {
+    setHhAutoCapture(true);
+    if (sfcwRunning) return;
+    sendSfcwParams();
+    sfcwOwnerRef.current = true;
+    sendSdr({ cmd: 'sfcw_start' });
+  }, [sfcwRunning, sendSfcwParams, sendSdr]);
+
+  const handleHhPause = useCallback(() => {
+    setHhAutoCapture(false);
+  }, []);
+
+  const handleHhStop = useCallback(() => {
+    setHhAutoCapture(false);
+    cancelHhCapture('sweep stopped');
+    sendSdr({ cmd: 'sfcw_stop' });
+  }, [sendSdr, cancelHhCapture]);
+
+  // If the sweep dies underneath a capture (stopped from another panel, SDR
+  // dropped), the tag must not sit armed forever showing "Capturing…".
+  useEffect(() => {
+    if (!sfcwRunning) cancelHhCapture(hhCaptureRef.current ? 'sweep stopped' : null);
+  }, [sfcwRunning, cancelHhCapture]);
+
+  const removeHhCell = useCallback((cell) => {
+    if (!cell) return;
+    setHhScanData(prev => prev.filter(p => !(p.grid_ix === cell.ix && p.grid_iy === cell.iy)));
+  }, []);
+
+  // Recapture: drop the record and tag the next sweep for the same cell. The
+  // centre/tilt gates are the panel's business; by the time this is called it
+  // has already checked them against the live pose.
+  const handleHhRecapture = useCallback((cell) => {
+    if (!cell || hhCaptureRef.current) return;
+    removeHhCell(cell);
+    hhCaptureRef.current = { cell, skip: 1, need: Math.max(1, hhAvgCount), got: [] };
+    setHhScanCapturing(true);
+    setHhCaptureProgress({ got: 0, need: Math.max(1, hhAvgCount) });
+  }, [removeHhCell, hhAvgCount]);
+
+  const handleHhSetOrigin = useCallback(() => {
+    // Reuse the handheld origin machinery: "set origin here" takes the current
+    // per-axis LiDAR readings as the reference the scan grid is measured from.
+    const res = originFromPose(handheldPose, handheldOrigin);
+    handleHandheldOriginChange(res.origin);
+  }, [handheldPose, handheldOrigin, handleHandheldOriginChange]);
+
+  const handleHhClear = useCallback(() => {
+    setHhScanData([]);
+    setHhScanCapturing(false);
+    setHhCaptureProgress(null);
+    setHhLastEvent(null);
+    hhCaptureRef.current = null;
+  }, []);
+
+  const handleHhExport = useCallback(() => {
+    const exportData = {
+      version: 1,
+      kind: 'handheld_cscan',
+      timestamp: new Date().toISOString(),
+      params: hhScanParams,
+      sfcwParams,
+      lidarAntennaOffsetMm: lidarOffsetMm,
+      data: hhScanData,
+    };
+    const blob = new Blob([JSON.stringify(exportData)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `handheld_${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [hhScanData, hhScanParams, sfcwParams, lidarOffsetMm]);
+
+  const handleHhImport = useCallback(() => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json';
+    input.onchange = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        try {
+          const imported = JSON.parse(ev.target.result);
+          if (imported.data && Array.isArray(imported.data)) {
+            setHhScanData(imported.data);
+            if (imported.params) setHhScanParams(imported.params);
+          }
+        } catch { /* ignore a bad file */ }
+      };
+      reader.readAsText(file);
+    };
+    input.click();
+  }, []);
 
   // How full each grid row is, in the order the rover walks them (0 = the row
   // the origin sits on). This, not a count of non-empty rows, is what a
@@ -2158,6 +2627,7 @@ export default function App() {
       }
       if (sfcwRunning) return;
       sendSfcwParams();
+      sfcwOwnerRef.current = true;
       sendSdr({ cmd: 'sfcw_start' });
     } else if (action === 'start_raster') {
       // Second half of the rover start; a no-op unless parked at the origin.
@@ -2235,13 +2705,20 @@ export default function App() {
               // restoring them would silently re-gain the radio off an old file --
               // exactly the trap CLAUDE.md documents for capture_bgmodel.py.
               if (imported.sfcwParams) {
-                const { startFreq, stopFreq, stepSize: fStep, rangeOffset } = imported.sfcwParams;
+                // rangeOffset is NOT restored either, for the same reason as the gains: it
+                // is a calibration constant of the rig and its cabling, not a property of
+                // a scan. Restoring it put 0.5 back into the panel from any file saved
+                // before 2026-09-07, and the panel then pushed 0.5 to the Pi on every
+                // connect, reconnect and sweep start -- from whichever tab had imported
+                // it, overriding the others. That is the most likely way rod1.json was
+                // swept at 0.5 on a Pi whose default is 0.378. The imported cells keep
+                // their own per-cell range_offset, which is what their processing uses.
+                const { startFreq, stopFreq, stepSize: fStep } = imported.sfcwParams;
                 setSfcwParams(prev => ({
                   ...prev,
                   ...(startFreq != null && { startFreq }),
                   ...(stopFreq != null && { stopFreq }),
                   ...(fStep != null && { stepSize: fStep }),
-                  ...(rangeOffset != null && { rangeOffset }),
                 }));
               }
               // Window and averaging MODE are display choices and are restored so
@@ -2250,15 +2727,13 @@ export default function App() {
               // number of them is whatever was taken, so it is read back from
               // the data rather than trusted from the header.
               if (imported.procParams) {
-                const got = imported.data.find(d => Array.isArray(d.sweeps) && d.sweeps.length)
-                  || imported.data.find(d => d && d.sweep_count > 1);
+                const got = imported.data.find(d => Array.isArray(d.sweeps) && d.sweeps.length);
                 setBscanProcParams(prev => ({
                   ...prev,
                   ...(imported.procParams.windowType && { windowType: imported.procParams.windowType }),
                   ...(imported.procParams.kaiserBeta != null && { kaiserBeta: imported.procParams.kaiserBeta }),
                   ...(imported.procParams.avgMode && { avgMode: imported.procParams.avgMode }),
-                  avgCount: got ? (Array.isArray(got.sweeps) && got.sweeps.length
-                    ? got.sweeps.length : got.sweep_count) : 1,
+                  avgCount: got ? got.sweeps.length : 1,
                 }));
               }
               if (imported.bgRef) {
@@ -2272,7 +2747,7 @@ export default function App() {
                 const {
                   stepSize, numPositions, maxDepth, wallThickness,
                   hCount, hStep, vCount, vStep, gateStart, gateEnd, metric,
-                  focusEnabled, focusAperture,
+                  focusEnabled, focusAperture, focusMethod, focusGamma,
                 } = imported.params;
                 // v3 and earlier called it wallThickness. It is no longer a
                 // C-scan parameter at all -- it only ever bounded SAR's
@@ -2292,6 +2767,8 @@ export default function App() {
                   ...(metric != null && { metric }),
                   ...(focusEnabled != null && { focusEnabled }),
                   ...(focusAperture != null && { focusAperture }),
+                  ...(focusMethod != null && { focusMethod }),
+                  ...(focusGamma != null && { focusGamma }),
                 }));
               }
             }
@@ -2346,6 +2823,7 @@ export default function App() {
     if (action === 'start_session') {
       if (sfcwRunning) return;
       sendSfcwParams();
+      sfcwOwnerRef.current = true;
       sendSdr({ cmd: 'sfcw_start' });
     } else if (action === 'stop_session') {
       sendSdr({ cmd: 'sfcw_stop' });
@@ -2546,6 +3024,44 @@ export default function App() {
         imuRate={imuRate}
         imuData={imuData}
         lidarMm={lidarMm}
+        handheldPose={handheldPose}
+        sdrConnected={sdrConnectionStatus === 'connected'}
+        sfcwRunning={sfcwRunning}
+        hhScanData={hhScanData}
+        hhScanParams={hhScanParams}
+        onHhScanParamsChange={setHhScanParams}
+        hhScanCapturing={hhScanCapturing}
+        hhCaptureProgress={hhCaptureProgress}
+        hhAvgCount={hhAvgCount}
+        onHhAvgCountChange={setHhAvgCount}
+        hhAutoCapture={hhAutoCapture}
+        onHhStart={handleHhStart}
+        onHhPause={handleHhPause}
+        onHhStop={handleHhStop}
+        onHhCapture={requestHhCapture}
+        onHhRecapture={handleHhRecapture}
+        onHhClearCell={removeHhCell}
+        onHhSetOrigin={handleHhSetOrigin}
+        onHhClear={handleHhClear}
+        onHhExport={handleHhExport}
+        onHhImport={handleHhImport}
+        hhBeep={hhBeep}
+        onHhBeepChange={setHhBeep}
+        hhLastEvent={hhLastEvent}
+        handheldOrigin={handheldOrigin}
+        onHandheldOriginChange={handleHandheldOriginChange}
+        handheldAssignment={handheldAssignment}
+        onHandheldAssignmentChange={handleHandheldAssignmentChange}
+        handheldAvgMs={handheldAvgMs}
+        onHandheldAvgMsChange={handleHandheldAvgMsChange}
+        handheldTilt={handheldTilt}
+        onHandheldTiltChange={handleHandheldTiltChange}
+        handheldMount={handheldMount}
+        onHandheldMountChange={handleHandheldMountChange}
+        handheldCal={handheldCal}
+        onHandheldCalStart={handheldCalStart}
+        onHandheldCalFinish={handheldCalFinish}
+        onHandheldCalCancel={handheldCalCancel}
         sdrConnected={sdrConnectionStatus === 'connected'}
         roverConnected={roverConnectionStatus === 'connected'}
         roverStatus={roverStatus}
@@ -2557,9 +3073,11 @@ export default function App() {
         onToggleFFT={setShowFFT}
         graphPaused={graphPaused}
         onTogglePause={setGraphPaused}
-        sendSdr={sendSdr}
+        sendSdr={sendSdrTracked}
         sfcwRunning={sfcwRunning}
         sfcwStatus={sfcwStatus}
+        sfcwRangeOffsetMismatch={sfcwRangeOffsetMismatch}
+        sfcwEmptySweeps={sfcwEmptySweeps}
         sfcwParams={sfcwParams}
         onSfcwParamsChange={setSfcwParams}
         sfcwResult={processedSfcwResult}
@@ -2616,9 +3134,6 @@ export default function App() {
         onCscanSmoothChange={setCscanSmooth}
         cscanColormap={cscanColormap}
         onCscanColormapChange={setCscanColormap}
-        cscanKeepSweeps={cscanKeepSweeps}
-        onCscanKeepSweepsChange={setCscanKeepSweeps}
-        cscanMemory={cscanMemory}
         cscanProjector={cscanProjector}
         onCscanProjectorChange={setCscanProjector}
         bscanScaleLink={bscanScaleLink}
@@ -2659,6 +3174,7 @@ export default function App() {
         sarMaxDepth={sarMaxDepth}
         onSarMaxDepthChange={handleSarMaxDepthChange}
         sarEpsilonR={sarEpsilonR}
+        sarEpsilonSuggestion={sarEpsilonSuggestion}
         onSarEpsilonRChange={setSarEpsilonR}
         sarWindowType={sarWindowType}
         onSarWindowTypeChange={setSarWindowType}
@@ -2674,17 +3190,16 @@ export default function App() {
         onSarViewModeChange={setSarViewMode}
         sarColormap={sarColormap}
         onSarColormapChange={setSarColormap}
-        tomoParams={tomoParams}
-        onTomoParamsChange={setTomoParams}
-        tomoData={tomoData}
-        tomoResult={tomoResult}
-        tomoProgress={tomoProgress}
-        tomoCapturing={tomoCapturing}
-        tomoBgRef={tomoBgRef}
-        tomoBgModel={tomoBgModel}
-        onTomoAction={handleTomoAction}
-        onTomoCaptureBg={handleTomoCaptureBg}
-        onTomoClearBg={handleTomoClearBg}
+        sarDetection={sarDetection}
+        sarDetectProgress={sarDetectProgress}
+        sarDetectError={sarDetectError}
+        sarEmptyRefName={sarEmptyRef ? sarEmptyRef.name : null}
+        onLoadSarEmptyRef={handleLoadSarEmptyRef}
+        onClearSarEmptyRef={handleClearSarEmptyRef}
+        sarHandleEnds={sarHandleEnds}
+        onSarHandleEndsChange={setSarHandleEnds}
+        sarDetectMode={sarDetectMode}
+        onSarDetectModeChange={setSarDetectMode}
         mapBscanData={mapBscanData}
         mapGateStart={mapGateStart}
         mapGateEnd={mapGateEnd}
@@ -2744,7 +3259,12 @@ export default function App() {
       <Viewport
         activePanel={activePanel}
         isConnected={isConnected}
+        sweepPeriodMs={sweepPeriodMs}
         imuData={imuData}
+        handheldPose={handheldPose}
+        hhScanData={hhScanData}
+        hhScanParams={hhScanParams}
+        hhScanReady={captureReadiness(handheldPose, hhScanParams, filledCells(hhScanData)).ready}
         roverStatus={roverStatus}
         roverTrail={roverTrail}
         roverLog={roverLog}
@@ -2768,6 +3288,7 @@ export default function App() {
         bscanBgSubMode={bscanBgSubMode}
         cscanSharedScale={cscanSharedScale}
         bscanParams={bscanParams}
+        cscanFocusParams={cscanFocusParams}
         bscanCapturing={bscanCapturing}
         roverScan={roverScan}
         bscanScaleMode={bscanScaleMode}
@@ -2781,15 +3302,21 @@ export default function App() {
         cscanColormap={cscanColormap}
         cscanRowScales={cscanRowScales}
         cscanGridScales={cscanGridScales}
-        cscanCellValues={cscanCellValues}
         sarResult={sarResult}
         sarProgress={sarProgress}
         sarScaleMode={sarScaleMode}
         sarDynRange={sarDynRange}
         sarViewMode={sarViewMode}
         sarColormap={sarColormap}
-        tomoResult={tomoResult}
-        tomoProgress={tomoProgress}
+        sarRows={sarRows}
+        sarDetection={sarDetection}
+        sarDetectProgress={sarDetectProgress}
+        sarHandleEnds={sarHandleEnds}
+        sarActiveRow={sarActiveRow}
+        onSarRowStep={handleSarRowStep}
+        cscanSelectedCell={cscanSelectedCell}
+        onCscanSelectCell={handleCscanSelectCell}
+        onCscanCloseRow={() => setCscanSelectedCell(null)}
         mapBscanData={mapBscanData}
         mapGateStart={mapGateStart}
         mapGateEnd={mapGateEnd}
@@ -2821,7 +3348,7 @@ export default function App() {
           <CscanDisplay
             chromeless
             scanData={cscanProcessedData}
-            params={bscanParams}
+            params={cscanFocusParams}
             scaleMode={bscanScaleMode}
             scaleRange={bscanScaleRange}
             sharedScale={cscanPlanScales.global}
@@ -2835,7 +3362,8 @@ export default function App() {
             projection={cscanProjection}
             smooth={cscanSmooth}
             colormap={cscanColormap}
-            cellValues={cscanCellValues}
+            detection={sarDetection}
+            handleEnds={sarHandleEnds}
             rootRef={cscanProjectorRootRef}
           />
         </ProjectorWindow>

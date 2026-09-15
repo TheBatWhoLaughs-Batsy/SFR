@@ -64,7 +64,10 @@ throttle the LiDAR rate. The LiDAR read is guarded the same way.
 **Diagnosing a missing standoff readout:** the sidebar's IMU Hz tile is on every panel and
 tells the two cases apart. Hz blank -> the sensor stream (port 9001) is down, check
 `stream.py`'s stdout on the Pi. Hz live but Standoff `—` -> the stream is up and
-`read_distance()` is returning `None`, so it's the TF-LC02 serial path (`/dev/serial0`).
+`read_distance()` is returning `None`, so it's the TF-LC02 path.
+**Since 2026-09-11 you no longer have to guess which:** the packet carries `lidar_err`
+naming the cause, and `stream.py` logs a dropout in plain words. See "LiDAR dropouts are
+the SENSOR refusing to range" below -- do NOT start from the wiring again.
 
 **LiDAR silent-serial investigation (2026-08-24), unresolved — needs a bench check, not
 more code.** `read_distance()` returns `None` because the TF-LC02 gives back literally zero
@@ -122,6 +125,9 @@ it's UART0's receive path specifically. **Fix shipped:** `uart0-pi5` disabled (c
 removed) and `uart3-pi5` made persistent in `config.txt`; `tflc02.py` `TFLC02.__init__`
 now defaults to `/dev/ttyAMA3` (was `/dev/serial0`) — **the earlier instruction above to
 default to `/dev/serial0` no longer applies now that UART0 is dead; don't move it back.**
+**SUPERSEDED 2026-09-15: the forward (standoff) head is now on `/dev/ttyAMA2`** (three heads
+were re-wired; see "Handheld panel" at the end of this file), so `TFLC02.__init__` and
+`stream.py`'s `LIDAR_PORTS_DEFAULT[0]` default to it. UART0 is still dead.
 LiDAR now wired to physical pins 24 (TX) / 21 (RX) instead of 8/10; VCC (3.3V, not shared
 with the IMU — see above) and GND unchanged. Live-tested end to end afterward with clean,
 stable readings.
@@ -274,6 +280,240 @@ The `[INFO @ .../version.c]` firmware/FPGA-newer-than-compatibility-table lines 
 and expected — libbladeRF's bundled compatibility table just lags the flashed firmware/FPGA
 versions; ignore them, don't chase a libbladeRF upgrade just to silence an INFO line.
 
+## LiDAR dropouts are the SENSOR refusing to range, not the link (2026-09-11)
+
+Reported as "random issues with the lidar sometimes not working", and separately as
+"running long c scans, randomly the lidar data stops and I get those scans with the x
+mark". Both are one fault, now measured and now self-reporting.
+
+### What it is
+
+**The module answers every single command and reports a non-zero `error_code`.** Measured
+live on the bench: over 30 s, 16.9% of reads failed, **every one of them sensor-reported,
+with zero link failures**. The UART underneath is spotless --
+`TIOCGICOUNT` on `/dev/ttyAMA3` (read without consuming bytes, alongside a running
+`stream.py`) gives **888 B/s TX = 177.6 commands/s against 1423 B/s RX = 177.9 replies/s,
+a clean 1:1, and 0 frame / parity / overrun / break / buf_overrun over 100 s.**
+
+So this is a SIGHTING problem -- target range, angle, reflectivity, ambient IR -- and the
+fix is to aim the head, not to re-check cables. **Do not re-run the 2026-08-24 wiring
+investigation.** That one was real and is fully resolved (dead UART0 receiver); this is a
+different failure with the same symptom, and the two were indistinguishable until now.
+
+The dropouts are **total and long**: runs of 9.0 s, 22.3 s, 2.4 s and 1.1 s were caught,
+all self-recovering, against 420 s and 180 s windows elsewhere with none at all. They are
+condition-dependent, which is exactly why they read as "random".
+
+### The error code is a BITFIELD, and blackouts raise bits ordinary misses do not
+
+Codes observed: **4, 6, 20, 22, 52, 54, 128**. They decompose cleanly into bits --
+4 = bit2, 6 = bits1+2, 20 = bits2+4, 22 = bits1+2+4, 52 = bits2+4+5, 54 = bits1+2+4+5,
+128 = bit7 alone. So it is a flags register, not an enum, and `error_code != 0` is throwing
+away the only information that separates the two regimes:
+
+| | codes |
+|---|---|
+| ordinary scattered misses (blackout-free windows) | almost entirely **`sensor:4`**, occasionally `128` |
+| a real blackout | **`4` + `6` + `20` + `22` together, in the hundreds** |
+
+**Bits 1, 4 and 5 essentially only appear during a sustained out-of-range run**, while an
+isolated miss is almost always bare `4`. Useful as a signature, but note BOTH carry 8888
+(see below), so the difference is in how the module grades its own failure, not in whether
+a measurement was available.
+
+**ROOT CAUSE, settled by a raw probe: the target is simply OUT OF RANGE, and the module
+says so with a literal distance of 8888.** Driving the driver directly (stream.py stopped)
+while the module was pointed across a room:
+
+| code | reads | distance returned |
+|---|---|---|
+| 0 | 5,947 | 288-404 mm, real |
+| 4 / 6 / 20 / 22 / 54 | 33,825 | **ALL exactly 8888, without exception** |
+
+and a separate 70 s run held at ~300 mm gave **37,211 reads, 100% `error_code 0`, zero
+failures** -- at 531 reads/s, i.e. three times harder than `stream.py` polls. So:
+
+- **Nothing usable is being discarded.** Every rejected read carried the 8888 sentinel, so
+  the 2026-08-24 decision to reject on `error_code != 0` costs no measurements. Returning
+  8888 would put the standoff at 8.888 m and destroy any BG model.
+- **Short range is flawless and hammering it is harmless.** Poll rate is exonerated; the
+  `--lidar-rate` A/B below is no longer worth running.
+- **A "blackout" is not a fault at all.** It is a healthy module reporting that the target
+  is beyond what it can measure. Runs of 41.6 s, 16 s and 14.4 s were logged while the
+  module was waved around a room.
+
+**An EARLIER ENTRY IN THIS SECTION CLAIMED RANGE WAS FALSIFIED AS THE TRIGGER. THAT WAS
+WRONG** and is corrected here. It rested on a 180 s window that swept 31-847 mm with no
+blackout -- but that window simply never exceeded the module's reach. 847 mm is inside it;
+a room is not. The reach is not a fixed number: it depends on the target's reflectivity and
+angle, which is why a bright surface at 850 mm reads fine and a far wall does not.
+
+Operationally this means the blackouts seen while hand-waving are EXPECTED and say nothing
+about a scan. During a real C-scan the standoff is 130-400 mm, where the module is
+measurably perfect -- so **X marks appearing in an actual raster are far more likely to be
+the transport fault below than the sensor.**
+
+`read_distance_detail()` therefore reports `oor:<code>` (distance was 8888) separately from
+`sensor:<code>` (non-zero code with a plausible distance -- never yet observed) and
+`link:*`, via `is_out_of_range_reason()`. The dropout log names it in words: *"target OUT OF
+RANGE -- the module is working and returns its 8888 sentinel"*. The distinction matters
+because the operator reported the old 8888-passthrough as "way more responsive and
+predictable" -- the information it carried was real, and suppressing the VALUE without
+surfacing the FACT is what made a working sensor look broken.
+
+### Why it produces the red X, and why only sometimes
+
+`lidar_standoff_mm` goes null after `LIDAR_CARRY_MS` (1 s) of CONTINUOUS failure. Every
+cell captured from then on records a null standoff, and `backgroundFor()` in `bscanBg.js`
+returns `BG_STATUS.NO_STANDOFF` -> drawn as a red cross on dark red, excluded from both
+colour scales. A 9-22 s dropout is several cells, mid-raster.
+
+**It only happens under a BG MODEL.** A captured reference and Super Fit do not consume
+standoff at all, so the identical cells subtract normally in those modes -- which is what
+makes it look intermittent and mode-dependent. Two neighbours worth knowing: **SAR does
+NOT flag these cells**, it fills them with the median standoff (`sar.worker.js`), so a
+dropout degrades SAR quietly rather than visibly; and continuous BG capture refuses to
+interpolate across a gap > `MAX_BRACKET_GAP_S`, so a dropout silently thins the run.
+
+### The reason a failure now has a reason
+
+`read_distance()` collapsed FIVE distinct failures into a bare `None` -- timeout, no
+header, short frame, bad footer, bad opcode, and `error_code != 0`. Nothing in the system
+could tell "the module cannot see the target" from "the module is dead", which is why the
+last investigation spent days on cables. `read_distance_with_error()` existed and was
+never called.
+
+`tflc02.py` now has ONE parse path (`_read_response` returns `(dist, error_code, reason)`)
+with `read_distance()` / `read_distance_detail()` / `read_distance_with_error()` as thin
+wrappers -- the two hand-copied parsers it used to carry were the same drift hazard this
+repo already records for CFAR and the SAFT kernel. Reasons split into two classes that
+demand opposite responses: `sensor:<n>` (module answered; aim/range/reflectivity) and
+`link:*` (module did not answer; power/wiring/baud), separated by `is_link_reason()`.
+
+On the wire, additively (a groundstation that predates them ignores them):
+`lidar_err`, `lidar_last_good_mm`, `lidar_last_good_age_s`.
+
+**`stream.py` logs a dropout in plain words**, and the rate-limiting is the load-bearing
+part. Nothing is printed below `LIDAR_DROPOUT_WARN_S = 1.0 s` of CONTINUOUS failure --
+that is not a round number, it is exactly `LIDAR_CARRY_MS` in `App.jsx`, i.e. the moment
+the standoff actually goes null and cells actually start rendering invalid, so every line
+printed corresponds to something the operator is about to see. A persisting dropout
+repeats only every `LIDAR_DROPOUT_REPEAT_S = 15 s`. Verified head-first (15 checks, fake
+clock, scripted sensor): a healthy stream and a **40%-scattered-invalid stream are both
+completely silent**, a sustained dropout prints exactly one warning naming the dominant
+reason and one recovery line with the duration, and a 60 s dropout prints 3-6 lines rather
+than 12,000. That silence is the point -- a recurring benign line is what trained the
+operator to ignore the `_sweep_core` 2-tuple error for weeks.
+
+### Also fixed: the accumulators grew for as long as the tab was open
+
+`lidarAccumRef` / `poseAccumRef` in `App.jsx` were cleared ONLY inside the `sfcw_result`
+handler, so with no sweep running they grew at the measurement rate indefinitely. Besides
+the leak, **the first sweep of the next session got a standoff averaged over the entire
+idle period** -- over wherever the head was while being carried into place -- reported with
+an `lidar_n` in the thousands, which makes it look exceptionally well measured. Entries are
+now `{mm, t}`, filtered to `ACCUM_WINDOW_MS = 2000` before a sweep reads them and pruned at
+`ACCUM_PRUNE_AT = 512` so an idle tab cannot accumulate. 2 s is generous on purpose: the
+job is to exclude the idle period, not to trim a slow sweep, and a 2 s-old reading is
+already past the age at which App calls the standoff stale.
+
+### A SECOND, independent cause of the same X marks: one slow client froze the stream
+
+**This is the one that produces a "LiDAR blackout" with a perfectly healthy LiDAR, and it
+is now FIXED.** `stream.py`'s broadcast was `await gather(*(c.send(msg) for c in clients))`
+with no timeout -- the same slow-client bug already fixed in `sdr_server.py`
+(`_send_to_all`) and `rover_server.py` (`_fanout`), left latent here because this file's
+gather happened to be safe from the *other* half of that bug (the set-mutation
+RuntimeError).
+
+Measured 2026-09-11 against the shipped server, one client that never reads:
+
+| | healthy client alongside it |
+|---|---|
+| before | 34.0 Hz, worst gap **10,000 ms**, 3 gaps > 1 s in 40 s |
+| after `BROADCAST_TIMEOUT_S = 0.5` | 47.8 Hz, worst gap **503 ms**, 0 gaps > 1 s |
+
+A 50 ms-per-packet stall alone (not a full stop) already cost 48.6 -> 36.5 Hz. The residual
+503 ms is exactly the one frame that hits the timeout before the client is dropped.
+
+**How this was caught, and the lesson: the Pi log and the UI disagreed.** The operator
+reported repeated 5-10 s freezes of the standoff readout with the warning line showing,
+over a 12-minute period in which `stream.log` recorded **zero** dropout lines and a
+180 s capture measured 0.3% null over 31-847 mm. A LiDAR fault cannot be invisible to the
+sensor's own log; a transport fault is invisible to it by construction. **Whenever the UI
+says the LiDAR is out and the Pi log is silent, it is not the LiDAR.**
+
+**Contributing factor worth checking on any repeat: how many clients are actually
+attached.** `ss -tn | grep :9001` during the incident showed **six** connections from three
+machines -- three from one host, plus two in FIN-WAIT-2 (tabs closed without completing the
+close, which the 20 s keepalive had not yet reaped) and one with 504 bytes backed up in
+Send-Q. Note `rover_server.py` is NOT among them: it never connects to 9001. But each
+browser tab opens THREE sockets (9001 sensor, 9002 rover, 9003 SDR) drained by the SAME
+main thread, so rover-panel rendering competes with draining the LiDAR socket -- which is
+worst during a rover-driven C-scan, exactly when the X marks were reported.
+
+### THE ACTUAL CAUSE of random X marks in a real C-scan: staleness was timed on the BROWSER clock
+
+This is the one that matches the operator's real complaint -- *"C-scans at a near-constant
+range of around 200 mm, random cross marks, sometimes rare, sometimes quite frequent"* --
+and it is neither of the two above. At 200 mm the sensor is measurably perfect (37,211
+consecutive reads at 300 mm, 100% valid, and the module's cadence is FASTEST at short
+range), so a null standoff there could never have been the LiDAR.
+
+`App.jsx` decided whether to carry the last reading forward with
+
+    (performance.now() - fresh.t) < LIDAR_CARRY_MS
+
+where `fresh.t` was also `performance.now()`, stamped when the browser got around to
+HANDLING the lidar packet. **Both ends were the browser's own scheduling clock, so the test
+measured how busy the main thread was, not how old the measurement was.** Any stall past
+1 s -- the 4 Hz live-flush derive chain is 32-52 ms per pass over a few hundred cells,
+`bscanData` reaches tens of MB, and GC pauses are real -- made every reading look stale the
+instant the thread resumed. The sweep landing in that window recorded a null standoff and
+its cell rendered INVALID.
+
+That explains every part of the report that the sensor theory could not:
+- **constant 200 mm** -- irrelevant, the test never looked at the sensor;
+- **random** -- it tracks browser load, not anything physical;
+- **"sometimes rare, sometimes quite frequent"** -- the derive chain cost scales with cell
+  count, so a big or long-running grid stalls more often than a small one.
+
+Both quantities are already available on the **Pi's** clock -- `lidar_ts` (stamped when the
+measurement appeared) and `sfcw_result.timestamp` -- and they are the same `time.time()`,
+the pairing `bgContinuous.js` already depends on. The age is now computed from those, with
+the browser clock kept only as a fallback for a Pi that sends no `lidar_ts`. Verified by
+extracting the SHIPPED expression out of `App.jsx` and driving it (11 checks): a 3 s browser
+stall now carries correctly, a genuine 3 s sensor outage still goes null, a measurement
+stamped after its sweep is refused rather than treated as infinitely fresh, and the fallback
+path behaves as before.
+
+**The general lesson, which this repo keeps relearning: an instrument fed from a throttled,
+decimated or re-timed copy of the data reports on the copy.** Same class as `lidar_seq`
+counting reads rather than measurements, and as the SFCW header reporting the throttled
+display rate as the radar's sweep rate.
+
+Note the send timeout above stops one stalled client taking the others down, but it was
+never going to fix this: the stalling client and the scanning tab are the same tab.
+
+The two causes are now distinguishable, which is the practical payoff of the logging:
+
+- **runs of adjacent invalid cells + a `no valid LiDAR reading for N s` line in the Pi log**
+  -> the sensor could not range. Re-aim.
+- **isolated invalid cells and the Pi log SILENT** -> the browser stalled. Nothing is wrong
+  with the LiDAR.
+
+### What to do about the blackouts themselves
+
+The instrumentation names the cause; it does not stop it, and the physical trigger is not
+yet known (see above -- range is ruled out). **Before the next long C-scan, watch
+`stream.log` for a minute:** a low steady `sensor:4` rate is normal and harmless; a run
+past 1 s now announces itself and is the cue to re-aim rather than to scan.
+
+**The poll-rate hypothesis is dead, do not spend time on it.** The idea was that adaptive
+integration (17.2 Hz at 165 mm falling to 11.5 Hz at 340 mm) might never complete against a
+command every 5.6 ms. Measured: 37,211 consecutive reads at **531/s** with **zero** failures
+at 300 mm. Polling hard does not break it.
+
 ## Living Documentation Rule
 
 CLAUDE.md and CONTEXT.md are living documents. Whenever you learn key information
@@ -383,35 +623,95 @@ The panel is the source of truth; keep new SFCW params in that payload or they w
 reach the Pi.
 Next steps: SAR reconstruction integration.
 
-## Rover firmware lineage — READ BEFORE TOUCHING `rover/` (2026-09-12)
+## Rover steering: yaw trim + closed loop (ported from `moving_stuff`, 2026-09-13)
 
-There were two divergent `rover.ino`s. This branch carries the one the rig actually runs.
+`pi/rover/yaw_control.py`, `rover_server.py`'s yaw plumbing, the panel's Steering
+Trim section, and firmware yaw trim. The rover has one driven front wheel and two
+driven rear wheels on separate axles; **nothing steers**. The chassis yaws when the
+rear pair run at different rates, and that is the only steering authority there is.
+Full description in CONTEXT.md ("Steering: three modes" and "Yaw trim").
 
-- **`rover/` on this branch = firmware 2.4.0**, built on **2.3.0**, which is the original
-  2.0.0 plus exactly one networking addition (`ensureLinkHealth()`: WiFi up but no socket
-  for 30 s → drop the association and rejoin; every 3rd round resets the radio;
-  `LINK_STALL_MS 0` makes it byte-identical to 2.0.0) plus yaw trim. It was run on the rig
-  and holds the link.
-- **The previous `rover/` ("network recovery ladder": `serviceNetwork()`, gateway ping,
-  self-reboot, `IDLE_DISABLE_MS`, `DRIVER_WAKE_MS`, `rover/test/test_net.cpp`) is NOT on
-  this branch.** The sections below that describe it — "The board could never rejoin the
-  network", the ladder rungs, `test_net.cpp` — document that other lineage and do not match
-  the code here. They are left in place as history. `idle_ms` in `cfg` is still sent by the
-  Pi and is ignored by this firmware.
-- **The random mid-scan disconnects of 2026-09-10 were never in the firmware.** They were
-  `_fanout()` in `rover_server.py` raising `Set changed size during iteration` inside
-  `board_handler` (see the docstring on `_fanout`). Every firmware-side "our side dropped
-  it, WiFi fine, back in 3 s" log was the Pi's TCP vanishing without a close frame. Keep
-  that docstring; it is the finding.
-- Merging the two lineages is a deliberate job, not a merge conflict to resolve blindly.
-- **Yaw trim** (2.4.x): firmware runs the rear wheels at (1∓α) of the base rate; α comes
-  from the Pi as `yaw` in `cfg` or a bare `trim` command. Manual α is `yaw_trim_pct`;
-  `heading` α closes on the BNO085; `track` α cascades the LiDAR standoff into the
-  heading reference (`pi/rover/yaw_control.py`). `rover_server.py` needs `stream.py` up
-  for both; `manual` works without. **Firmware is unchanged between them** — the board
-  only ever receives a number.
-  Sign convention and the invert flag are documented in `rover/config.h` and
-  `yaw_control.py`; test the sign before trusting a raster to it.
+Three modes, each strictly more capable: `manual` (a number the operator tuned by
+eye), `heading` (hold the BNO085 heading — fixes travelling SLANTED), `track`
+(cascade the LiDAR standoff into the heading reference — also fixes being on the
+wrong LINE). Mode is a **command, never persisted**, because the references do not
+survive a restart either; the gains are config and are.
+
+**Heading hold cannot recover the line, and that is inherent, not a bug.** Heading is
+unobservable in position, so a disturbance that shoves the rover sideways leaves it
+running perfectly parallel along a new, permanently offset line. Reproduced here in
+simulation: shoved 80 mm off with the heading already correct and no drift at all,
+`heading` sits at 280.0 mm for 60 s and never moves; `track` returns to 202.7 mm.
+That is the whole reason `track` exists — do not "fix" heading mode to close it.
+
+### What this branch's firmware is, and the lineage trap
+
+**There are two divergent `rover.ino` lineages and this branch carries a THIRD that
+is the merge of them.** Do not resolve this by blind checkout in either direction.
+
+- **`rover/` here = firmware 2.5.0 = 2.0.0 (the network recovery ladder,
+  `serviceNetwork()` / gateway ping / self-reboot / `test_net.cpp`) + yaw trim + the
+  2026-09-12 wiring.**
+- **`moving_stuff`'s `rover/` = 2.4.1**, which is the same yaw trim on a 2.0.0 that
+  has **no** ladder — it has `ensureLinkHealth()` instead, and it deletes
+  `test_net.cpp` and `rover/test/netstubs/`. Taking that commit wholesale would have
+  reverted the network work this repo's own "The board could never rejoin the network"
+  section records, and dropped the only harness that can test a liveness property.
+- What was ported across is exactly: the yaw trim (ISR, `setYawTrim`, `yaw` in
+  `cfg`/`hello`/`status`, the `trim` command), the per-wheel `H_INVERT_*` direction
+  flags, the pin map and `V_DIR_INVERT` **as set on the rig 2026-09-12**, and
+  `RX_BUFFER_SIZE` 256 -> 320. Nothing networking-related moved.
+- **`RX_BUFFER_SIZE` and the Pi's `BOARD_RX_LIMIT` must agree** (both 320). The `cfg`
+  grew a `yaw` field and a worst-case `cfg` is now 264 bytes; over the limit the board
+  rejects it silently apart from one line in its log — and `cfg` is what carries the
+  **soft limits**, which on a rig with no endstops are the backstop.
+
+### Signs: two flags, and the defaults are consistent with the documented conventions
+
+`+alpha` turns the nose RIGHT (`rover/config.h`) and `bno085.yaw_deg` is CCW-positive,
+so `+alpha` must DECREASE `yaw_deg`. Checked in simulation: with the plant built from
+those two documented conventions the shipped defaults (`yaw_invert` false) converge,
+and `yaw_invert` true diverges to +185 deg in 20 s where open loop reaches only +12.
+So a wrong sign is loud, not subtle — which is what the panel's "if the drift gets
+WORSE, flip it" instruction relies on. **Still verify both signs on the rig**; the
+simulation validates the arithmetic, not the wiring.
+
+`dir` appears TWICE in the control law for different reasons — inner loop because the
+same alpha yaws the chassis the opposite way in reverse, outer loop because a given
+heading moves the rover sideways the opposite way in reverse. Both automatic.
+
+The outer loop is **P-only on purpose**: heading -> lateral position is an integrator,
+so P already drives standoff error to zero at equilibrium, and a second integrator
+would only fight the inner loop's `bias` for authority over the same steady state.
+
+### Degradation is deliberate
+
+A stale IMU holds alpha and steers nothing. A stale or implausible LiDAR drops `track`
+to `heading` behaviour — straight, but not distance-corrected — rather than steering on
+a bad range. LiDAR samples are deduped by `lidar_seq` (which counts MEASUREMENTS, not
+polls — see the LiDAR section above), gated to 40-2000 mm, EMA-filtered, and a single
+>120 mm jump is rejected unless three arrive in a row, which is a real move rather than
+a speckle off the wall.
+
+### Verification
+
+`yaw_control.py` is pure and was exercised head-first (38 checks): wrap, every staleness and stationary gate, forward/reverse sign, both invert
+flags, deadband, the +-30 clamp, the integrator learning a standing bias, the outer
+loop's lean and its clamp, duplicate-`seq` and out-of-window LiDAR rejection, the
+three-outlier re-acquire, `track` degrading to `heading` when the LiDAR goes quiet, and
+the send throttle. Then a closed-loop simulation against a kinematic rover (20 Hz board
+status, 14 Hz LiDAR, a +0.6 deg/s standing drift): open loop runs to 434 mm in 30 s;
+`heading` holds parallel to under 1 deg; `track` returns to the reference within 3.5 mm
+from an 80 mm offset, forward and in reverse. There is still no test runner in this
+repo, so these were throwaway scripts.
+
+**Not run on the rig, and the firmware could not even be compiled here** — there is no
+C++ toolchain on this machine, so `rover/test/build_check.sh` has NOT been run against
+the ported firmware. Run it on the Pi before flashing. What to check on the bench, in
+order: (1) `build_check.sh` passes, including the network harness that was kept; (2)
+nudge each axis 1 mm and confirm the pin map and all four direction flags against the
+rig, since those came from a branch and not from a measurement made here; (3) the two
+steering signs.
 
 ## Rover Scan Panel + firmware (rewritten 2026-08-29)
 
@@ -928,6 +1228,12 @@ by splitting the same sweeps across twice as many cells. 1 mm is 15x oversampled
 needs v <= 36 mm/s just to fill one sweep per cell.
 
 ### Time base: one clock, and one scalar
+
+**SUPERSEDED 2026-09-14 for positions: `last_status_at` is when the Pi RECEIVED a
+position, not when it was measured, and keying on it left empty cells. Positions are
+now keyed on the board's own clock -- see "Continuous raster holes: positions are now
+timed by the board's clock" at the end of this file.** The rest of this section (never
+extrapolate, the latency scalar) still holds.
 
 Both streams are already stamped on the **Pi's** clock -- `sfcw_result.timestamp` and
 `rover_status.last_status_at` -- so the association never touches `performance.now()`,
@@ -3998,243 +4304,6 @@ explaining what a control does. The Super Fit "needs a full grid, N of M cells"
 line went with them; the Scan Grid section's `Captured` tile already shows that
 count.
 
-## C-scan raw-sweep retention toggle (2026-09-12)
-
-The C-Scan panel's Data section carries a **Keep raw sweeps / Free raw sweeps**
-toggle (`cscanKeepSweeps` in `App.jsx`, persisted to
-`localStorage.cscan_keep_sweeps`, default KEEP = the original behaviour).
-Deliberately NOT in `bscanParams`: it is a live property of the session, like
-`scanMode` and the projection, and must not ride along in an export as though it
-described the capture.
-
-**What it trades.** `buildCellRecord` takes `keepSweeps` and omits `sweeps` when
-it is false. Measured through the shipped function, 1515 cells (101x15):
-
-| looks/cell | 1 | 4 | 8 | 18 | 64 |
-|---|---|---|---|---|---|
-| keep | 6.8 MB | 12.6 | 18.5 | 33.4 | **102.0** |
-| free | 6.6 MB | 6.5 | 6.5 | 6.6 | **6.5** |
-| saved | 4% | 48% | 65% | 80% | **94%** |
-
-The costs are flat and worth knowing: **4.3 KB per cell** (almost all of it the
-Pi's 204-bin profile and its distance axis) plus **1.01 KB per stored look**,
-constant across every size tried. `cscanMemory` in `App.jsx` uses exactly those
-two constants for the panel's Scan RAM tile. Note the 6.5 MB floor is the RAW
-list only -- `processedBscanData` and `sarProcessedData` cost again on top.
-
-**Nothing MEASURED is lost.** `h_cal_real/imag` is already the coherent mean of
-the looks being dropped, and all provenance is pooled from them before the drop.
-Verified head-first against the shipped `buildCellRecord` (extracted from
-App.jsx with `new Function`, not retyped -- 20 checks): every field except
-`sweeps` is bit-identical between the two modes, and `applyBscanBg` gives a
-byte-identical range profile with and without the looks, raw and
-background-subtracted alike. What IS lost is **incoherent averaging** (it needs
-the individual looks) and the per-look content of the v7 export.
-
-Three details that matter:
-
-- **`sweep_count` is written in BOTH modes.** Without it a freed cell is
-  indistinguishable from a genuine single-sweep one. `applyBscanBg` now reports
-  `num_sweeps` from `cellLookCount(pos)` -- what was TAKEN -- rather than from
-  what is still stored, so an 8-look freed cell does not read as N = 1. New
-  helpers `cellLookCount` / `cellHasLooks` in `lib/bscanBg.js`; `cellSweeps`'s
-  existing single-spectrum fallback handles a freed cell unchanged, which is why
-  the coherent path needed no other change.
-- **Turning it OFF is RETROACTIVE, and has to be** -- the cells already captured
-  are where the memory is, so a mode that only applied to future cells would not
-  reclaim anything on the scan that is already too big. Turning it back on cannot
-  restore what was freed; it applies from then on.
-- **A freed cell silently ignores `avgMode: 'incoherent'`** (it falls back to the
-  coherent mean and reports `avg_mode: 'coherent'`), so the panel warns when the
-  two are combined rather than letting the control read as if it were doing
-  something.
-
-Import infers `avgCount` from `sweep_count` when no record carries `sweeps`, so
-re-importing an export taken in Free mode restores the right Avg. Export format
-is unchanged at v7 -- a record without `sweeps` is read by the existing v6 path.
-
-Verified in a real headless Chrome against the DEV server (20 checks head-first
-plus 20 in-browser): the button renders and defaults to Keep, a 300-cell x 8-look
-import reads "2400 looks / all held / 3.6 MB", flipping to Free takes it to
-"2400 / 0 still held / 1.3 MB · 3.6 MB if held", the plan view is still painted
-afterwards (189,662 colour-mapped pixels read back with `getImageData`), export
-still produces a blob, the setting survives a reload, and the incoherent warning
-appears and clears with the mode. No console errors. Throwaway scripts as usual;
-`vite build` passes.
-
-**This toggle is NOT the fix for the long-scan lag** -- see the next section.
-It bounds how long a scan can get in one tab; the lag is main-thread compute
-that scales with the CELL count, which freeing looks does not change.
-
-## Long C-scans: the lag and the blank cells were ONE bug (diagnosed + mostly fixed 2026-09-12)
-
-Two symptoms reported on long rover rasters: the plan-view colours lag behind
-where the rover actually is, and a few cells come out blank. **They are the same
-root cause, and the causal chain runs Pi-ward:** the groundstation's main thread
-was saturated by work that scales with the captured cell count, so it stopped
-draining its websocket, and the Pi -- which has an 8-deep drop-oldest sweep queue
-and a 0.5 s send timeout -- threw sweeps away. A cell with no sweeps is blank.
-
-### Why that turned into blank cells (unchanged, and still the thing to watch)
-
-`sdr_server.py`: `sfcw_queue` is `maxsize=8` drop-oldest, which at the 36 Hz
-NIOS sweep is **222 ms of buffer**, and `_send_to_all` drops a client that does
-not accept a frame within **0.5 s**. So:
-
-- a main-thread stall **> 222 ms** silently drops sweeps -- at 100 mm/s that is
-  22 mm of travel, and two such stalls straddling a boundary empty a 50 mm cell;
-- a stall **> 0.5 s** gets the browser evicted entirely; `useWebSocket`
-  reconnects after 500 ms (`RECONNECT_INTERVAL`), and every sweep in that window
-  is gone. **Nothing on screen says this happened.**
-
-**The confirming measurement needs no new code:** `_sfcw_drops` is printed by the
-Pi's 30 s heartbeat (`drops=N (+d)`). Run a long raster and watch it. Non-zero
-drops during a traverse means the browser is still stalling; zero means look at
-sweep spacing instead (`v * T_sweep` -- 2.75 mm at 100 mm/s, so a pitch finer
-than ~10 mm starves on its own, which is what the panel's Hole readout is for).
-
-### What the main thread was doing, and what it costs now
-
-Two loops, both O(captured cells), both re-running from scratch every time. All
-figures measured head-first on node 22 (same V8 as the browser) at 101x15 = 1515
-cells, 8 looks/cell, simulating the real flush pattern -- **one row's records
-rewritten, the other fourteen the same objects**, which is exactly what
-`writeRoverRowCells` does at 4 Hz while a row is driven.
-
-| | before | after |
-|---|---|---|
-| **live flush**, Focus OFF | 81.8 ms | **20.4 ms** (4.0x) |
-| **live flush**, Focus ON (SAFT, ap 7) | 169.9 ms | **21.0 ms** (8.1x) |
-| ... as a share of one core at 4 Hz | 33% / 68% | **8% / 8%** |
-| **per animation frame**, Focus OFF | 3.4 ms | **0** |
-| **per animation frame**, Focus ON | 46.6 ms | **0** |
-
-Per-stage, same grid:
-
-| stage | before | after |
-|---|---|---|
-| `applyBscanBg`, cells unchanged since last call | 13.6 ms | **0.1** |
-| bin-domain colour scales (global + per row) | 50.1 ms | **16.9** |
-| `computeCellValues`, Focus ON, one row of 15 changed | 46.3 ms | **3.1** |
-| `computeGridScales` + `buildCscanGrid`, Focus ON | 95.2 ms | **0.7** |
-
-Four changes, and the reasoning behind each is the load-bearing part:
-
-1. **`buildCscanGrid` is memoised OUT of the animation loop**
-   (`CscanDisplay.jsx`). It used to be called inside `drawCscan`, i.e. 60 times a
-   second, rebuilding the whole grid -- including the full SAFT back-projection
-   with Focus on -- whether or not anything had changed. 47 ms/frame is a hard
-   21 fps ceiling and the entire main thread on its own, **twice over with the
-   projector open**. Nothing it depends on changes per frame; the pulse, the
-   crosshair and the layout do, and those are still per frame.
-
-2. **`applyBscanBg` memoises PER CELL** (`bscanBg.js`, `CELL_CACHE`). It is a
-   pure per-cell map with no cross-cell dependency, which is what makes it
-   memoisable at all. A `WeakMap` keyed on the record, so a cell dropped by New
-   Scan, an import, or a row being re-driven takes its cache with it; **3 slots**
-   per record, because there are exactly three live callers (this panel's
-   complex result, the magnitude result when that mode is on, and
-   `sarProcessedData`) and a fourth would only hold an entry left behind by a
-   settings change. Background sources are compared by **identity**, not hashed.
-
-   **SAFETY CONDITION: the cached object is SHARED between calls, so nothing
-   downstream may mutate a processed record.** Checked across the whole frontend
-   before shipping this -- the displays and `cscanGrid` read only, `svdFilter`
-   spreads into new objects, the SAR worker is handed a projection. Keep it that
-   way. It also costs memory: ~4 MB per retained option set at 1515 cells, up to
-   ~12 MB, against the ~7 MB the two memo results it partly replaces already
-   held. Bounded, which unbounded per-cell memoisation would not be.
-
-3. **Focused cell values are cached PER GRID ROW** (`cscanGrid.js`,
-   `FOCUS_CACHE`). Focusing is per row and only along it -- a physical decision
-   documented above -- so a row whose records are the same objects in the same
-   order has the same focused values. That invariant is what makes the cache
-   sound, and the validation compares **record identities**, not a count. The
-   coherent methods' complex profiles (one IFFT per trace) are now built only for
-   a row that is actually being recomputed, where they used to be built for every
-   row on every call.
-
-4. **`computeCellValues` runs ONCE per update, not three times plus per frame.**
-   `buildCscanGrid` and `computeGridScales` both take an optional precomputed
-   array; `App.jsx` computes `cscanCellValues` once and hands it to both plus
-   both `CscanDisplay` instances. The two bin-domain colour scales likewise came
-   out of one `computeBinScales` pass instead of two functions walking the same
-   174k-value population separately, and the population is now collected into
-   preallocated `Float64Array`s and sorted natively -- **a `Float64Array` sorts
-   numerically with no comparator, 3.3x faster than the plain-Array-plus-
-   comparator it replaced (49.4 -> 14.8 ms) and bit-identical, a sort being a
-   sort.** The comparator branch is kept, because a plain Array sorts
-   LEXICOGRAPHICALLY without one.
-
-Also shipped with them:
-
-- **`useSarWorker` is gated on the SAR panel being open**, as are the two
-  main-thread `svdFilter` passes (`sarBscanInput`, `mapBscanData`). SAR used to
-  reconstruct at every row change of every raster whichever panel was in front,
-  and the cost is not just the worker's own time: `projectForSar` allocates a
-  record per cell and `postMessage` then structured-clones ~17 MB of it
-  **synchronously on the main thread** (~70 ms at 101x15), plus a fresh Worker
-  per job. Gating off deliberately KEEPS the last result rather than clearing it,
-  so switching panels does not blank the SAR image.
-- **The rover-link abort has a 1 s grace** (`useRoverScan.js`, `LINK_GRACE_MS`).
-  It used to abort the whole raster on the FIRST tick with `roverConnected`
-  false, which is a hair trigger now that `rover_server.py`'s `_fanout` evicts a
-  slow client at 0.5 s and the browser reconnects 500 ms later -- so a browser
-  stalled by its own render work lost a minutes-long scan through no fault of the
-  rig. What makes the pause safe is that **the tick returns without acting**: no
-  move issued, no arrival judged, nothing captured, while the link is down. The
-  `STATUS_STALE_MS` = 4 s check for a link that is up but silent is unchanged and
-  is deliberately NOT reset on recovery.
-- **`lidarAccumRef` and `poseAccumRef` are capped** (256 / 512). They are drained
-  by the `sfcw_result` handler, so with the sensor stream up and no sweep running
-  they grew without bound. Both caps are far above what any sweep can collect, so
-  `lidar_n` stays an honest count.
-- **`createRowCollector`'s `drain()` no longer wedges on an unresolvable sweep.**
-  `track.at()` returns null for two opposite reasons: too NEW (the bracketing
-  status frame has not arrived -- stop, nothing behind it is resolvable either)
-  and too OLD (no interpolant can ever exist). It broke on both, so one sweep
-  older than the track would have parked at the head of the queue for ever and
-  every sweep behind it with it -- the row would simply stop filling with nothing
-  saying why. Too-old is now dropped and counted as `stranded`. It needs a
-  position outage longer than the track's ~55 s of history to reach, which is
-  exactly why it must not be the case that silently wedges a raster.
-
-### Verification
-
-No test runner in this repo, so throwaway scripts as usual. 66 equivalence +
-speed checks comparing every changed pure function against the **pre-change
-implementation pulled from git** (`git show HEAD:...`), not a retyped copy:
-colour scales bit-identical across four grid shapes plus the bg-failed,
-non-finite-bin, degenerate and empty cases; `buildCscanGrid` and
-`computeGridScales` identical with and without precomputed values; the
-`applyBscanBg` memo identical across five option sets, proven to actually HIT
-(a second call returns the same objects), proven not to collide between modes,
-proven to invalidate on a new background object, and correct under round-robin
-thrash past the LRU cap and under the flush pattern. Plus 53 focus-cache checks:
-all three focus methods x three metrics x four apertures, cached and uncached;
-the flush pattern where one row is rewritten (only that row's values move, and
-reverting restores the baseline); a row filling one cell at a time; a row with a
-hole; params changes invalidating; a gate outside the record; and bg-failed cells
-still excluded from apertures. Plus 10 checks on the link grace, driving the
-shipped `useRoverScan` against a four-hook React shim and a fake clock.
-
-Then in a real headless Chrome against the **dev server** (12 + 7 checks): the
-plan view paints and is byte-stable frame to frame, Focus changes it and it stays
-stable, changing the gate re-derives it, re-importing identical data reproduces
-an identical focused image, both panes paint with a row open, New Scan clears,
-the projector window opens and its second `CscanDisplay` instance paints, SAR
-reconstructs once its panel is opened (so the gate does not strand it), and there
-are no console errors. `vite build` passes.
-
-**Not done, deliberately (item 5 of the original plan):** raising `sfcw_queue`
-past 8 on the Pi and surfacing a silent SDR reconnect during a raster. The
-groundstation side is now 4-8x cheaper, so the stalls that caused the evictions
-should be gone -- confirm with the heartbeat's `drops` counter on a real long
-raster before adding Pi-side margin for a problem that may no longer exist.
-
-**Still not measured on the rig.** Every number above is a head-first benchmark
-or a browser check; none of it has driven the gantry.
-
 ## C-scan plan-view focusing, per row (2026-09-06)
 
 A **Focus (SAFT)** section on the C-scan panel -- a toggle and an aperture
@@ -4293,6 +4362,16 @@ the title carries `FOCUS ×N`.
 `focusEnabled` / `focusAperture` live in `bscanParams` beside `metric` and the
 gate -- they are the same kind of setting, "how a record becomes a colour" --
 so they ride along in the export and are restored on import.
+
+**Both `CscanDisplay` instances draw with `cscanFocusParams`, not `bscanParams`**
+(2026-09-13). It is `bscanParams` plus the window and start frequency the
+coherent DAS+CF / DMAS+CF kernels need. When it was added, App passed it to
+`<Sidebar>` (which ignores it) instead of `<Viewport>`. So the panel's plan view
+got `params = undefined`: `drawCscan` threw on its first frame, the rAF loop
+never rescheduled, and **the grid came up completely blank for every scan**,
+live or imported, with no on-screen error. The projector window was fine because
+App renders that one directly. If the plan view is ever blank, check the console
+for a throw in `drawCscan` before suspecting the data.
 
 **What it is not:** incoherent, magnitude-domain back-projection, exactly what
 the 2D Map has always done. It reads the magnitude profiles already on screen
@@ -5396,13 +5475,23 @@ the current `sfcw_engine.py`. Confirmed working on the GUI by the operator, incl
 target-in / target-out case that broke an earlier draft (see "the resolver that had to
 go" below). **The image is committed at `fpga/images/hostedxA9_niosIIf_sweep_ts_v1.rbf`**
 (sha256 `3449d1af...`, provenance + load instructions in `fpga/images/README.md`).
-**It is RAM-loaded only (`bladeRF-cli -l fpga/images/hostedxA9_niosIIf_sweep_ts_v1.rbf`)
-and reverts on power cycle -- SPI flash still holds the OLD image; flashing (`-L`) is the
-operator's call.** After a
-power cycle, reload it or the engine prints one line ("NIOS autonomous sweep unavailable
-on this FPGA image") and runs the standard sweep for the session: the capability latch
-(`_nios_unavailable`) detects the dead sample counter at the first EXEC, so a stock image
-degrades to exactly the old behaviour rather than churning. `docs/nios_sweep.md` (copied
+**FLASHED TO SPI 2026-09-11, so it now survives a power cycle and needs no host
+action.** It was RAM-loaded only (`-l`) until then, which cost a silent 2x regression
+every power cycle -- see "The 18 Hz regression" below. `bladeRF-cli -L
+fpga/images/hostedxA9_niosIIf_sweep_ts_v1.rbf` is what flashed it; the stock 0.16.0
+image is no longer on the board, so reverting means re-downloading it from Nuand.
+
+**THE DIAGNOSTIC INVERTED WHEN IT WAS FLASHED, and this is the trap.** `bladeRF-cli -e
+info` reporting *"configured from SPI flash"* used to mean the STOCK image and was the
+signature of the fault; it now means the II/f image loaded correctly and is the HEALTHY
+state. *"configured by USB host"* means someone `-l`-loaded something over the top.
+**The string is no longer diagnostic on its own** -- the only reliable check is
+behavioural: run a sweep and read `sweep_core` on `sfcw_result` (`nios` = working,
+`standard` = the latch tripped), or just look at the rate. If the sample counter is ever
+dead again the engine prints one line ("NIOS autonomous sweep unavailable on this FPGA
+image") and runs the standard sweep for the session: the capability latch
+(`_nios_unavailable`) detects it at the first EXEC, so a stock image degrades to exactly
+the old behaviour rather than churning. `docs/nios_sweep.md` (copied
 from `fpga_branch`, plus a 2026-09-07 II/f addendum) holds the protocol and firmware side.
 
 Measured through the full stack (`start.py` + one websocket client), 51 steps, settle 0:
@@ -5574,6 +5663,71 @@ never guess).
   start/stop cycling also still degrades the device (recover by restarting `start.py`
   after a 15-20 s gap, or `usbreset` if it wedges).
 
+### The 18 Hz regression: the FPGA image silently reverted (2026-09-11)
+
+Reported as "the sweeps are running at 18fps, from the 37 we had already achieved".
+Nothing had slowed down -- **the NIOS autonomous sweep was not running at all**, and
+18 Hz is simply what the II/f image does host-driven. The bench had been power-cycled
+while the LiDAR was rewired back to the TF-LC02, the image was RAM-loaded only, so the
+FPGA reverted to the stock SPI image and the capability latch tripped at the first EXEC.
+Fixed by flashing the image to SPI (`-L`), verified 35.9 Hz with 0.75-1.00% fallbacks.
+
+**18 Hz is a DIAGNOSIS, not just a number, and the rate table above is the lookup.**
+The three regimes are far enough apart to identify the cause from the rate alone:
+~37 Hz = NIOS autonomous; **~18 Hz = II/f image present but NIOS not running**;
+~15 Hz = the old II/e image. So ~18 Hz specifically means the sweep firmware is
+unreachable while the II/f image is loaded -- look at the FPGA image and the latch,
+never at `settle_count` or the host path.
+
+**Confirm it with `sweep_core` on `sfcw_result`, which names the cause directly**
+(`nios` / `fallback` / `standard`) -- that field exists precisely so this does not have
+to be inferred from a rate. A 100% `standard` block is the latch; a 100% `fallback`
+block is the span gate refusing every sweep, which is a different fault with the same
+rate.
+
+### There were TWO 18 Hz faults, and they masked each other (2026-09-11)
+
+After the FPGA was reflashed and the wire measured **35.9 Hz**, the browser still
+read 18 -- because the SFCW pane header was reporting the DISPLAY rate while
+claiming to report the radar's, and the two numbers collide almost exactly.
+
+`Viewport.jsx`'s `useSweepRate` derived the rate from the `sfcwResult` STATE, but
+`App.jsx` only sets that inside the ~20 Hz live-display throttle added on
+2026-09-10 (the slow-client fix). A fixed 50 ms gate against a 27.9 ms sweep
+passes **exactly every other sweep**, so the header read the doubled period:
+
+| real sweep | what the header USED to say | what it says now |
+|---|---|---|
+| 27.9 ms (35.87 Hz, NIOS, II/f) | **17.93 Hz** | 35.87 Hz |
+| 55.5 ms (18.02 Hz, stock image) | **18.02 Hz** | 18.02 Hz |
+| 65.5 ms (15.27 Hz, old II/e) | 15.27 Hz | 15.27 Hz |
+
+**17.93 against 18.02 is not a distinguishable difference on a readout**, so the
+header showed ~18 Hz whether the radar was healthy or the FPGA had reverted --
+and it had shown ~18 ever since the throttle landed, which is why the rate looked
+like it "dropped from 37" long after the throttle actually took it there. Fixing
+the FPGA moved the wire from 18 to 36 and moved the readout not at all.
+
+**Fixed by deriving the header from the measurement `App.jsx` already takes above
+the throttle** (`sweepPeriodMs`, median of adjacent Pi timestamps over 12 sweeps),
+which the C-scan panel was already using correctly for its traverse-sampling
+arithmetic. `useSweepRate` is deleted; do not reintroduce a rate derived from
+`sfcwResult`, and note that the throttle means **any** state gated behind it is
+unsafe to measure timing from.
+
+The general lesson is the one this file keeps relearning: **an instrument fed from
+a throttled, decimated, or averaged copy of the data reports on the copy.** Same
+class as `lidar_seq` counting reads rather than measurements, and as the C-scan
+recomputing its own range profiles while the panel beside it showed the Pi's.
+
+**The failure is quiet by design and that is the real cost here.** Degrading to the
+standard sweep is the right behaviour -- it is a correct, slower sweep, not a broken one
+-- but it announces itself with a single stdout line at startup that nobody is watching,
+and the GUI's rate readout is the only other evidence. A halving of throughput should
+probably be louder than one line; it went unnoticed long enough to be reported as a
+mystery. Note `start.py` still does not touch the FPGA, so the flash is now the only
+thing keeping this from recurring.
+
 ## The sweep "stuck in websocket": one slow client froze every client (2026-09-10)
 
 Integrated from the `balls` branch (`cb077ea`). Symptom: the GUI stops receiving
@@ -5712,3 +5866,1488 @@ first await, so the set is never iterated across a yield point. It has no send t
 the slow-client stall is latent there, but it cannot raise this RuntimeError. It is the
 only other websocket fan-out on the Pi; `sdr_server.py` and `rover_server.py` are now both
 fixed.
+
+## Standoff dependence of the background is ~linear in phase; LiDAR offset is stale (2026-09-13)
+
+Asked whether near-field coupling and a non-linear alignment make a linear-phase
+along-track background fit wrong. Measured offline on `groundstation/models/gw2.json`
+(122 knots, 1 mm spacing, 2026-09-12, current gains) by rewinding its unwound knots
+(`h = u * exp(-j*4*pi*f*0.8*d/c)`) and scoring per-frequency complex least-squares
+fits under guarded leave-one-out: neighbours within 2 mm of the held-out knot
+excluded, so a model cannot score by copying its nearest knot. Throwaway scripts.
+
+| window | mean | const + exp(-j*a*phi) | + 2nd bounce | + wall amplitude slope | 6 terms |
+|---|---|---|---|---|---|
+| +-10 mm | 14.3 | 20.6 | 22.3 | 22.4 | 20.9 |
+| +-20 mm | 6.9 | 18.3 | 18.7 | 20.5 | 15.0 |
+| +-40 mm | 3.2 | 17.9 | 18.5 | 17.8 | 20.8 |
+
+Shipped Akima model under the SAME 2 mm guard: **20.5 dB** (25.6 as stored is unguarded).
+
+- **Alignment is linear.** Best alpha is flat from 0.75 to 1.05 (within 0.2 dB); local
+  alpha wanders 0.75-1.0 across the span with no trend. Not a curving delay.
+- **Coupling is nearly constant.** Its fitted spectrum correlates 0.988-0.998 between
+  adjacent 10 mm windows, 0.987+ against the 40 mm window, i.e. changes ~17 dB below
+  itself. Irrelevant for a 15 dB target, binding past ~20 dB.
+- **What is non-linear is amplitude and multi-bounce.** Wall term falls ~5 dB over the
+  span; the second antenna-wall bounce is -5.7 dB of total at the closest window and
+  -21 to -30 dB mid-range. Modelling them buys 2-3 dB. Nothing exceeds ~22 dB guarded.
+- **The ceiling is data at specific standoffs, not model form.** Every model, Akima
+  included, drops to 15-17 dB at gw2 standoffs 10-30 mm and 80-90 mm. Untested lead:
+  hand tilt during the wave; check pose spread in those bins on the next capture.
+- pass3 (2026-08-28, 30 static knots, an OLDER bench) agrees: linear phase 21-24 dB, + 2nd bounce
+  23-27 dB, correct sign 24.2 dB vs wrong sign 7.1 dB (a wrong sign fails safe).
+
+**LiDAR->antenna offset on the gw2 bench: 131.475 mm (set 2026-09-13).** gw2's nearest
+knot was captured with the antenna FLUSH on the wall (operator) and read -28.525 mm under
+the 160 mm offset then in use, so flush = 131.475. Note the code default was already 132
+(bench-measured 2026-09-07 as 136-138 minus a 5 mm buffer); the 160 came from the
+operator's browser localStorage, which always beats the default. Fixed by moving the
+setting to a VERSIONED key, `lidar_antenna_offset_mm_v2`, defaulting to 131.475 with no
+buffer. Re-measure after any re-mount: antenna flush on the wall, read the LiDAR.
+- **gw2.json was migrated to 131.475 EXACTLY, not rebuilt.** Every knot `d` +28.525 mm,
+  and `uRe/uIm` AND the Akima slopes `sRe/sIm` rotated by `exp(+j*4*pi*f*alpha*28.525mm/c)`.
+  Rotating the slopes (not recomputing Akima, which is nonlinear per real/imag part) makes
+  inference identical: old model at x vs new at x+28.525 differ by 2.7e-15 over 997
+  standoffs. `quality.per[].d` shifted too, `geometry.lidarAntennaOffsetMm` = 131.475, and
+  `geometry.offsetMigration` records it. Original kept as
+  `groundstation/models/gw2.offset160-backup.json`. **The models folder is gitignored**, so
+  this lives only on the PC that holds it -- migrate any other copy the same way.
+- Other models in that folder are other benches and keep their own offsets; loading one
+  now shows the geometry-mismatch warning, which is correct.
+
+**SAR used to clamp a negative standoff to zero in the layered model -- FIXED 2026-09-13.**
+`buildRayTable` only added the air layer `if (dA1 > 0)`, so a cell at standoff <= 0 was
+reconstructed flush with the wall while its neighbours kept their gap. A negative value
+is now kept as a pure broadside delay (what the straight-ray branch always did), the
+worker reports `standoffNegativeN`, and the SAR panel warns that the LiDAR offset is too
+large by at least the most negative value.
+
+## rod1 SAR scan: the settings decide whether anything focuses (2026-09-13)
+
+`rod1.json` (operator's Downloads, 2026-09-12) is the one current SAR scan on the gw2
+bench: 1 rover row, 66 columns at 5 mm, **64 captured (columns 36-37 missing)**,
+continuous traverse at 100 mm/s, so only 1-3 sweeps per cell. Analysed offline by
+driving the SHIPPED `applyBscanBg` + `sar.worker.js` from Node: copy `src/lib` to a
+scratch dir, add `.js` to relative imports, `{"type":"module"}` package.json, shim
+`globalThis.self`, call `self.onmessage` synchronously and collect `postMessage`.
+Worker `image` is in **dB** (negative), not linear amplitude.
+
+- **Every cell recorded `range_offset` 0.5, while the panel and the repo's Pi default
+  are 0.378 -- the Pi that took it was running the old default.** The raw profile's
+  dominant echo sits at 0.41 m of raw range: 0.5 would put the wall face at -9 cm,
+  0.378 puts it at 32 mm, consistent with the gw2 offset finding (true standoff ~30 mm).
+  SAR reads the per-cell value, so a stale Pi mis-ranges every reconstruction.
+- **Wall permittivity ~5.5, not the panel's 4.5.** Back-face echo at 0.761 m raw, 35 cm
+  of apparent range behind the face, so n = 2.34 for the 15 cm wall. The SAR panel's
+  wall-thickness default is 29 (an older bench) -- set 15 here.
+- **The SAR worker placed positions by ARRAY INDEX, not `grid_ix` -- FIXED 2026-09-13.**
+  A missing column shifted every later cell by a pitch. On rod1 every cell after the
+  gap sat 10 mm off and the image ended 1 cm short; the rod is before the gap and moved
+  only 0.1 dB at the calibrated settings. (An earlier ~1 dB figure was from the guarded
+  fit at er 4.5, a different configuration.)
+- **Along-track reference is valid over tens of mm.** Repeatability 32 dB within a cell
+  and between adjacent cells; the raw spectrum decorrelates only to 25 dB at 20 mm,
+  21 dB at 50 mm, 18 dB at 200 mm.
+- **gw2 subtraction adds nothing once an along-track step is present.** It helps only
+  with no along-track removal; after rank-1 SVD, along-track mean or the guarded fit it
+  scores 0 to -2 dB against no model on rod1's feature.
+- **A compact scatterer at x ~14.5 cm, 17-18 cm deep (er 5.5), i.e. ~2.5 cm behind the
+  15 cm wall's back face, passed every falsification test** at the calibrated settings
+  (range offset 0.378, standoff +28.5 mm, gap filled, refraction on, rank-1 SVD):
+  17.2 dB over the image median, coherence 0.72; unchanged with 6 columns trimmed from
+  either end (16.8 / 17.8 dB); present in both halves of the band (2-3.5 GHz 16.6 dB,
+  3.5-5 GHz 12.1 dB, weaker high as concrete attenuation predicts). Ground truth for the
+  rod's position was NOT known when this was found -- confirm before relying on it.
+  The next distinct peak 5 cm left at the same depth (~13.5 dB) may be its own sidelobe.
+- **A second strong feature sits on the LAST column at back-face depth (x 32.5 cm,
+  15.2 cm) and cannot be resolved from this scan.** The guarded fit makes it the
+  strongest peak, but it is NOT a simple one-sided-window artefact: trimming 6 end
+  columns leaves the new end only 8-12 dB, so it does not follow the edge. It lies at or
+  past the end of the aperture (a brick edge would look like this). Overscan past it.
+- **Combined amplitude x coherence with NO along-track removal peaks in the deepest
+  image rows** (coherence ~0.9 from few contributors). Misleading as a detector there.
+- With the as-recorded settings (0.5 offset, uncorrected standoff, gap by index) the
+  image is dominated by a flat band at ~12.6 cm depth -- the back face mis-placed.
+
+## SAR panel: permittivity suggestion, grid positions, range-offset guard (2026-09-13)
+
+Implemented after rod1.json's ground truth was confirmed: the rod was ~15 cm along
+the scan, immediately behind the 15 cm wall, exactly where the reconstruction put it
+at er 5.5, range offset 0.378 and the standoff corrected for the stale LiDAR offset.
+
+### Permittivity suggested from the back wall (`lib/permittivityEstimate.js`)
+
+Shown directly under the SAR panel's εr field. It only SUGGESTS: a "Use" button copies
+the value into the field, and every other candidate echo is a clickable chip. The field
+stays the operator's.
+
+- **Method.** Coherent mean of the RAW `h_cal` of every cell (never the background-
+  subtracted input, since a model removes exactly the wall echoes needed), Hanning
+  window, zero-padded IFFT at range offset 0, log-parabolic peak interpolation. The
+  strongest peak is taken as the front face; each later peak implies
+  `er = (separation / wall thickness)^2`. Candidates between er 1.5 and 16 and within
+  30 dB of the face are returned, strongest first.
+- **Offset-free by construction.** It uses a separation, so the range offset and the
+  LiDAR offset cancel. Verified: identical er at offset 0.5 and 0.378.
+- **Why the highlighted pick is restricted to er 3-10, not the strongest echo.** On
+  rod1 the candidates are er 2.4 at -6 dB, 5.5 at -14 dB, 9.8 at -17 dB and 15.7 at -28 dB.
+  The strongest, 2.4, is a RIG echo: it sits in the gw2 model at every standoff (its
+  peak range moves with slope ~0.08 against the ~1 a wall echo must show) and repeats
+  at an even ~23 cm spacing. Nothing in one scan separates rig from wall -- a per-
+  frequency constant-plus-standoff-rotating regression over gw2 did not separate them
+  either -- so the strongest echo would have suggested the wrong answer on this bench.
+  The dry masonry range excludes it; the chip keeps it available for a wall that
+  really is ~2.4 (aerated block).
+- **It needs the wall thickness.** 0 shows a prompt instead. A wrong thickness gives a
+  confident wrong answer (rod1 at 29 cm suggests 4.2), so check it first.
+
+### Grid-column aperture positions and negative standoffs (`sar.worker.js`)
+
+Positions come from `grid_ix` (now in `SAR_INPUT_FIELDS`), so a missing column is a gap
+rather than a slide. Falls back to the array index when `grid_ix` is absent or repeats
+(a multi-row capture), and the result carries `positionSource`, `missingColumns` and
+`duplicateColumns`; the panel notes gaps and warns on the fallback. Negative standoffs:
+see the FIXED note in the section above.
+
+### Range offset: 0.378, and a guard against a Pi that ignores it
+
+- **0.5 is wrong; 0.378 is the calibrated value** (tuned for targets in air, confirmed
+  by the rod1 face echo). `SFCWEngine` defaults to 0.378 on this branch and now logs
+  any change pushed to it. **`main` still carries -0.13, and `fpga_branch`,
+  `imaging-stuffs`, `imaging-things`, `tight_packing` and `tight_packing_clean` carry
+  0.5.** The Pi that recorded rod1 was running one of those, or unpushed code; it was
+  unreachable over SSH (`sfrpi`, `sfrpieth`, `sfrpiFRMLAPTOP` all timed out) so its
+  branch is unconfirmed. Deploy this branch's engine to the Pi.
+- **Groundstation guard (App.jsx, top of the `sfcw_result` handler).** If a result's
+  `range_offset` differs from the panel's, the panel's value is stamped onto the result
+  (the Pi's kept as `range_offset_pi`), params are re-pushed at most every 5 s, a console
+  warning is printed once per distinct pair, and the SFCW panel shows an amber banner
+  under Range Offset. Safe because `h_cal` does not depend on the offset -- it only labels
+  the range axis -- and consistent with the rule that the panel is the source of truth.
+  Records captured while the banner shows are therefore correct.
+
+### Where rod1's 0.5 came from, and the corrected file
+
+- **Not the export.** A C-scan cell takes `range_offset` from the Pi's `sfcw_result`, which
+  copies `SFCWEngine.range_offset`; the export writes the cells verbatim. rod1's own Pi
+  profile confirms the Pi swept at 0.5: its first distance is 0.0021 m, which 0.5 produces
+  and 0.378 (0.0016 m) does not.
+- **The Pi runs this branch (operator, 2026-09-13), so the 0.5 was PUSHED to it.** Saved
+  scans bracket when: `temp.json` (09-08) header 0.378 / cells 0.378; `one&zero.json`
+  (09-11) and rod1 (09-12) header 0.378 / cells **0.5**; `rebar_air_b_scan.json` (09-13)
+  0.378 / 0.378. Every scan saved before 09-07 has 0.5 in its HEADER. The Pi's
+  `set_params` has no failure path before the offset, and no code touched the push
+  between 09-08 and 09-11. Two routes on this branch put 0.5 on the Pi, both FIXED:
+  1. **C-scan import restored `rangeOffset` from the file header** (since `9b51962`,
+     09-04). Importing any pre-09-07 scan set the panel to 0.5, which the panel then
+     pushed. The gains were already deliberately NOT restored for this exact reason; the
+     offset now is not either. Imported cells keep their own per-cell value.
+  2. **Every tab pushed its full param set on every (re)connect, even mid-sweep.** Since
+     `b0dd95c` (09-10) the Pi evicts a client that stops draining and the browser
+     reconnects in 500 ms, so a throttled background tab re-pushed ITS panel over another
+     tab's running sweep, repeatedly. A tab holding 0.5 (old build or imported old scan)
+     explains the 09-11 and 09-12 files, and 09-10 is exactly where the window opens.
+     Gains and settle were exposed the same way. Now the connect push happens only when
+     the first `sfcw_status` after connecting says the Pi is idle; whoever starts a sweep
+     still pushes first. The guard's 5 s re-push is limited to the tab that started the
+     sweep (`sfcwOwnerRef`, set at every `sfcw_start` including the SFCW panel's button via
+     `sendSdrTracked`, cleared only on a running->stopped TRANSITION of `sfcw_status`: the
+     Pi answers the params push that precedes every start with `running:false`, which
+     arrives after the tab has claimed ownership, so a plain `!running` test clears it at
+     once -- that bug was in the first version and caught in review).
+  Not proven which route fired: the Pi was unreachable. The engine now prints
+  `[sfcw] range_offset A -> B m` on any change, so the Pi's stdout will name the next one.
+- **What hid it: the export header is the panel's state AT EXPORT, the cells are what the
+  Pi swept with.** rod1's header said 0.378 over 64 cells at 0.5. Every sweep-record site
+  in App.jsx now also copies `range_offset_pi` (set only when the guard corrected a
+  result), and `buildCellRecord` carries it into C-scan cells, so an export shows the
+  disagreement. `JSON.stringify` drops it when undefined, so clean scans are unchanged.
+- **rod1.json was corrected in place (operator's request):** every cell `range_offset`
+  0.5 -> 0.378, the Pi profile's `distances` shifted +0.122 m (same bins, relabelled),
+  `range_offset_pi: 0.5` added per cell. Then every cell AND sweep `lidar_standoff_mm`
+  +28.525 mm and `lidar_offset_mm` / header 160 -> 131.475, recorded in
+  `lidarOffsetCorrection`. Standoffs now 27.5-34.0 mm. Original kept as
+  `Downloads/rod1.original-range-offset-0.5.json`. With AUTO standoff and the new SAR
+  defaults the brightest pixel is on the rod: 14.4 cm along, 17.7 cm deep, coherence 0.72
+  (SVD k 1, BG off); with gw2 subtraction all 64 cells apply unclamped, coherence 0.66.
+
+### Verification
+
+Node harness driving the shipped `permittivityEstimate.js` and `sar.worker.js` on
+rod1.json (the copy-lib-and-add-`.js` method above): estimator 5.5 at 15 cm, prompt at
+0 cm, offset-invariant; grid positioning keeps the gap (aperture 32.5 cm, 2 missing)
+and still focuses the rod at 16.9 dB / coherence 0.70; a scan shifted entirely negative
+reconstructs with finite values and counts all 64; repeated columns fall back to the
+index. `vite build` passes; `sfcw_engine.py` compiles. **Not driven in a browser** and
+**not deployed to the Pi**. The SAR panel's own defaults (εr 4.5, wall 29 cm) are
+unchanged -- set 15 cm for the gw2 bench.
+
+### SAR image orientation and per-row SAR on multi-row grids (2026-09-13)
+
+- **The SAR image is drawn like the C-scan's row B-scan now**: lateral position left to
+  right, depth INCREASING bottom to top (wall face on the bottom edge). It used to put depth
+  on the x axis and position down the y axis. `SarDisplay.jsx` `blit` writes image row
+  `pixelsZ-1-zi`, column `xi`; the ticks, axis titles and crosshair follow. The worker's
+  data layout (`vals[zi*pixelsX + xi]`) is unchanged. The lateral axis starts at the
+  worker's new `apertureStart` (first captured column x pitch), so a row that begins part
+  way into the grid reads the same x as the C-scan.
+- **SAR reconstructs ONE row of a multi-row C-scan: the row selected on the C-scan.**
+  Before, it fed every cell of every row to the 1-D back-projection, which fell back to
+  capture order (`duplicateColumns`) and produced a meaningless zig-zag aperture. The C-scan
+  selection (`cscanSelectedCell`) moved from `Viewport` local state to `App.jsx` for this.
+  `sarRowIy` is kept separately: closing the C-scan row pane does not change the SAR row, and
+  a missing row (new scan, import) falls back to the lowest row that holds data. `sarRowData`
+  filters BEFORE `applyBscanBg` (a per-cell map, so the result is identical and cheaper).
+- **Row stepper**: a footer at the bottom right of the SAR viewport, only when more than one
+  row holds data. It walks the rows that hold data, stops at either end (no wrap), and moves
+  an open C-scan row pane with it so the two panels always agree. Rows are numbered
+  `iy + 1`, same as the C-scan's B-scan pane (row 1 = bottom row).
+- The permittivity suggestion still reads the WHOLE grid (a better coherent mean), not just
+  the active row. The 2D Map is unchanged and still treats the capture as one line.
+
+### SAR panel defaults for the gw2 bench (2026-09-13)
+
+`sarWallThickness` 29 -> **15.2 cm**, `sarEpsilonR` 4.5 -> **5.4**, `sarRefraction` false ->
+**true** (layered ray), `sarMaxDepth` 70 -> **40 cm** (**20 cm since 2026-09-14**, operator's choice, matching the 5-20 cm detection band) (the auto-fit only pulls a clipped
+request down, and 40 is well inside the ~60 cm a sweep reaches on this bench). Not persisted, so they take effect on reload. 5.4 agrees with the
+back-wall suggestion on rod1 at 15.2 cm (5.36). Layered is on by default because the
+straight ray loses the rod entirely on rod1. The negative-standoff warning now counts
+cells below **-2 mm**, not below 0: with a correct offset a flush antenna reads 0 +/- 0.7 mm
+and a strict test would warn on every legitimate flush scan.
+
+## 2rods1pipe.json: blind multi-row analysis (2026-09-13)
+
+6-row x 140-column rover C-scan (5 mm pitch, rows 1 cm apart, 70 cm wide) recorded with
+the corrected offsets (range 0.378, LiDAR 131.475). Rows 0 and 2 have long gaps (~37-53
+and ~27-37 cm) and row 0 has 25 cells without a standoff. Back-wall suggestion 5.5-5.85
+per row (5.66 overall) at 15.2 cm, agreeing with the 5.4 default.
+
+**Method worth reusing: treat every row as an independent measurement.** Per-row SAR
+through the shipped worker (layered, er 5.4, wall 15.2, Auto standoff), each row's
+amplitude x coherence normalised to its own median and resampled onto one lateral axis,
+then a feature counts only if it (1) appears in most rows, (2) survives both clutter
+removals (rank-1 SVD and the guarded along-track fit), (3) holds its x across the
+2-3.5 and 3.5-5 GHz halves -- a sidelobe's offset scales with wavelength, a scatterer's
+position does not -- and (4) stays put when 8 columns are trimmed from either end.
+
+**Result, blind (ground truth not yet given):** three scatterers ~1-2 cm behind the back
+face, at scan x ~12.0, ~20.5 and ~54.0 cm (+-0.5 cm across bands and methods), depth
+14.5-17 cm at er 5.4. Weaker peaks at 7 and 24 cm move between band halves (sidelobes);
+16.5 cm sits exactly midway between 12 and 20.5 and is weaker (cross-term). Features
+below 26 cm depth changed with the clutter method (SVD: 9 and 14.5 cm; guarded fit: 30
+and 45.5 cm) and are not counted.
+
+**The last column carries a bright feature at back-face depth in BOTH rod1.json and this
+scan, and it is not a target inside the aperture.** In neither scan does it follow the
+edge when the end is trimmed, and here nothing appears at 62-65 cm once the end moves to
+65.5 cm. Treat a peak on the final column of a continuous rover row as a raster-end
+artefact unless the scan overruns it by 15-20 cm. Cause not investigated.
+
+A raw-data check without SAR (along-track residual energy just behind the wall) was
+dominated by the back-face echo at the same range and by one-sided references at the
+ends; it disagreed with SAR and is not a usable detector at this geometry.
+
+### Why the C-scan plan view of 2rods1pipe.json does not show straight pipes (2026-09-13)
+
+Reported: a plan view of straight vertical pipes, where every row should look alike,
+does not. **The rows are not misregistered; the plan view is not measuring the pipes.**
+
+- **Not a snake/latency zigzag.** Rows alternate direction at 7.5 cm/s with
+  `roverLatencyMs` 0, but per-row SAR puts each target in the same place in every row
+  (11.5-12, 18.5-21, 53-54.5 cm), and L->R minus R->L differs by <= 1.3 cm with a sign
+  that flips between targets and methods -- a latency bias would move them all one way.
+  Row 0's third target at 56-56.5 cm is the exception, and it sits just past that row's
+  37-53 cm gap where it has only half an aperture.
+- **The file's plan-view settings map the wall.** Gate 0-70 cm with `metric: 'peak'` puts
+  the median cell's peak at **2.2 cm depth** (face + coupling). No target clears its
+  row's median by 3 dB in any row.
+- **The pipes sit ~1.5 cm behind the 15.2 cm back face, inside one 5 cm range cell of
+  it**, so no gate separates them from the back-face echo, and the plan view's per-cell
+  reduction (a gated metric of an unfocused profile) cannot either. Measured, rows agree
+  at Pearson r and targets 12 / 20.5 / 54 clear +3 dB in N of 6 rows:
+
+| plan view | row r | targets |
+|---|---|---|
+| file: gate 0-70, peak, no BG | 0.46 | 0 / 0 / 0 |
+| gw2 model, gate 0-70, peak | 0.00 | 2 / 1 / 3 (+47 invalid cells) |
+| gw2 model, gate 38-48, energy | 0.71 | 5 / 0 / 0 (+47 invalid) |
+| same + Focus (SAFT) | 0.65 | 4 / 2 / 0 (+47 invalid) |
+| **per-row SAR, rank-1 SVD, amp x coherence, 14-24 cm** | **0.70** | **4 / 6 / 5** |
+| per-row SAR, guarded fit | 0.39 | 4 / 6 / 6 |
+
+  The 47 invalid cells under the model are the cells with no LiDAR standoff, drawn as red
+  crosses. **What shows the pipes is focusing plus clutter removal:** a plan view built
+  from per-row SAR (depth slice of amplitude x coherence after rank-1 SVD). The C-scan
+  panel has no such mode today; its Focus is magnitude-domain SAFT without SVD or
+  coherence, and measured here it does not recover them.
+
+### Why the six per-row SAR images of 2rods1pipe.json differ and show far more than 3 targets (2026-09-13)
+
+The three target positions (12, 20.5, 54 cm) were CONFIRMED correct by the operator. The
+operator's complaint was the SAR images themselves: six rows of straight vertical pipes
+should look alike, and each shows many extra features. Measured at the panel defaults
+(er 5.4, wall 15.2, layered, depth 40, SVD OFF, rectangular):
+
+- **Each image has 86-125 local peaks inside its 20 dB colour window**; the targets are a
+  handful of them. The display's per-image autoscale (vMax = own max, vMin = vMax - 20) is
+  NOT why rows look different: every row's max is within 2.4 dB of the brightest, and
+  similarity is identical on a common scale.
+- **Most extra features are full-width horizontal bands from echoes that are the same at
+  every position.** Rig-locked echoes do not move when the wall does -- rod1 (standoff
+  30.5 mm) vs this scan (55.2 mm): 26.1 -> 26.8, 38.3 -> 38.4, 62.5 -> 62.3 cm apparent --
+  and mapped through the layered model at this scan's standoff they land exactly on the
+  image bands: **9.2 cm (the brightest thing in every row with SVD off), 14.1 cm and
+  36.7 cm**. A fourth echo, 50.0 -> 52.6 cm, DID move with the wall (47 cm behind the face
+  in both): a real reflector ~12 cm behind the back face, band at 27 cm. A 12.7 cm echo
+  (band at ~3 cm) is likely the antenna-face double bounce. A 30 cm band appears with the
+  rectangular window only (range sidelobe). The rig echo at 26 cm is the same one that
+  poses as a back wall at er ~2.4 in the permittivity suggestion.
+- **Rows differ mainly because of gaps.** Rows 0 and 2 miss 33 and 31 columns. Gap-free
+  rows (1,3,4,5) agree at r 0.79; pairs with row 0 or 2 at 0.59, rising to 0.79 once gap
+  columns are masked. Standoff differences between rows do not matter (corr ~0). Rows
+  1 cm apart agree better (0.76) than rows 3-5 cm apart (0.61), so the scene also changes
+  genuinely with height. Rank-1 SVD is estimated per row and gaps change what it removes,
+  so SVD ON lowers row similarity (0.55).
+- **Cleanup options, tested on all six rows (Hanning, depth 40).** Band level is the
+  width-averaged image at that depth relative to the image max; targets = rows where each
+  of 12 / 20.5 / 54 cm is within 6 dB of the image max.
+
+| processing | peaks/row | 9 cm rig | 27 cm behind-wall | 37 cm rig | targets | brightest is a target | row r |
+|---|---|---|---|---|---|---|---|
+| SVD off (panel default) | 53 | -4.5 | -11.2 | -16.0 | 0/0/0 | 0/6 | 0.84 |
+| **SVD k1** | 65 | -15.9 | -12.5 | -9.0 | 5/6/6 | **6/6** | 0.52 |
+| SVD k2 | 71 | -17.2 | -14.8 | -10.4 | 6/6/3 | 4/6 | 0.43 |
+| SVD k3 | 78 | -15.9 | -16.9 | -15.2 | 6/6/**0** | 6/6 | 0.51 |
+| row mean removed | 62 | -9.1 | -11.5 | -10.7 | 5/6/5 | 1/6 | 0.39 |
+| row mean + SVD k1 | 66 | -17.0 | -13.8 | -9.4 | 6/6/5 | 6/6 | 0.49 |
+
+  With SVD off the rows look ALIKE for the wrong reason: every row is the same rig band.
+  **Use SVD k1 with Hanning** -- the brightest pixel is then a target in every row. k2/k3
+  eat the 54 cm target (k3 removes it in all six rows), the same over-filtering first seen
+  on sartt.json. No usable setting removes the 37 cm rig band, which sits below all three
+  targets, so **Max Depth ~30 cm** crops it out. The lasting fix is to remove the rig
+  echoes at the source (absorber, cable dress) or with a measured rig reference.
+- **The gaps in rows 0 and 2 are a FROZEN rover position, not lost sweeps.** Every row got
+  283-294 sweeps over ~9 s with no timestamp hole (largest ~80 ms). Instead each big gap sits
+  right after an overloaded cell in the direction of travel -- row 0 (R->L) columns 106-110
+  hold 68 sweeps (~2 s) before the empty 73-105; row 2 (R->L) columns 75-76 hold 44 (~1.3 s)
+  before the empty 55-74; smaller cases in rows 3 and 4 -- and the overloaded cells' sweep
+  time spans match the time needed to cross each gap at 7.5 cm/s, with their assigned
+  positions spread LESS than a normal cell's. So the reported position stopped advancing
+  while the gantry kept moving: every sweep in that window was filed under the last column
+  before the freeze, and the columns driven over stayed empty. Not yet traced to whether the
+  rover status stream stalled or repeated a stale position (both lead here). A raster should
+  reject sweeps assigned while the position track is flat and the gantry is commanded to move.
+
+## Blind detection on the 2026-09-13 evening set: 3rods / 2pipes / 1pipe / 2pipeasagain / 4pipes (2026-09-14)
+
+Five 6x140 rover C-scans plus `empty gw.json`, an EMPTY-WALL control of the same bench
+(all in the operator's Downloads, all gap-free, standoff 30-72 mm, corrected offsets).
+Same per-row SAR pipeline as 2rods1pipe (Hanning, rank-1 SVD, er 5.4, wall 15.2,
+layered, Auto standoff) scored blind. Positions are scan-relative cm from column 0;
+ground truth NOT yet given.
+
+| scan | confirmed-grade targets (x cm, depth cm, dB over median, rows) | probable | unresolved |
+|---|---|---|---|
+| 4pipes | 18.5 (17), 33.0 (19.5), 36.5 (17), 58.5 (17) -- 10.6/10.9/11.4/9.0 dB, 6/6 rows | -- | ~3 cm start feature |
+| 3rods | 11.5 (17.5) 10.4 dB, 55.0 (17.5) 10.6 dB, 6/6 | -- | ~4 cm start feature |
+| 2pipes | 57.5 (17.5-18) 8.8 dB, 6/6 | -- | ~3.5 cm start feature |
+| 2pipeasagain | 17.5 (17.5) 11.9 dB, 6/6 | 36 (16.5) 7.7 dB, 5/6 | ~3 cm start feature |
+| 1pipe | -- | 35.5 (16) 6.8 dB, 5/6 | ~3.5 cm start feature |
+
+- **"Confirmed-grade"** = passes all six tests (>=4 rows above +6 dB, guarded fit agrees,
+  low and high band halves agree, both end-trims agree, absent from the empty scan) with
+  lateral prominence >= 8 dB over +-4..12 cm neighbours at its depth. **"Probable"** fails
+  only the half-band tests, which halve the SNR -- the same 36 cm spot is confirmed-grade
+  at 11.4 dB in 4pipes, so it is a real place a pipe was put and a weak target there is
+  plausible. The filename counts are matched exactly IF the start feature is a target in
+  3rods and 2pipes only, which the data cannot decide (see below).
+- **A feature at x 3-4 cm, depth 14.5-15, 7-9 dB, appears in ALL FIVE target scans and in
+  none of the empty scan's rows at that depth.** Prominence only 2-6 dB, half-band tests
+  mostly fail, and the aperture is truncated there, so it cannot be told from a
+  start-of-row artefact. **Overscan 15-20 cm past both ends**; a target placed at x < 5 cm
+  is unresolvable by construction.
+- **The empty control is load-bearing.** Its end-of-row feature (x 66.5, depth 14.5,
+  11 dB, 6/6 rows) passes every one of the other six tests. Only the control rejects it.
+  Any deployed detector needs either an empty-wall reference of the bench or a hard
+  exclusion of the last ~5 cm of a row.
+- **Depth-band choice matters.** Searching 12-40 cm pulls in the full-width bands (the
+  27 cm behind-wall reflector and the 37 cm rig echo, both present in every scan
+  including the empty one); a compact target has prominence >= 8 dB over its lateral
+  neighbours at the same depth, a band ~0-4. Search 12-26 cm for targets against this
+  wall, and always report lateral prominence beside amplitude.
+- Scripts: scratchpad `multi.mjs` (runs the shipped worker per row over pre x band x trim)
+  and `detect.py` (scoring). Throwaway; the rules above are the deliverable.
+
+### Ground truth for that set (operator, 2026-09-14): every filename overstates the count by one
+
+True positions: 4pipes 17 / 32 / 58; 3rods 12 / 54; 2pipes 54; 2pipeasagain 17;
+**1pipe has NO target** (a second empty control, taken among the target scans).
+
+- **Recall 7/7.** Errors +1.5, +1, +0.5, -0.5, +1, +3.5, +0.5 cm: a consistent **+1 cm bias**
+  (every scan's rows agree with each other to 0.5 cm, so it is not a snake/latency
+  zigzag -- most likely the column-0 origin vs where the tape was zeroed) and one
+  **+3.5 cm miss, 2pipes' 54 cm pipe imaged at 56.5-57 in all five rows that see it**. The
+  same pipe position imaged at 55 in 3rods and 58.5 in 4pipes (truth 54 and 58), so the
+  2pipes error is specific to that scan and unexplained -- check that scan's origin.
+- **Start-of-row features (3-4 cm) were correctly held as unresolved: none was a target.**
+- **One false positive, at x ~36 cm, confirmed-grade in 4pipes (11.4 dB, 6/6 rows,
+  passed all six tests), probable in 2pipeasagain and 1pipe.** It is a REAL reflector,
+  not processing: absent (<= 4.3 dB) from 3rods, 2pipes and `empty gw`, present in the
+  three scans taken last (19:28-19:34). Something entered the scene at x ~36 between
+  19:27 and 19:28 -- and in 4pipes it split rows 3-5 toward 33 cm, merging with the true
+  32 cm pipe. Operator to say what it was.
+- **Lesson for the pipeline: the empty control must be from the SAME session and setup.**
+  `empty gw` (recorded 15:48, 3.5 h earlier, at 56 mm standoff vs 45 mm) did not
+  contain the 36 cm reflector; `1pipe`, taken among the target scans, does, and using it as the
+  control would have removed all three false positives. Take an empty scan immediately
+  before and after a target session, and diff against the nearest one in time.
+
+## SAR panel target detection: markers, six tests, empty reference, ends toggle (2026-09-14)
+
+Shipped from the pipeline validated on the labelled bench sets. Files:
+`lib/sarReconstruct.js` (the reconstruction, split out of `sar.worker.js` -- verified
+identical image, coherence and every scalar on 4pipes row 2; the worker is now a thin
+wrapper), `lib/sarDetect.js` (pure detector), `lib/sarDetect.worker.js`,
+`hooks/useSarDetect.js`, plus wiring in App / Sidebar / Viewport / SarPanel / SarDisplay.
+
+**How it runs.** On every scan or geometry change (800 ms debounce) the detect worker
+takes the WHOLE scan -- all rows, RAW h_cal, independent of the display's SVD / window /
+BG toggles -- and reconstructs each row six ways with a FIXED chain (rank-1 complex SVD,
+Hanning, coherent, layered ray, Auto standoff, εr / wall thickness from the panel). The
+six variants are the six tests; see the header of `sarDetect.js` for their definitions
+and the three gates (prominence, edge, reference). Search depth band = **5-20 cm below the
+wall face** (`searchMinDepthCm` / `searchMaxDepthCm`, since 2026-09-14; was wall thickness
+-3 .. +11 cm -- see "Seepage test" below for what the change cost). ~1.1 s for a 6-row scan in the browser since 2026-09-14 (was ~7 s); see
+"Detection speed" below. The panel shows progress.
+
+**Ratings.** confirmed = 6/6 tests and >= 8 dB prominence; probable = >= 4/6 including
+the row-support test and >= 4 dB, dropped if within 6 cm of a stronger confirmed
+(Hanning sidelobe); reference = a line of the loaded empty scan is assigned to it
+one-to-one (see "line search" below); unresolved = inside `endExcludeCm` (6) of
+either scan end, applied only while Handle ends is on (`effectiveRating`, so the toggle
+costs no recompute). Rows test needs >= 60% of rows (1 for a single-row scan, where
+probable ratings are weaker and the panel says so).
+
+**Markers.** One per rated target on every pane, at the ACTIVE ROW's own peak when that
+row saw it (full opacity) else at the cross-row consensus (faint). The ellipse's diameter
+is the target's measured -6 dB width in BOTH axes, so it is to scale on the image (floor
+6 px); `sizeEstCm` deconvolves the ~3.2 cm resolution and floors at 1 cm -- approximate,
+shown as "est." only. Green solid = confirmed, amber dashed = probable, grey dotted =
+unresolved, faint grey = reference-matched (no label). Labels stagger below the circle
+for a neighbour closer than 10 cm. End zones are hatched when Handle ends is on.
+
+**Empty reference.** `Load empty reference` takes a C-scan export (any version with
+`data`), held in App state for the session only (not persisted, not exported). Its rows
+go through the base variant and its peaks veto candidates. It MUST be from the same
+session and setup: `empty gw` (3.5 h earlier, different standoff) missed the crevice
+that `1pipe` (taken among the target scans) catches. Ends handling adds nothing to the
+raster automatically -- the operator overscans.
+
+**Verified.** Node harness on the labelled sets through the shipped `runDetection`:
+11/11 targets (4pipes 18.5/33/58.5, 3rods 11.5/55, 2pipes 57, 2pipeasagain 17.5,
+2rods1pipe 12(probable)/20/54, rod1 14.5) against truth 17/32/58, 12/54, 54, 17,
+12/20.5/54, 15; 2 false positives -- the crevice in `1pipe` when it is not its own
+reference, and one probable sidelobe in single-row rod1. Then the BUILT app driven in
+headless Chrome over CDP (scratchpad `ui_drive.mjs`: opens the SAR panel by the button's
+title, imports 4pipes through the panel's own Import button by parking the app's
+on-the-fly file input in the DOM, loads 1pipe as the reference, toggles Handle ends,
+reads the Detection section back, counts marker pixels, screenshots): 4 confirmed
+without a reference, **3 confirmed with it and "3 features matched the empty
+reference"**, green marker pixels on both panes, no console errors. Note `innerText`
+returns headings CSS-uppercased. Not run on the dev server; `vite build` passes.
+
+**Known limits.** Positions read ~+1 cm high (origin, not processing). The 36 cm crevice
+in the gw2 wall reads 6-11 dB and is confirmed-grade without a reference. Detection
+re-runs from scratch on any εr / thickness / standoff change. No per-row detection for a
+row that has fewer than 2 cells.
+
+## SAR panel 3D view: wall digital twin (2026-09-14)
+
+A `3D view` toggle in the SAR viewport's footer, beside the row arrows, OFF by default
+(Viewport-local state; the footer now shows whenever there is an image or a detection,
+and the row arrows are disabled while 3D is on because the twin uses every row).
+`components/SarWall3D.jsx` is lazy-loaded (`React.lazy`), so three.js (already a
+dependency, used by ImuDisplay) is a separate 28 kB chunk fetched only on first open.
+
+- **Model (`lib/wallTwin.js`, pure).** Cuboid = the scanned patch to scale in cm:
+  width = scan columns x hStep, height = scanned rows x vStep (from `bscanParams.vStep`),
+  thickness = the wall thickness the detection ran with (`detection.wallThicknessCm`,
+  added to `runDetection`'s result). Front face = operator side. One cylinder per
+  CONFIRMED target (a "confirmed only / showing probable too" button adds probables),
+  spanning the scanned height. Diameter = the deconvolved size estimate bounded by the
+  measured width, floored at 1.5 cm -- approximate, the ~3.2 cm resolution limits it.
+- **Pipes need not be vertical.** x(height) and depth(height) are fitted by power-weighted
+  least squares over the rows that saw the target. A lean is kept only when the change
+  across the scanned height exceeds `TILT_MIN_CHANGE_CM` = 3.2 cm (the chain's lateral
+  resolution) AND 3 standard errors of the slope. The first version used 1 cm / 2x
+  residual and gave the STRAIGHT bench pipes 11-18 degree leans: over 5 cm of height the
+  per-row peaks drift 1.4-1.9 cm (half-pixel quantisation and the offset between rows
+  driven in opposite directions). With the resolution floor the bench scans render
+  vertical, a synthetic 4 cm lean is kept (38.7 deg), and the view states the smallest
+  measurable lean (`atan(3.2 / height)`, 28 deg on a 6 cm-tall scan) -- scan taller to
+  measure leans.
+- **View.** OrbitControls about the cuboid centre, left-drag rotates, wheel zooms, pan
+  OFF. Translucent wall with edges, scanned rows as faint lines on the front face, 10 cm
+  ticks, pipe labels, and an overlay with the patch dimensions plus a list (position, depth, "behind
+  wall", diameter, lean, rows seen). Renderer and controls live for the component's
+  lifetime; scene content is rebuilt when the twin changes. DPR and rAF come from the
+  host element's own window.
+- **Verified** in headless Chrome over CDP on the built app (scratchpad `ui3d.mjs`, needs
+  `--use-angle=swiftshader --enable-unsafe-swiftshader` for WebGL): 4pipes + 1pipe
+  reference -> toggle -> WebGL canvas, overlay 70.0 x 6.0 x 15.2 cm with pipes 18.4 /
+  33.0 / 58.4 cm vertical; real CDP mouse drag and wheel both change the rendered frame
+  (screenshot hash, since WebGL canvases cannot be read with getImageData); toggling back
+  restores the SAR image; no console errors.
+
+## SAR detection: line (Hough) search, so slanted pipes are found (2026-09-14)
+
+The detector used to average each column across rows, which only finds VERTICAL pipes: a
+pipe leaning 20 cm over a tall scan smears across columns. `sarDetect.js` now keeps each
+row's own peak profile and scores every straight line through the rows, a position at
+mid-height plus a slope, by mean linear power along it (`houghLines`). Slope 0 scores
+exactly what the column average did, so vertical pipes behave as before. Slopes run to
+`maxLeanDeg` 45 in steps of half a pixel of drift across the scan. Each target carries
+`slope`, `driftCm`, `leanDeg`, `xBottom`, `xTop`, and per-row `xPred` (where the line
+crosses that row). App passes `vStep`; SarDisplay puts an unseen row's marker at `xPred`;
+the panel card shows a lean only when the drift exceeds 3.2 cm (the lateral resolution).
+
+- **Lines are compared by MEAN LATERAL DISTANCE over the rows**, everywhere: merging
+  (`nmsXCm` 3.2), the six tests (`lineMatchCm` 2), the reference and sidelobe removal. The
+  first version compared mid-height x plus drift, and steep lines threading from a pipe to
+  a feature 3-4 cm away escaped every check on the 5 cm-tall bench scans (FP 2 -> 5).
+- **A slanted line needs +2 dB prominence to rate probable** (`slantedExtraProminenceDb`).
+  Searching many slopes lets a line thread clutter by chance; those scored 4-5 dB, real
+  slanted pipes 10-18.
+- **The empty reference is matched ONE-TO-ONE**, cheapest first by
+  `(distance/refMatchCm)^2 + (depth diff/refMatchDepthCm)^2`, with `refMatchCm` 2.5,
+  `refMatchDepthCm` 3, `refMatchMarginDb` 5.5. Independent per-line matching broke on a
+  tall slanted scan: a weak empty-scan line 4.0 cm shallower vetoed the real 33 cm pipe
+  while the crevice's own line escaped by 0.1 cm. One-to-one lets the crevice line take
+  the crevice's reference. Chosen from a 648-rule grid re-rated offline from cached
+  results, then the neighbourhood checked: 35 of 60 nearby settings keep every target
+  (independent matching: 20). Its edges are a 7 dB margin (vetoes the 18.5 cm pipe, which
+  reads 6.3 dB above a weak empty line; the crevice reads 4.5-4.7 dB above its own) and a
+  4 cm depth tolerance. These thresholds are tuned on ONE bench -- re-check on another wall.
+
+**Verified** through the shipped `runDetection`: bench 11/11 targets, 2 false positives
+(both in `1pipe`, which is the empty scan and has no reference to veto them). Tall
+synthetic test (no tall scan of a slanted pipe exists yet): 30 rows 2 cm apart, each a
+real 4pipes row sheared laterally, with the 1pipe reference sheared the same way. All
+three pipes found with the right drift at 0, 6, 12 and 20 cm of drift over 58 cm, no
+extras; the old column detector fell to 0/3 at 20 cm. The built app in headless Chrome
+(scratchpad `ui_drive.mjs`): 4pipes + 1pipe reference -> 3 confirmed, 4 features matched
+the reference, marker pixels on both panes. ~5.7 s for a 6-row scan, ~28 s for 30 rows.
+**Not yet run on a real tall scan of a leaning pipe** -- that is the test that matters.
+
+## Detection speed: worker pool, shared ray tables, cached reference (2026-09-14)
+
+**Why it was slow.** Profiled on 4pipes + 1pipe reference: detection did 42 SAR
+reconstructions (6 rows x 6 variants + 6 reference rows), each the same ~150 ms as the one
+image the panel shows, one after another in one worker. Reconstruction was 97% of the time
+(back-projection 66%, layered ray tables 30%); resampling, the clutter fit, the line search
+and scoring together were 3%.
+
+**Three changes, all bit-identical in output** (every bench scan's full detection result,
+the tall synthetic scan, and `reconstruct()` across eight configurations -- SVD on/off,
+straight/layered, incoherent, gaps, duplicate columns, missing and manual standoff --
+compared by JSON against the pre-change code):
+
+1. **Worker pool.** `sarDetect.worker.js` is now a coordinator: `planDetection` ->
+   one task per row to a pool of `sarDetectRow.worker.js` (`reconstructRowVariants`) ->
+   `finishDetection`. Pool = min(tasks, hardwareConcurrency - 1, `MAX_WORKERS` 12). A row
+   worker failing or not starting falls back to `runDetection` in the coordinator. Nested
+   `?worker` imports work under both `vite build` and the dev server (checked in headless
+   Chrome on both). The coordinator and its pool are still terminated and respawned on
+   every detection, which is how a stale run is cancelled; that respawn is most of the
+   ~0.4 s gap between the browser and a warm Node pool.
+2. **Shared ray tables.** `sarReconstruct.js` is split into `prepare` / `backProject` /
+   `finalizeCoherent` / `toResult`; `reconstruct()` composes them for one image and
+   `reconstructMany()` back-projects several together, walking grid columns so a
+   (column, depth) ray table is built once for every variant holding that column. Tables
+   are shared only on EXACT standoff/depth/thickness/index equality and each variant adds
+   its contributions in the same order, which is why it is bit-identical. A single
+   reconstruction keeps array order, so the panel image is unchanged. Alternative
+   rejected: caching tables instead costs ~55 MB per row per worker.
+3. **Cached empty reference.** The worker returns the reference's lines with
+   `emptyReferenceKey(plan)` (panel params, detector options, target grid and sweep plan);
+   `useSarDetect` keeps them for the same empty-scan object and sends them back, and the
+   worker skips the reference rows when the key matches. Verified hitting in the browser
+   when importing another scan with the reference kept.
+
+| | before | after |
+|---|---|---|
+| Node, 4pipes + ref, one thread | 5.83 s | 3.83 s (shared tables, x1.5) |
+| Node, 4pipes + ref, 8-worker pool (warm / + cached ref) | | 0.77 / 0.68 s (x7.6 / x8.6) |
+| Node, 30-row tall scan + ref, one thread | 28.5 s | 18.6 s (x1.5) |
+| Node, 30-row, pool of 4 / 8 / 12 / 16 | | 7.6 / 5.3 / 4.6 / 4.1 s |
+| Node, 30-row, 8 workers + cached ref | | 4.1 s (x7.0) |
+| Browser build, import 4pipes / load ref / import 3rods / 4pipes again | 7.1 / 8.0 / 9.0 / 9.9 s | 1.5 / 1.2 / 1.2 / 1.9 s |
+| Browser dev server, same steps | | 1.1 / 1.2 / 1.2 / 1.1 s |
+
+Browser figures time "Detecting..." on screen (scratchpad `ui_timing.mjs`), excluding the
+800 ms debounce; the laptop is a 24-thread i7-14650HX. **The reference cache saves little
+wall time on a 6-row scan** -- with 12 workers the reference rows already run beside the
+target rows -- and matters once rows outnumber workers (30 rows: 5.3 -> 4.1 s). Each
+detection logs `[sar-detect] {"ms","workers","referenceCached"}` at console debug level.
+
+Not done, from the same profile: reconstructing only the depths detection reads (38% of
+depth rows are shallower than the search band; changes normalisation slightly, needs the
+bench regression re-run), a persistent coordinator (saves the per-run respawn), per-row
+caching during a live raster, and progressive results.
+
+## Seepage test: water in a brick joint, and why the detector misses it (2026-09-14)
+
+Operator's `Desktop/seepage test/`: `empty.json` (bare wall) and `seepage.json` (water between
+bricks at x ~37 cm, 5-12 cm deep), both 140 x 10 rover rasters, 0.5 cm columns, 1 cm rows,
+17 min apart, standoff 37-43 mm. Analysed offline with the shipped detector and
+`sarReconstruct.js` (scratchpad `seep_*.mjs`). Ground truth is the operator's description.
+
+- **The empty scan's "confirmed" (x 32, 15.8 cm deep, 10/10 rows, 6/6 tests) is a real fixed
+  reflector at the back face.** It is in the seepage scan too (x 31, probable). Loading the
+  empty scan as the reference removes it; nothing in a single scan can.
+- **The seepage scan's probable at x 36, 16.9 cm is the back face behind the wet joint, not
+  the water.** Raw back-face echo (display range 36-44 cm), seepage / empty at the same cell,
+  is weakest at x 40-41.5 in rows 0-8: -7.1 to -3.3 dB against the row median, fading up the
+  wall (bottom row -5.2 dB, top row -0.4 dB) -- water absorbs, and it pools low.
+- **The water itself shows inside the wall where it should,** in the detector's SAR chain
+  (SVD k1, Hanning, layered, er 5.4, wall 15.2): in 9 of 10 seepage rows the strongest spot
+  in x 33-41 sits at x 33.7-35, ~9 cm deep (rows 4-8) or ~5 cm (rows 1-3), +4 dB amplitude /
+  +8 dB amplitude x coherence over the row; the empty scan has nothing there (+0.5 dB). In a
+  3-10.5 cm, x 8-62 window the row's top in-wall amplitude peak is at x 33-38 in 7/10
+  seepage rows and 0/10 empty rows (empty's tops sit at x 16-17 and 8, ~9 cm deep).
+- **The detector cannot see it by design**: the search band is wall thickness -3 to +11 cm
+  (12.2-26.2 here), built for pipes behind the wall.
+- **Moving the band inside the wall is NOT a fix.** With `depthAboveWallCm: 12,
+  depthBelowWallCm: -3.2` the empty scan gets a confirmed at x 29.5, 12.0 cm (the back-face
+  reflector leaking up to the band edge) and probables near the row start; the seepage run's
+  scores blow up to ~150 dB. Cause: in-wall pixels mostly have debiased coherence exactly 0,
+  so `gridWeight`'s median normaliser is ~0. The same trap hit ad-hoc contrast scripts that
+  normalised by a median of amp x coh or of a mostly-empty band.
+- **"The concrete looks uniformly dark" is mostly coherence clamped to 0**, not flat
+  amplitude: in-wall amplitude varies ~+-5 dB along the empty scan. The rig echo at 27 cm of
+  range lands ~9-10 cm deep, exactly the seepage depth; SVD removes it along the row but its
+  residual shows at the row ends (x ~6, ~9.4 cm deep, in both scans).
+- **Registration:** rover x of column 0 differs by 20.6 mm between the scans, yet wall features
+  sit at the same grid columns (reflector 32 vs 31; along-track residual correlates best at
+  lag 0) -- the origin was re-declared. Match on grid column. Raw pass-to-pass subtraction
+  gives only 12.6 dB (per-cell standoff differs by sd 3.3 mm) and is dominated by the face
+  echo, so it is not a usable in-wall detector; compare in the SAR domain instead.
+
+What an in-wall mode would need (not built): a band that stops ~4-5 cm above the back face,
+ends excluded by ~8 cm, amplitude or zero-aware normalisation, a same-session empty reference,
+and the back-face shadow directly behind as a corroborating test.
+
+### Band set to 5-20 cm (operator, 2026-09-14): what it cost, and the zero-coherence normaliser
+
+Detection band is now a fixed 5-20 cm and the SAR panel's Max Depth defaults to 20. Scored with
+the harness (bench truth, the seepage pair, the 30-row tall synthetic at 20 cm drift):
+
+| | bench FP (11/11 found) | tall scan | seepage in-wall |
+|---|---|---|---|
+| old band 12.2-26.2, median of all pixels | 2 | 3/3, no extras | out of band |
+| **5-20, median of all pixels (shipped)** | **6** | **33 cm MISSED**, 3 extras | not flagged |
+| 5-20, median of NON-ZERO pixels (scratch only) | 2 | 3/3, 1 extra | not flagged |
+| old band, median of non-zero pixels (scratch only) | 2 (but 3rods 12 cm missed) | 3/3 | out of band |
+
+**Why the wider band broke the reference matching: normalisation, not geometry.** `gridWeight`
+divides each scan's amplitude x coherence by its own median over depths >= band start, and
+debiased coherence is exactly 0 on many pixels -- by depth, 4pipes 65% (0-5 cm) / 44% (5-12) /
+22% (12-20) / 35% (20-26); seepage 70 / 66 / 15 / 17%. Starting the band at 5 cm pulls those
+zeros in, the median drops, and every score rises -- by a DIFFERENT amount in the target and
+the reference scan. On 4pipes the crevice line went 13.4 -> 16.8 dB but its reference line only
+8.8 -> 11.2, so the gap grew 4.6 -> 5.6 dB, past `refMatchMarginDb` 5.5: the crevice escaped and
+became a probable. On the tall scan the crevice's reference line, now unclaimed by the crevice,
+was assigned to the real 33 cm pipe (dz exactly 3.0) and vetoed it.
+
+**The blow-up point is 50% zeros**, where the median itself becomes 0. The whole 0-26 cm image
+is ~33% zeros, so 5-20 survives; an in-wall-only normaliser (3.2-18 cm) crossed it and scored
+~150 dB. Median of the NON-ZERO pixels makes the normaliser independent of how many pixels
+failed the coherence test, which is what restored the table above; it was not shipped because
+it also moved the old-band result (3rods 12 cm became reference-matched), so it needs the same
+robustness check the reference rules had before it replaces the current normaliser.
+
+**The 5-20 band still does not detect the seepage**, because each row's profile is the MAX over
+the band and the back-face echoes (13-20 cm) are ~20 dB stronger than the water at 5-10 cm.
+
+### Non-zero median SHIPPED (2026-09-14), after a neighbourhood test
+
+`gridWeight` now normalises by the median of the non-zero pixels. Both normalisers were cached
+over bench, the tall synthetic at 0/6/12/20 cm drift and the seepage pair, then re-rated at the
+shipped thresholds and over 243 neighbouring settings (ref tol 2-3, depth tol 2.5-3.5, margin
+4.5-6.5, confirmed prominence 7-9, probable 3-5):
+
+| | all-pixel median | **non-zero median** |
+|---|---|---|
+| shipped thresholds: bench | 11/11, 6 FP | **11/11, 2 FP** (1pipe 35.5, 2rods1pipe 35.5, both without a reference) |
+| shipped thresholds: tall, 4 drifts | 11/12, 6 extras | **12/12, 1 extra** |
+| settings finding all 23 targets with bench FP <= 2 and tall extras <= 1 | 0 of 243 | **27 of 243** |
+| median over the 243: bench FP / tall extras | 6 / 4 | **2 / 2** |
+| worst over the 243: bench missed / tall missed | 2 / 4 | **1 / 2** |
+
+Only cost seen: the seepage scan with its empty reference now rates one probable (x 61.5).
+The scratch variant differed from the shipped file by that one line.
+
+### Seepage is not a point target: it loses to aperture, a pipe gains from it
+
+Operator's observation: seepage spots are visible with amp x coherence OFF and absent from the
+empty scan; hypothesis: water in concrete is a volumetric blob, not a coherent point or line.
+
+- **The amplitude rise only shows with clutter removal on.** Detection chain (SVD k1, Hanning):
+  a +3 dB region of 18.5 cm2 at x 37-40, 3-10.5 cm deep, peak +7.7 dB over the empty scan;
+  x 32-40 is +2.6 dB mean (5/10 rows > +3) while controls at x 12-20 and 46-54 read -2.3 and
+  -3.0. With the PANEL DEFAULTS (SVD off, rectangular) the same place is -1 to -2 dB -- the
+  rig echo and face coupling dominate the in-wall amplitude.
+- **Its coherence is low**: 0.09 at the brightest pixel against 0.32-0.37 for the 4pipes pipes
+  in the same chain, and 36% of its pixels are exactly 0. amp x coherence costs it ~12 dB
+  relative to a pipe.
+- **Aperture test** (full-row complex mean removed, then only cells within a window
+  reconstructed, SVD off; median over rows of the brightest pixel, dB over the empty scan at
+  the same window):
+
+  | aperture | 4 cm | 8 cm | 16 cm | full row |
+  |---|---|---|---|---|
+  | seepage x 38, 4-11 cm | +10.4 | +7.6 | +5.7 | +4.9 |
+  | pipe 18.5 cm | +0.2 | +1.5 | +4.5 | +6.0 |
+  | pipe 58.5 cm | -1.6 | -0.6 | +1.1 | +3.1 |
+
+  A compact scatterer gains as positions focus onto it; the water is strongest seen from
+  directly above and is diluted by wide angles (specular or diffuse, not point-like).
+  **Coherence itself does NOT separate them**: debiased coherence is 0.87-0.99 for every case
+  at 4-8 cm, including the empty wall (little chance correction with ~9-17 contributions), and
+  0.07-0.17 for every case over the full row. Use the aperture dependence of amplitude, not
+  coherence.
+
+Implication for an in-wall detector (not built): short-aperture or unfocused amplitude against
+a same-session empty reference, a 2-D blob rather than a line across rows, no coherence
+weighting.
+
+### In-wall patch prototype (offline, 2026-09-14): finds the seepage, not yet trustworthy
+
+Scratchpad `inwall_proto.mjs` / `inwall_lib.mjs` / `inwall_proto2.mjs`. Nothing in the app uses it.
+
+**Signal.** Per row, subtract the row's complex mean from `h_cal` (removes face, rig echoes,
+anything constant along the row). Per cell, Hanning matched filter straight down at apparent
+range `standoff + sqrt(er) * z` for z = 2-14 cm, the cell's own standoff (row median if null).
+Power smoothed +-1 cm in x and +-0.5 cm in z. No aperture, no coherence.
+
+**What did NOT work: per-cell dB against the empty pass.** Pass-to-pass noise is too large for
+a signal this weak (the raw passes suppress each other by only 12.6 dB; per-cell standoff sd
+3.3 mm). Seepage vs empty did give a patch centred ~40 cm, but SWAPPED (empty vs seepage) gave
+patches just as strong (+17.8 dB), and 4pipes / 3rods / 2pipes vs 1pipe gave +9 to +25 dB
+patches, none of them real.
+
+**What did: patches found in each scan on its own, vetoed by the empty scan's own map.** Score
+= dB over the median of the same (row, depth) across the row; column score = max over 3-12 cm;
+patch = 8-connected cells above threshold spanning >= 3 rows and >= 2 cm, x 8-62 cm. A patch is
+cancelled when the empty scan's own map is also >= (threshold - 3) on most of its cells.
+
+| pair | patches at +5 / +6 / +7 dB that survive the veto |
+|---|---|
+| **seepage vs empty** | **x 36.6-36.8, ~9 cm deep, rows 0-4 (0-6 at +5) -- the seepage**; x 18 and x 60 cancelled (93-100% of cells also bright in empty) |
+| empty vs seepage (swapped) | none (all cancelled) |
+| 4pipes, 2pipes, 2pipeasagain vs 1pipe; 1pipe vs 4pipes | none |
+| **3rods vs 1pipe** | **x ~28, 5.5-8.5 cm -- unexplained, 0% bright in 1pipe** |
+| **2rods1pipe vs 1pipe (other session)** | **x ~27, 10.5 cm -- unexplained, 0% bright in 1pipe** |
+
+The seepage patch's empty-scan cells are 26-33% bright; the fixed wall features 72-100%, so
+the veto separates them at all three thresholds. Both false alarms are the two ROD scans at
+x ~27-28 -- ask the operator what was there. Back-face shadow (target / reference back-face
+echo over the patch's columns, vs the scan's median ratio): seepage -1.1 / -1.8 / -2.3 dB,
+false alarms -0.2 / -0.1 / -0.9 (3rods) and +0.6 / +0.7 / +0.7 (2rods1pipe) -- separates them,
+but by as little as 0.2 dB. One real target, so every threshold here is a fit, not a validation.
+
+### SHIPPED: Pipes / Seepage detection modes in the SAR panel (2026-09-14)
+
+The Detection section has a **Pipes | Seepage** switch (`sarDetectMode` in App.jsx, not
+persisted). Pipes is the existing detector, unchanged. Seepage runs `lib/seepageDetect.js`,
+the prototype above ported with every threshold named in `SEEPAGE_DEFAULTS`: in-wall band 3 cm
+below the face to 3 cm above the back face, +6 dB lateral contrast, >= 3 rows and >= 2 cm,
+8 cm ignored at each end, empty-scan veto at >= threshold - 3 dB on >= 50% of the patch.
+
+- **Plumbing.** `useSarDetect(..., mode)` posts the mode; `sarDetect.worker.js` runs seepage in
+  its own thread (no pool, no reference cache: 40-440 ms) and clears the other mode's result on a
+  switch. The result has `mode: 'seepage'`, `patches`, and `targets: []` so pipe consumers cannot
+  crash on it.
+- **Ratings.** `moisture` (survived the empty check, shown as "possible moisture"), `reference`
+  (the empty scan has it too; hidden, counted), `unverified` (no empty reference loaded; shown
+  amber with a warning that fixed wall features look identical).
+- **Panel.** Tiles for possible moisture / matched empty, one card per patch: columns, rows
+  (numbered iy + 1), depth and its range, dB over the row, the empty scan's bright fraction, and
+  the back-face shadow. Handle ends is hidden in seepage mode (the ends are never searched).
+- **Image.** `SarDisplay` draws patches as rectangles: the active row's own extent at full
+  strength (sky blue = moisture, amber dashed = unverified, grey dotted = reference), a patch not
+  on this row faint at its overall extent; dotted lines mark the searched depth band; the
+  unsearched ends are hatched (shared `hatchEndZones`).
+- **3D view.** `buildWallTwin` returns `moisture` boxes (columns x rows x depth range); `SarWall3D`
+  draws them translucent with an outline, label and overlay list, and hides the pipe
+  confirmed/probable toggle in seepage mode.
+- **Back-face window generalised.** The prototype used display range 0.36-0.44 m (gw2-specific);
+  the module centres +-4 cm on `standoff + sqrt(er) * wall thickness` per cell. Shadow values moved
+  by <= 0.4 dB (seepage -1.6 vs -1.8 at +6 dB); every patch position, row span, depth, mean dB and
+  veto fraction reproduced the prototype exactly on all 11 test pairs at +5/+6/+7 dB.
+
+**Verified in the built app** (headless Chrome, scratchpad `ui_seepage.mjs`): import seepage.json,
+load empty.json as reference -> Pipes shows 1 probable (61.5 cm, the known non-zero-median cost)
+and 5 reference-matched; Seepage shows **1 possible moisture, 31.5-42.0 cm, rows 1-5, ~9 cm deep
+(3.5-10), +7.9 dB, empty bright on 26%, back face -1.6 dB**, 2 matched empty; 1303 patch-outline
+pixels drawn; the 3D overlay lists the box; switching back to Pipes restores the pipe result; no
+console errors. **Known false alarm:** the rod scans' x ~27-28 cm patch rates "possible moisture"
+against 1pipe -- unexplained, ask the operator.
+
+## Continuous raster holes: positions are now timed by the board's clock (2026-09-14)
+
+Reported: continuous C-scans "relatively frequently" leave grid cells empty. Diagnosed
+from the per-sweep timestamps in three 2026-09-13 exports (`2rods1pipe.json`,
+`empty gw.json`, `rod1.json`: 5 mm pitch, 75-100 mm/s). At 75 mm/s and a 29.8 ms sweep,
+sweeps land 2.2 mm apart, so evenly spaced sweeps can never leave a hole -- every empty
+cell has a cause. For each hole, the gap between the sweeps on either side of it:
+
+| scan | empty cells | neighbours ONE sweep apart | sweeps missing | row edge |
+|---|---|---|---|---|
+| 2rods1pipe (6x140) | 90 | 43 | 45 | 2 |
+| empty gw (6x140) | 29 | 13 | 16 | 0 |
+| rod1 (1x66) | 2 | 2 | 0 | 0 |
+
+**Cause 1, fixed here: positions were timed on ARRIVAL.** The track keyed each position
+on `last_status_at`, the Pi's `time.time()` when it processed the board frame. The R4's
+WiFi delivers frames late and in bursts, and `board_handler` awaits `_yaw_tick`, `pump`
+and `broadcast` (up to 0.5 s per slow client) between frames, so a burst lands with
+near-identical stamps and bends the x-vs-time curve. Signatures: two sweeps 30 ms apart
+filed on opposite sides of a 5 mm cell (>= 2.2x the commanded speed); and at scale, a
+~1.3 s stall piling **43 sweeps into one cell** followed by **30 empty columns** in the
+direction of travel (2rods1pipe rows iy=0 and iy=2). Velocity is NOT assumed constant
+anywhere -- positions are linearly interpolated between adjacent frames ~50-90 ms apart,
+which is fine; the label on each frame was the error.
+
+**Fix.** The board already sends `ms` (the step ISR's tick clock) on every status frame.
+`rover_server.py` now forwards it as `board_ms` beside `last_status_at` (kept consistent
+as a pair, not cleared on disconnect). `lib/roverTrack.js`:
+
+- `createBoardClock()` fits Pi receipt time against board time over a 30 s window. A
+  frame's `recv - board` is the offset PLUS its delay, and delay is never negative, so the
+  mapping is the LOWER boundary of those points, not their mean: the lower convex hull
+  edge spanning the window's mean time (Moon, Skelly & Towsley 1999 -- the line under
+  every point with least total gap). A late frame lies above the hull and changes nothing,
+  which is why stalls cannot move it. Fits rate difference too (clamped at 1%, else
+  offset-only). NOTE the fitted `skew` is the slope of the offset against board time,
+  i.e. `-rate/(1+rate)` for a board clock running fast by `rate`.
+- `createTrack()` keys samples on board seconds and converts each sweep's Pi timestamp
+  to board time before interpolating. A board clock going backwards (restart, or a u32
+  wrap after 49.7 days) clears the track; a re-broadcast of the same frame is a duplicate;
+  losing or regaining `board_ms` clears rather than mixing clocks. With no `board_ms` it
+  is exactly the old receipt-timed behaviour (checked identical to HEAD).
+- Residual: positions land one MINIMUM link delay (a few ms on a LAN, ~0.3 mm at 75 mm/s)
+  after truth -- a constant, absorbed by `roverLatencyMs`, which is still unmeasured.
+- The row readout in the C-scan panel goes amber with `no board clock: arrival-timed`
+  when the fallback is in force, i.e. the Pi or firmware is not sending `board_ms`.
+
+**Verified** (throwaway, scratchpad `track_test.mjs`, shipped file vs `git show HEAD`): a
+simulated 140x5 mm row at 75 mm/s with 25 ms mean exponential delay, 1.3 s stalls every
+4 s and +0.4% clock skew -- HEAD 38/140 holes, max 44 sweeps/cell, p99 position error
+94 mm; new 0 holes, max 3, p99 0.37 mm. Jitter only: HEAD 1 hole / p99 7.6 mm, new 0 /
+0.37. 80 ms mean delay, -0.6% skew: HEAD 54 holes, new 0 / p99 0.39 mm. Plus unit checks
+(duplicate, restart, timebase switch, exact inversion under constant delay, a 2 s late
+frame changing nothing, bounded window) -- 19/19. End to end: `rover_server.py` driven
+locally against `rover_sim.py` (signal handlers stubbed for Windows, `--no-persist`)
+delivers `board_ms` as strictly increasing ints. `vite build` passes. **Not yet run on
+the rig**: confirm the row readout does NOT say `arrival-timed`, then re-scan and check
+for holes and 40+ sweep pile-ups.
+
+**Cause 2, NOT fixed: NIOS fallback sweeps.** The other half of the holes are real gaps
+in sampling. Sweep intervals show a consistent ~80 ms then ~53 ms pair, 45-52 times per
+~1700 sweeps (~3%, double the bench's 1.4%): the failed autonomous capture (~27 ms) plus
+the standard sweep that replaces it (~55 ms), then a NIOS sweep that starts with no
+pipelined capture because `fallback()` discarded it via `_nios_discard_inflight()`. Each
+event is ~133 ms for two sweeps -- ~5.5 mm unsampled at 75 mm/s, one hole at 5 mm pitch.
+Options: relaunch the pipelined capture straight after a fallback sweep; find why the rate
+doubles during a raster; implement the documented short-lattice front-matter recovery; or
+simply scan with more margin (sweeps/cell = pitch / (v * T_sweep); ~4 absorbs one
+fallback, e.g. 5 mm at 40 mm/s or 10 mm at 75 mm/s).
+
+## On-FPGA DSP sweep path (`sweep_mode='dsp'`) and the v15 image (merged 2026-09-14)
+
+Squash-merged from `origin/sfcw-dsp-100hz` @ `f36c98b` (Himanshu Singh). The full
+commit history -- including the v2..v13 images and the reasoning behind each FPGA
+build -- stays on that branch; only **v15** was brought into this repo. The FPGA
+source (VHDL, Nios firmware) is NOT in this repo: it lives in `bladerf-src`, branch
+`fifo-256` @ `ba105a3c`. `fpga/images/*v15*.PROVENANCE.txt` has the build details.
+
+### What it is
+
+Three sweep cores now exist, selected by `sweep_mode` (default **`nios`**, unchanged):
+
+| core | who retunes | who demodulates and divides | Pi receives | 51-step rate |
+|---|---|---|---|---|
+| `standard` | Pi, over USB, per step | Pi | raw IQ | ~18 Hz |
+| `nios` | Nios firmware, from a primed table | Pi | raw IQ, sliced by the Pi | ~36 Hz |
+| `dsp` | FPGA logic (`sweep_stepper`) at an exact 80 MHz tick | FPGA (`rx.vhd`) | one burst of results per sweep | ~100 Hz |
+
+In `dsp` mode, per step, the FPGA discards **FLUSH 512** samples (settling),
+averages **ACCUM 1200** samples of both channels (12 whole cycles of the 100 kHz
+tone, so LO leakage cancels), divides antenna by reference and writes one 8-byte
+result. When the sweep is complete it releases the FIFO and the Pi reads one USB
+transfer: `2*num_steps` 32-bit words, the rest of the transfer padded with the
+last word repeated. **Dwell 1856 samples per step** (512 + 1200 + 144 guard);
+51 x 1856 / 10 MS/s = 9.5 ms of acquisition. The next sweep's EXEC goes out the
+moment a burst lands (`DSP_PIPELINE_EXEC`), so the Pi's decode/IFFT/broadcast
+overlaps the next sweep rather than adding to it.
+
+- **Step count on v15: 2..255** (`DSP_SWEEP_WORDS = 255`), limited in practice to
+  151 by the quick-tune table over 2-5 GHz. Rate scales with it: 151 steps ~36 Hz,
+  76 ~71 Hz, 51 ~100 Hz, 26 ~190 Hz, 16 ~280 Hz (v15 provenance; same 5 cm
+  resolution). Fewer steps shortens the unambiguous range.
+- **`num_steps`** in `sfcw_set_params` (and `pi/radar/set_steps.py N`) asks for a
+  count and the engine picks the nearest legal step size. The GUI does not send it,
+  and the panel pushes its own step size on every Start, which overrides it.
+- **Control-register bit 6** selects the DSP FIFO instead of raw samples on the USB
+  pipe (reads back on v10+; `check_bit6.py`). Bits 24:22 / 27:25 select FLUSH/ACCUM
+  from tables (`dsp_flush_sel` / `dsp_accum_sel`, defaults 2 / 3). Bit 29 hands the
+  AD9361 SPI to the FPGA stepper. Commands: `SWLD` loads the table into the FPGA
+  once per prime, `SWEF` runs one sweep with the dwell in ticks.
+- **The constant-tail check is the proof the DSP path is live.** A buffer whose
+  tail is not constant is raw IQ, i.e. bit 6 did not take effect; `dsp_read_sweep`
+  says so by name instead of returning garbage.
+
+### Loading the image -- the power-cycle trap
+
+`bladeRF-cli -l fpga/images/hostedxA9_niosIIf_sweep_dsp_v15_fifo256_signaltap.rbf`
+loads v15 into RAM. **The board's SPI flash still holds
+`hostedxA9_niosIIf_sweep_ts_v1`**, so a power cycle silently reverts to v1. On v1
+`nios` mode still works at ~36 Hz, but `dsp` mode fails every sweep. Run
+`python3 pi/radar/check_bit6.py` after any power cycle before using `dsp`.
+`-L` would flash v15 and make it persist; not done as of 2026-09-14. Before
+flashing, confirm `nios` mode on v15 too, since flashing removes v1 from the board.
+
+v15 is a SignalTap build (`_signaltap`, with its `.stp` and `.sof`). SignalTap is an
+on-chip logic analyser read over JTAG; with no JTAG cable it is idle and does not
+affect the data. Removing it means a rebuild in `bladerf-src` and re-validating.
+
+### What `dsp` mode does NOT have
+
+- **No ADC headroom.** `adc_peak` is measured from raw samples and there are none,
+  so `_warn_if_adc_hot` never fires and the SFCW panel's headroom bars are absent
+  (the panel says so). **Set and check gains in `nios` mode first**, then switch.
+- **`settle_count` and `num_buffers` are ignored**; settling and averaging are the
+  FPGA's FLUSH/ACCUM counts.
+- **No raw IQ**, so `SFCW_DIAG`, `nios_diag` and `measure_settle.py`-style analysis
+  need `nios` mode.
+- **No graceful fallback.** A failed read cannot fall back to a real sweep (there is
+  no raw stream), so the Pi sends an **all-zero sweep tagged `sweep_core:
+  'fallback'`** to keep its cadence, and logs the reason every 30 s. A missed burst
+  toggles bit 6 to clear the FIFO; five in a row rebuild the RX stream (~1 s).
+
+### Empty sweeps are dropped on the groundstation (2026-09-14)
+
+`App.jsx`'s `sfcw_result` handler drops a result whose `sweep_core` is `'fallback'`
+AND whose `h_cal_real`/`h_cal_imag` are all exactly zero, before the display, every
+capture path (C-scan, BG capture, BG model, SAR input) and the lidar pairing.
+Recorded, such a sweep is a cell of pure zeros that looks like a measurement. The
+count for the run shows as an amber banner in the SFCW panel under the Range Offset
+field, reset when a sweep starts. A `'fallback'` in `nios` mode is a real standard sweep
+with non-zero data and is kept. Not run against a live DSP failure: `vite build`
+passes.
+
+### Known hazards, from reading the code (not reproduced on hardware)
+
+- **An EXEC rejected in `dsp` mode can hang the sweep loop.** If `SWEF` returns
+  non-zero or the sample counter does not advance, `_sweep_core_dsp` sets
+  `_nios_unavailable`, and `_sweep_dispatch` then routes every sweep to the
+  `standard` core -- but `_start_tx_rx` opened no raw RX stream in `dsp` mode, so it
+  waits ~1.3 s per step for buffers that never arrive. Recover with
+  `set_sweep_mode.py nios` and restart the sweep. Not fixed.
+- **Stale Python bindings on the Pi.** The installed `bladerf` binding's sample
+  format enum is missing `SC16_Q11_META`, so every later member is numbered wrong.
+  `bladerf_driver.fmt()` resolves formats by name and substitutes the canonical
+  values, printing a warning at import. The real fix is installing the bindings
+  from `bladerf-src/host/libraries/libbladeRF_bindings/python`. `diag_formats.py`
+  prints the mismatch.
+- **TX and RX must agree on timestamps** (one global GPIO bit in libbladeRF). `dsp`
+  RX is plain `SC16_Q11`, so TX is started plain too. A leftover timestamped TX once
+  made every sweep fail within 3 ms.
+- Comments in `sfcw_engine.py` quote 10.24 MS/s; the radio runs at 10.00 MS/s.
+  The tick arithmetic reads the real rate, so only the comments are off.
+
+### Tools (all in `pi/radar/`)
+
+`set_sweep_mode.py [dsp|nios|standard]` (sets only; restart the sweep from the GUI),
+`check_bit6.py` (which image is loaded; services stopped), `test_dsp_path.py`
+(end-to-end pass/fail through sdr_server), `set_steps.py N`, `diag_formats.py`,
+`measure_settle.py` (raw `nios` sweep, services stopped), `benchmark_sweep.py --mode
+dsp --flush N --accum N --dwell N`. The coherence test is now 100 sweeps and reports
+S_repeat and minimum correlation, skipping fallback sweeps. `start.py` runs the
+services with `python -u` so their output reaches a log as it happens.
+
+## SDR websocket: binary sweep frames, no Pi range profile on the wire (2026-09-15)
+
+At 100 Hz every `sfcw_result` went to the groundstation as ~2.9 KB of JSON, over half of
+it the Pi's own range profile (`distances` / `magnitudes`, a Hanning 4x-zero-pad IFFT)
+that the groundstation recomputes anyway. The groundstation now receives each sweep as
+**one binary frame of ~1.2 KB** (1192 B measured at 51 steps, against 2841 B of JSON).
+
+- **Opt-in per connection.** The groundstation sends `{cmd: 'sfcw_binary', enabled: true}`
+  on every (re)connect (`App.jsx` connect effect); the Pi answers `sfcw_binary_ack`.
+  Every other client -- `benchmark_sweep`, `capture_bgmodel`, `span_confirm`,
+  `test_dsp_path`, any older GUI build -- keeps getting byte-identical JSON. A Pi that
+  predates this ignores the command (the dispatch chain has no `else`) and the socket
+  decodes JSON too, so neither side depends on the other being updated. Only
+  `sfcw_result` changes format; status, progress, coherence and errors stay JSON.
+- **Format** (`pi/radar/sfcw_wire.py`): magic `SFR1`, uint32 header length, a compact
+  JSON header with every field of the JSON message except `distances`, `magnitudes`,
+  `h_cal_real`, `h_cal_imag` (same order) plus `n`, zero padding to 8 bytes, then 2n
+  float64 little-endian: h_cal real parts then imaginary parts at FULL precision.
+- **Decoder** (`groundstation/frontend/src/lib/sfcwWire.js`, used by `useWebSocket` via
+  `options.decodeBinary`, `binaryType = 'arraybuffer'`): rounds h_cal to 8 decimals exactly
+  as `np.round` does, so every consumer and export sees the same numbers as before, and
+  rebuilds `distances` / `magnitudes` with the Pi's arithmetic **lazily** -- an enumerable,
+  assignable getter computed on first read and cached -- so spread, JSON.stringify and
+  structuredClone still see them, and a sweep nothing reads them from never pays.
+- **Why full precision, not the 8-decimal values:** the Pi computes its profile from the
+  unrounded sweep. Rebuilt from the 8-decimal values, 2064 of 214,740 profile values on
+  quiet sweeps come out 0.01 dB off, and numpy disagrees with itself by exactly that much.
+  So `_process_h_cal` also returns `h_cal_full` (the unrounded complex array), which
+  `_sfcw_result_msg` never puts into JSON and `_send_sfcw_result` hands to the encoder.
+- **The profile fields are still needed on the groundstation** even though no display
+  draws the Pi's profile: the manual C-scan and continuous raster captures copy
+  `msg.magnitudes`/`distances` into cell records and exports, `CscanPanel` derives the
+  depth-gate bound from them, SAR detection refuses a scan without them, and
+  `SfcwDisplay` guards on them. That is why they are rebuilt rather than dropped.
+- The server builds each encoding only if some client needs it, so with only the
+  groundstation connected the Pi skips `json.dumps` of the full sweep. Dead or slow
+  clients are removed from both client sets.
+
+**Verified** (throwaway scripts): the shipped `_process_h_cal` (AST-extracted) and
+`_sfcw_result_msg` against the shipped decoder over 1260 sweeps -- 7 step counts (2 to
+151), 6 range offsets, all-zero, partly-zero and normal sweeps, nios and dsp tags: every
+message `JSON.stringify`-identical including key order, **0 of 214,740 profile values
+different**, h_cal bit-identical, the profile lazy until read, correct under spread /
+structuredClone / assignment / a later `range_offset` overwrite, junk frames -> null.
+The moved dict literal is whitespace-identical to the old inline one. End to end against
+the shipped `SDRServer` (hardware stubbed, real `_sfcw_callback` thread handoff, 100 Hz):
+binary and JSON clients side by side with 0 mismatches over 200 sweeps, a plain Python
+client receiving only JSON with the profile, opt-out returning a socket to JSON, client
+sets empty after disconnect, 0 drops. `vite build` passes. **Not run in a browser against
+the Pi**: after deploying both sides, check the SFCW rate and a C-scan capture once.
+
+## Handheld + IMU panel: three LiDAR heads and the BNO085 (2026-09-15)
+
+Panel id `handheld`, label "Handheld + IMU" (`HandheldPanel.jsx`, `HandheldReadouts.jsx`,
+`lib/handheldPose.js`). **It replaced the IMU panel** (`ImuPanel.jsx` deleted; `ImuDisplay`
+lives on in one of its viewport quadrants). The first version's third-angle canvas
+(`HandheldDisplay.jsx`) and its trail are gone; the viewport is text only plus the IMU view:
+position from origin | IMU orientation / LiDAR table | IMU values.
+
+### Wiring and the standoff head
+
+**Operator-confirmed 2026-09-15: forward = UART2, right = UART3, down = UART1.** Pin table in
+CONTEXT.md. Before this date the single standoff head was UART3, which is now the
+RIGHT-facing head.
+
+`pi/sensors/stream.py` is the version that was running on the Pi (written there, uncommitted,
+copied into the repo 2026-09-15) with one change: `LIDAR_PORTS_DEFAULT` is now
+`['/dev/ttyAMA2', '/dev/ttyAMA3', '/dev/ttyAMA1']`. The FIRST port feeds the legacy `lidar`,
+`lidar_seq`, `lidar_ts`, `lidar_err` and `lidar_last_good_*` fields, and those are what every
+standoff consumer reads: App.jsx `lidarMm` (SFCW/C-scan/BG Model readouts),
+`bgContinuous.js`, C-scan `lidar_standoff_mm`, SAR standoff correction,
+`capture_bgmodel.py`, and `pi/rover/yaw_control.py` (via `rover_server`). So moving the
+primary moved all of them; no consumer names a port. `TFLC02.__init__` and
+`lidar_noise_char.py --port` default to `/dev/ttyAMA2` to match. **If the forward head's
+mounting changed with the re-wire, re-measure `lidar_antenna_offset_mm` and treat BG models
+and Super Fit references captured on the old head as suspect.**
+
+**The Pi must run this repo's `stream.py`.** As of this entry the Pi's copy still has UART3
+first. The panel shows the Pi's `lidar_primary` and warns when it differs from the forward
+UART selected in Wiring.
+
+The packet is `lidars: {uart1, uart2, uart3}`, each `{port, mm, seq, ts, err, last_good_mm,
+last_good_age_s}`, plus `lidar_primary`. `readHandheldLidars` also accepts role keys with a
+`port` (an intermediate repo version) and the legacy single-head packet.
+
+### Position
+
+Frame X right, Y UP, Z forward (up positive is the operator's choice). Position = distance at
+origin - distance now for X and Z, and the reverse for Y (`sign: -1` in `HANDHELD_AXES`),
+because the down-facing head's distance grows going up. Origin is
+groundstation-only, per axis (`localStorage.handheld_origin_v2`). "Set origin here" accepts
+readings up to `ORIGIN_MAX_AGE_S` 0.25 s old; an axis without one keeps its previous origin.
+Wiring selectors (`DEFAULT_ASSIGNMENT`, `localStorage.handheld_lidar_assignment_v2`) clear the
+origin when changed. The v2 keys exist because v1 shipped a guessed default with forward and
+down swapped. Failed reads carry the last good value for `HANDHELD_CARRY_S` 1 s (amber).
+
+### Update rate and averaging (measured 2026-09-15, 60 s, module still)
+
+| head | new values/s | median interval | noise, no averaging |
+|---|---|---|---|
+| forward uart2 (~250 mm) | 10.9 | 58 ms | 0.7-0.9 mm |
+| down uart1 (~27 mm) | 12.8 | 58 ms | 0.9-1.0 mm |
+| right uart3 | 1.3 valid, 92% of packets null | | out of range: aim at something within reach |
+
+Intervals reach 175-260 ms because `seq` only advances when the value changes (or after the
+0.25 s republish), so "values/s" undercounts a still target. Time-window mean over the 50 Hz
+packets (`createLidarHistory`, groundstation-side), same data:
+
+| window | 0 | 100 ms | 250 ms | 500 ms | 1000 ms |
+|---|---|---|---|---|---|
+| noise | 0.7-1.0 mm | 0.5-0.75 | ~0.5 | 0.35-0.45 | ~0.3 |
+| frame-to-frame p95 | 1-2 mm | 0.4-0.6 | ~0.2 | ~0.1 | ~0.05 |
+| lag | 0 | 50 ms | 125 ms | 250 ms | 500 ms |
+
+**The TF-LC02 cannot be made to measure faster (checked 2026-09-15, operator wanted >= 30 Hz).**
+Its product manual (BP-UM-TF-LC02 V1.1) gives "data acquisition time 33ms" (~30 Hz nominal),
+but the UART protocol has only six commands: 0x81 get distance, 0x82 crosstalk correction,
+0x83 offset correction, 0x84 reset, 0x85 get factory settings, 0x86 get product info. None
+sets a frame rate, integration time or continuous output. **Never send 0x82 or 0x83**: they
+run the factory calibration and store the result, needing a dark box and a target. The
+11-17 Hz measured here is below the nominal 30 Hz, and polling faster does not help (584 Hz
+polling still gives 17 Hz; see the LiDAR sections above). Operator accepted "as fast as it
+goes". Getting >= 30 Hz means a different sensor or IMU fusion. The stream still publishes
+at 50 Hz, so the display updates at 50 Hz between measurements.
+
+**Default 100 ms** (operator's choice; `DEFAULT_AVERAGE_MS`, selectable Off/100/250/500/1000,
+persisted to `localStorage.handheld_average_ms_v2`, v2 so the old 250 ms default does not
+stick). 250 ms would remove nearly all visible flicker for ~125 ms of lag.
+Past ~500 ms noise barely falls. Averaging applies to the displayed distances, the position
+and the origin; `rawMm` keeps the unaveraged reading. It does NOT touch the standoff that
+SFCW/C-scan/rover use.
+
+### Not handled yet
+
+A beam crossing a surface edge (reads as a step, not motion), and range: the right head saw
+nothing in range on the bench. **Rotation IS handled as of 2026-09-15** -- see the next
+section; this entry used to list it.
+
+## Handheld Scan panel — C-scan for the hand-carried head (2026-09-15)
+
+Panel `handheldscan`, separate from `handheld` (which stays the raw position/IMU debug view).
+`handheldPose.pos` (X right, Y up, mm from a declared origin, tilt-corrected) tells you which
+cell the head is over, so the panel is thin and the interesting rules are few:
+
+- `lib/handheldScan.js` is PURE: `cellForPosition`, `filledCells`, `nextEmptyCell` (snake,
+  matches cscanGrid's `cellForIndex`), `scanProgress` (ignores cells orphaned by a grid edit),
+  `captureReadiness` (origin → position → in-grid → empty → tilt ≤ 12° → centred),
+  `positionSpread`. All exercised by a node walkthrough of seven use cases (normal capture,
+  walk-off, LiDAR dropout, tilt, recapture, grid shrink, boundary).
+- Capture reuses App.jsx's sweep handler and `buildCellRecord`/`coherentMean`. A parallel
+  `hhCaptureRef` branch tags the sweep-after-next (`skip:1`), fills an N-look budget, then
+  writes into `hhScanData` REPLACING any record at that cell. `hhCaptureRef` is in the display
+  throttle guard so it sees every sweep. **On every sweep it re-reads `hhPoseRef` and aborts
+  if the head left the cell or the position dropped** — that ref exists because the handler is
+  a stable callback and cannot see React state.
+- `hhScanData` is separate from `bscanData` ON PURPOSE.
+- Params carry `gateStart/gateEnd/metric/focusEnabled` like bscanParams. (`computeCellValues`
+  tolerates their absence by falling back to the whole profile — so this is for an editable
+  gate, not to avoid a crash. Focus stays off: it needs a row at a known pitch.)
+- Transport: Start (sweep + arm), Pause (disarm, sweep stays), Stop (sweep off, cancel any
+  capture). A `useEffect` on `sfcwRunning` cancels an in-flight capture if the sweep dies for
+  any reason, so "Capturing…" can never stick.
+- Auto-capture dwell is a `setTimeout` keyed on `armed` + the ready cell key; `onCaptureAt`
+  and the ready cell are read through refs so the timer never fires a stale cell.
+- Beep: Web Audio, lazy `AudioContext` (created on first tone, after the click that started
+  the sweep, so autoplay policy is satisfied). Guarded by a ref so the sweep handler does not
+  need the state in its deps.
+- Record extras: `hh_x_mm`, `hh_y_mm`, `hh_xy_std_mm`, `hh_tilt_deg`; looks carry `hh_x/y_mm`.
+
+Files: `components/HandheldScanPanel.jsx`, `components/HandheldScanDisplay.jsx` (grid and
+shared scale memoised — the pose updates at 50 Hz and neither depends on it),
+`lib/handheldScan.js`. App.jsx state `hhScanData/hhScanParams/hhAvgCount/hhAutoCapture/
+hhScanCapturing/hhCaptureProgress/hhBeep/hhLastEvent`, refs `hhCaptureRef/hhPoseRef/
+hhScanParamsRef/hhBeepRef/hhAudioRef`, handlers `requestHhCapture/handleHhStart/Pause/Stop/
+handleHhRecapture/removeHhCell/cancelHhCapture/handleHhSetOrigin/handleHhClear/Export/Import`.
+
+**Not built-verified.** The session that wrote this had no network, so `npm run build` was not
+run; prop contracts, imports, bracket balance and the pure logic were checked offline. First
+thing to do on a machine with the toolchain is build it.
+
+Not done: background subtraction in this panel's display; projector; detection overlay.
+
+## Handheld tilt compensation, and the IMU->LiDAR mount calibration (2026-09-15)
+
+`lib/handheldTilt.js` (pure), wired through `handheldPose.js`, with Tilt and Mount
+calibration sections in the Handheld panel and a tilt column in the LiDAR readout.
+Groundstation-only: the Pi streams distances and the BNO085 quaternion and knows nothing
+about any of this, the same rule background subtraction follows.
+
+### The problem, and why it dominates
+
+`pos = origin distance - distance now` is exact only while the module does not ROTATE. A
+beam meeting its surface at theta off the normal measures `h/cos(theta)`, so on an 800 mm
+reading a hand tilt costs **3.1 mm at 5 deg, 12.3 at 10, 28.2 at 15, 51.3 at 20 and 82.7 at
+25** -- against the 0.5-1.0 mm of sensor noise the averaging window was tuned against. It is
+systematic, not noise, and hand-held rotation is easily +-15 deg.
+
+### The model
+
+Everything is referenced to the pose the ORIGIN was declared in, which is what makes the
+room's own frame drop out of the arithmetic entirely:
+
+    Qr  = q0* (x) q          rotation since the origin, in the body-at-origin frame
+    g_k = mu_k . (Qr v_k)    cosine of the incidence angle
+    h_k = d_k * g_k          perpendicular distance -- EXACT, not a small-angle form
+    pos_k = sign_k * [ (h0_k - h_k) - mu_k . (Qr p_k - p_k) ]
+
+`v_k` is where LiDAR k points in the IMU's own sensor frame (the mount), `mu_k` the surface
+normal in the body-at-origin frame, `p_k` an optional lever arm. With Qr = I this collapses
+to `sign * (d0 - d)`, so it is a strict drop-in and an axis missing an orientation falls back
+to exactly the old number.
+
+Measured, origin set square then rolled and moved straight up 100 mm over a 1000 mm floor:
+**100.00 mm at every roll from 0 to 30 deg**, where uncorrected reads 117.0 at 10 deg and
+270.2 at 30. It also removes the phantom CROSS-AXIS motion, which is the less obvious win --
+roll tilts the right-facing beam too, and uncorrected that invents 108 mm of X travel at
+30 deg that never happened.
+
+The correction is applied **per SAMPLE, then averaged**, not to the averaged range: the
+window is up to 1 s and the correction depends on the attitude each sample was taken at.
+Correcting the mean with the latest attitude puts a whole window of hand rotation onto one
+reading (~5 mm at 30 deg/s and a 100 ms window). The per-LiDAR history therefore stamps the
+quaternion onto every sample. Verified: a stationary module rotated to 20 deg across a
+400 ms window reports **0.00 mm of apparent motion**.
+
+### THE ONE APPROXIMATION: mu = v, and exactly what it costs
+
+`mu_k` is where the surface normal sits relative to the module AT THE ORIGIN, so it is not a
+property of the hardware and no mount calibration can supply it. This version assumes the
+operator held the module square when declaring the origin. With an origin misalignment alpha
+and a later tilt theta the residual is `tan(alpha)*tan(theta)` against `1/cos(theta)-1` for
+no correction, so:
+
+**THE CORRECTION HELPS ONLY IF THE ORIGIN POSE IS SQUARE TO BETTER THAN ROUGHLY HALF THE
+TILT YOU THEN APPLY.** Each reading is at a MINIMUM when its beam is perpendicular, so aim by
+minimising; the panel's per-axis live tilt readout is there for this. Measured: an origin set
+with 5 deg of roll, then rolled to 10 deg, reads 117.7 mm for a true 100 mm -- still better
+than the 135.0 uncorrected, but not exact. **The residual scales with the STANDOFF, not with
+how far you moved** (~15 mm on a 1 m floor distance whether the move was 10 mm or 300).
+
+The proper fix is to fit `mu` at origin time from a deliberate 2 s wobble -- the same linear
+half of the solve below, with `v` known. The machinery is there, the UX is not; next step.
+
+### The mount calibration: alternating least squares, not a minimum search
+
+Hold the module in ONE SPOT and tumble it. The perpendicular distance H is then constant
+while the measured range is not, so
+
+    1/d_t = (1/H) * mu . (Qr_t v)  =  a . (Qr_t v)
+
+which is BILINEAR in two unknown directions. Alternating least squares splits it into two
+3-parameter linear solves, each well conditioned where the joint 9-parameter form
+(`1/d = <Qr, a v^T>`, linear in 9 unknowns) is not -- the samples sit near the identity
+rotation, so `vec(Qr)` explores barely four of its nine dimensions. The 9-parameter fit is
+still run, rank-1 factorised and used as a SECOND starting point, and whichever converges
+lower wins: the nominal mount comes from `imu_calibration.py`'s `R_ACCEL` remap, whose
+forward/left rows that file itself records as inferred rather than measured, so it must not
+be the only way in. **A by-product is that this calibration MEASURES those rows.**
+
+Simulated module (true mount 6.5 deg off nominal, 1 mm quantisation, 300 samples), fitted
+direction error vs how the operator moved:
+
+| rotation | translation 0 mm | 3 mm | 10 mm |
+|---|---|---|---|
+| ~11 deg, two axes | 0.2-0.5 deg | 0.1-1.6 | 1.5-4.6 |
+| ~21 deg, two axes | 0.02-0.05 | 0.06-0.34 | 0.4-1.0 |
+| ~35 deg, two axes | 0.02 | 0.05-0.12 | 0.1-0.2 |
+| any, ONE axis | **3-94 deg** | **3-92** | **73-95** |
+
+**Rotating about a single axis is not merely imprecise, it is a genuine gauge freedom** --
+both unknown directions can be spun about that axis with no change in the prediction -- which
+is why it produces confident answers up to 95 deg wrong. It is gated on `rotationCoverage()`,
+which measures the ROTATIONS (as rotation vectors, eigen-decomposed) and not the fitted beam
+directions. An earlier version measured the beam spread and was circular: a badly wrong `v`
+traces a wide cone and scores well, reading 6 deg of "coverage" on a run whose answer was
+21 deg out. **Measure the input, not the output.** With the rotation-vector metric the
+separation is total -- every degenerate case reads 0.0 deg of second axis, every good one
+6.8-29.6.
+
+Gates, all from that table: `CAL_MIN_ROT_DEG = 18`, `CAL_MIN_SECOND_AXIS_DEG = 4`,
+`CAL_MIN_SAMPLES = 120`, `CAL_MAX_RMS_MM = 6`, `CAL_MAX_MOUNT_DEG = 35`. The panel shows the
+same gates LIVE while the operator is still moving, and the result is SHOWN rather than
+applied -- `acceptedMount()` then stores only the axes that passed, so a rejected axis falls
+back to the nominal mount rather than keeping a fit that failed its own checks. An
+independent end-of-run check is that the three fitted beams should be mutually perpendicular
+(they are mounted square and nothing in the fit knows that): 0.19 deg on a good simulated run.
+
+### Why the correction runs UNCALIBRATED by default
+
+Worst-case position error on an 800 mm standoff, swept over every direction of mount error
+and of tilt:
+
+| mount error | 5 deg tilt | 10 | 15 | 20 | 25 |
+|---|---|---|---|---|---|
+| 0.5 deg | 0.0 mm | 0.0 | 0.0 | 0.0 | 0.0 |
+| 2 deg | 0.0 | 0.0 | 0.0 | 0.1 | 0.1 |
+| 5 deg | 0.0 | 0.1 | 0.2 | 0.4 | 0.6 |
+| 8 deg | 0.1 | 0.2 | 0.5 | 1.0 | 1.6 |
+| **NO CORRECTION** | **3.1** | **12.3** | **28.2** | **51.3** | **82.7** |
+
+The mount enters only to SECOND order -- `g = v.(Qr v)` tilts the assumed normal and the
+assumed beam together, so getting `v` wrong mostly cancels. So tilt compensation is ON by
+default with the nominal mount and calibration is a refinement, not a precondition. What
+calibration is really for is the lever-arm term (first order in `mu`), verifying `R_ACCEL`,
+and any future `mu`-at-origin fit.
+
+### Yaw drift costs very little, and the magnetometer must stay OFF
+
+The quaternion is `bno085.py`'s game rotation vector (report `0x08`, accel+gyro only), so
+roll and pitch are gravity-referenced and drift-free while yaw free-runs at ~1-2 deg/minute.
+Measured with the module physically still and only the reported heading drifting:
+
+| drift | X err | Y err | Z err |
+|---|---|---|---|
+| 1 deg | 0.11 mm | **0.000** | 0.08 mm |
+| 2 deg | 0.43 | **0.000** | 0.31 |
+| 5 deg | 2.66 | **0.000** | 1.90 |
+| 10 deg | 10.6 | **0.000** | 7.60 |
+
+**Y/height is EXACTLY immune** -- yaw is rotation about the down beam's own axis, and
+spinning a LiDAR about its own beam cannot change its range to a perpendicular surface. X and
+Z cost `standoff * psi^2/2`, second order, and do NOT scale with travel: the axes are pinned
+to the surface normals captured at the origin, so drift corrupts the cosine and not the axis
+definition (200 mm of forward travel under 2 deg of drift puts 0.43 mm into X, the same as
+standing still). At the real drift rate that is 0.1-0.4 mm over a session, under the sensor's
+own noise floor.
+
+**Do not "fix" this with the magnetometer.** The mag-fused rotation vector (`0x05`) is one
+constant away, and `bno085.py`'s comment gives the rover's reason for avoiding it (four
+stepper motors). The handheld has a better one: this instrument images REBAR, so a
+magnetometer aimed at reinforced concrete is pulled by exactly the thing being looked for and
+the heading error would correlate with the target. Conduit, steel studs and wiring make
+indoor heading untrustworthy generally. The payoff would be a few tenths of a millimetre.
+
+### Details that are load-bearing
+
+- **The origin stores a quaternion PER AXIS**, not one for the whole origin. "Set origin"
+  refreshes only the axes with a fresh reading and leaves the others on a reference taken in
+  an earlier pose; one shared quaternion would be wrong for those. `localStorage` key bumped
+  to `handheld_origin_v3` -- a v2 origin carries no attitude, and reusing it would reference
+  the correction to whatever pose the module happens to be in at page load.
+- **The origin stores the RAW reading, not the corrected one.** The origin is what the
+  correction is measured FROM, so at the origin attitude it is the identity by construction;
+  storing a corrected value double-counts the operator's pose.
+- **A beam past 90 deg from its surface is REFUSED, not extrapolated** (`cos > 0.05`). That
+  axis reports `grazing` and falls back rather than returning an explosive or negative
+  perpendicular distance.
+- **`corrected` is reported per axis and means what was DONE, not what was asked for** --
+  false whenever any link in the chain (no IMU quaternion, no origin attitude, grazing, tilt
+  switched off) made it fall back. The viewport says "tilt corrected" / "no tilt corr" from
+  that, never from the toggle.
+- **Rotating a LiDAR about its OWN beam axis changes nothing**, which the geometry reproduces
+  exactly and is a free sanity check: a 20 deg rotation about the forward beam's axis moves X
+  by -18.4 mm, Y by -29.0 mm and Z by 0.000 mm.
+- **Lever arms are implemented and tested but not exposed.** They are each LiDAR emitter's
+  offset from whatever point you want the reported position to refer to (the antenna
+  aperture, say) -- without them each axis reports ITS OWN emitter's position, which only
+  diverges once you rotate. Measured: a down head 50 mm to the side reads 8.7 mm low at
+  10 deg of roll (`r*sin(roll)`), and the term is exact when supplied. No UI, because it is
+  9 numbers and beyond what was asked for.
+- The calibration sample buffer is capped at `CAL_MAX_SAMPLES = 6000` per axis (2 min at
+  50 Hz); a run has no natural length and the panel can be walked away from.
+- `lidarsByUart()` is exported from `handheldPose.js` and shared with App's calibration feed
+  rather than copied -- the drift hazard this file already records for CFAR, the SAFT kernel
+  and the TF-LC02 parsers.
+
+### Verification
+
+`handheldTilt.js` and `handheldPose.js` are pure and were exercised head-first from node
+(73 checks across three scripts: quaternion algebra; mount recovery to 0.05-0.19 deg against
+a known truth with realistic noise; the degenerate single-axis run refused on all three axes;
+the correction exact to 4e-13 mm over 5-20 deg of tilt where uncorrected is 101 mm out; the
+lever-arm term exact; the `tan(alpha)tan(theta)` residual matching the derivation; per-sample
+averaging holding a rotating-but-stationary module to 0.00 mm; grazing refusal; the partial
+origin keeping each axis's own reference attitude; `acceptedMount` dropping failed axes and
+falling back to nominal; the sample cap; and malformed stored state). The roll-then-lift and
+yaw-drift tables above came from driving the SHIPPED `computeHandheldPosition` against a
+simulated module, not from the formulas.
+
+The panel and all three viewport readouts were then SERVER-RENDERED through Vite's own
+transform in 14 states -- uncalibrated, calibrated, tilt off, calibration running with and
+without coverage, result shown, no origin, no IMU orientation, a legacy Pi with no `lidars`,
+and disconnected -- which is the check that catches a field that does not exist, the class of
+bug that silently blanked the C-scan plan view. There is still no test runner in this repo,
+so these were throwaway scripts. `vite build` passes.
+
+**NOT run on hardware, and there is no browser on this Pi so the panel was never driven
+live.** What to check on the bench, in order: (1) the Tilt readouts move sensibly when the
+module is tilted by hand and read ~0 when held in the origin pose; (2) a calibration run
+passes its gates with a real tumble and the three fitted beams come out near-perpendicular --
+if `orthoDeg` is large the run was bad even where the per-axis checks passed; (3) the fitted
+mount agrees with `imu_calibration.py`'s `R_ACCEL`, which would be the first real measurement
+of its forward/left rows; (4) whether the position genuinely holds still under deliberate
+tilt, which is the whole point.
+
+## C-scan projection source: SAR detections (2026-09-15)
+
+The C-scan panel's Projection section has a **Grid | SAR detections** switch
+(`cscanProjection.source`, persisted to `localStorage.cscan_projection_source`). It drives
+BOTH the monitor plan view and the projector window, so the to-scale px/cm and Left/Top
+calibration is shared -- the rig is calibrated once whatever is projected.
+
+**SAR detections draws:** captured cells as flat dark grey (`SCANNED_FILL`), uncaptured
+cells exactly as the grid view does, and each **confirmed** pipe as a white band. No
+colormap, no colour bar, no depth. Probable targets and seepage patches are deliberately
+NOT drawn yet (operator's choice); a SAR panel in Seepage mode draws nothing and says so.
+
+`lib/detectionOverlay.js` `confirmedPipeOverlay()` (pure) is the whole mapping:
+
+- **Rating = `effectiveRating(t, sarHandleEnds)`**, the same one the SAR panel shows, so a
+  confirmed target inside the end zones is hidden while Handle ends is on (counted as
+  "at the scan ends not shown").
+- **No prediction.** A band is drawn only for rows the detection used (`rowIys`), and in
+  each only if the grid cell under the line was captured.
+- **Half-cell offset.** Detection x = `grid_ix * hStep` is an antenna position, the CENTRE
+  of plan-view cell ix, which spans `[ix, ix+1]`; `cellUnitsX` adds the half cell (and the
+  draw uses the row's own cell edges vertically). Without it every pipe lands half a cell
+  left and low.
+- **A drift under `TILT_MIN_CHANGE_CM` (3.2 cm) is drawn vertical**, same rule as the 3D
+  view. 4pipes' straight 58.5 cm pipe fits slope 0.2 (1 cm drift) and would otherwise be
+  projected leaning.
+- Band width = measured -6 dB width, floored at one column. A result whose pitch differs
+  from the grid's is not drawn (it is replaced by the re-run the change triggers).
+
+**It updates per ROW, not per cell.** Detection is whole-scan, debounced 800 ms, and the
+live raster flushes every 250 ms, so it runs at row changes and at the end (~1 s for 6 rows,
+~4 s for 30). The scanned-cell fill still grows live; the title and panel show
+`rows k/N` so a stale result is visible. Early rows rate weakly and pipes can appear or
+vanish as rows are added.
+
+**Without an empty reference the gw2 crevice rates confirmed**, so the panel warns in amber
+when none is loaded -- projected on the wall it is a confident false pipe.
+
+Verified head-first through the shipped `runDetection` on `4pipes.json` + `1pipe.json`
+reference (Node, lib copied with `.js` imports, scratchpad `overlay_test`): 3 confirmed at
+18.5 / 33 / 58.5, every band centre in the column of its antenna position, 17 bands (one of
+18 pipe-rows sits on an uncaptured cell and is correctly skipped), uncaptured rows skipped,
+seepage and pitch mismatch draw nothing, end-zone hiding follows the toggle, slanted row
+segments meet at the shared edge. 15 checks.
+
+Then the BUILT app in headless Chrome over CDP (scratchpad `ui_proj/drive.mjs`: C-Scan
+Import of 4pipes, SAR panel Load empty reference with 1pipe, Source = SAR detections, then
+To scale + Open projector view). A script `.click()` has no user activation, so Chrome opens
+no file chooser; the script parks the app's on-the-fly `input[type=file]` in the DOM and
+sets the file with `DOM.setFileInputFiles` on that node. Panel read "3 confirmed pipes ·
+rows 6 of 6", no console errors. **Projector at the default 8 px/cm @ 60,80: band centres
+exactly 210 / 326 / 530 px, widths 28 / 20 / 20 px** (= 60 + (x + hStep/2) * 8 for 18.5 / 33
+/ 58.5 cm), the 58.5 cm band absent on one 8 px row (the uncaptured cell). Monitor plan
+view (fitted): the three band centres lie on one line at 16.5 px/cm. Switching back to Grid
+restores colour-mapped cells and no white on both. Not yet run on the dev server or
+against a live raster.
+
+### Probable pipes toggle (2026-09-15)
+
+Under the Grid | SAR detections switch (shown only with SAR detections selected) a **Show
+probable pipes** toggle (`cscanProjection.showProbable`, persisted to
+`localStorage.cscan_projection_probable`, default off) adds the SAR panel's PROBABLE pipes as
+**amber** bands (`#fbbf24`, the SAR panel's probable colour) beside the white confirmed ones.
+`detectionOverlay.js` is now `pipeOverlay(detection, params, handleEnds, capturedAt,
+{ includeProbable })`; every segment carries `rating`, and `probable` is counted whether or
+not it is drawn. Probable bands are drawn FIRST so a confirmed band is never painted over.
+Same rules as confirmed: `effectiveRating` (end-zone probables hidden with Handle ends; the
+detector already rated sidelobe probables 'none'), no prediction, sub-resolution drift drawn
+vertical. The title and panel status add "· N probable" while it is on.
+
+Verified: Node (19 checks, incl. probable counted-not-drawn by default, drawn on every row
+when included, end-zone probable hidden, confirmed bands unchanged). Built app in headless
+Chrome on `2rods1pipe.json` with NO reference (confirmed 20.0 / 54.0, probable 12.0 / 35.5):
+projector at 8 px/cm @ 60,80 draws **amber at exactly 158 and 346 px (20 px wide)** and white
+at 222 (16 px) and 494 (24 px), the 35.5 cm band absent on one row; toggling off removes every
+amber pixel and leaves the white unchanged; localStorage follows the toggle; no console errors.
+Note 2rods1pipe has no reference, so its probables include the known 35.5 cm crevice.

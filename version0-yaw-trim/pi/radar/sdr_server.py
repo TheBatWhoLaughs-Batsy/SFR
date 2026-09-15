@@ -11,6 +11,7 @@ import websockets
 
 from bladerf_driver import BladeRFDriver
 from sfcw_engine import SFCWEngine
+from sfcw_wire import encode_sfcw_binary
 
 SCALE = 2047
 PORT = 9003
@@ -24,6 +25,9 @@ class SDRServer:
         self.driver = BladeRFDriver()
         self.sfcw = SFCWEngine(self.driver)
         self.clients = set()
+        # Clients that asked for sfcw_result as binary frames (cmd 'sfcw_binary',
+        # see sfcw_wire.py). Always a subset of self.clients; everyone else gets JSON.
+        self._binary_clients = set()
         self.rx_queue = asyncio.Queue(maxsize=4)
         self.sfcw_queue = asyncio.Queue(maxsize=8)
         self._broadcast_task = None
@@ -117,6 +121,7 @@ class SDRServer:
             pass
         finally:
             self.clients.discard(ws)
+            self._binary_clients.discard(ws)
 
     async def _dispatch(self, ws, cmd):
         action = cmd.get('cmd')
@@ -177,6 +182,10 @@ class SDRServer:
                     params['stop_freq'] = float(cmd['stop_freq_mhz']) * 1e6
                 if 'step_size_mhz' in cmd:
                     params['step_size'] = float(cmd['step_size_mhz']) * 1e6
+                if 'num_steps' in cmd:
+                    # fifo-256: a step count; the engine picks the nearest
+                    # legal step size for the current start/stop.
+                    params['num_steps'] = int(cmd['num_steps'])
                 if 'num_buffers' in cmd:
                     params['num_buffers'] = int(cmd['num_buffers'])
                 if 'settle_count' in cmd:
@@ -205,6 +214,13 @@ class SDRServer:
                     params['nios_settle'] = int(cmd['nios_settle'])
                 if 'nios_pipeline' in cmd:
                     params['nios_pipeline'] = bool(cmd['nios_pipeline'])
+                # v12 DSP chain counts (table indices 0-7)
+                if 'dsp_flush_sel' in cmd:
+                    params['dsp_flush_sel'] = int(cmd['dsp_flush_sel'])
+                if 'dsp_accum_sel' in cmd:
+                    params['dsp_accum_sel'] = int(cmd['dsp_accum_sel'])
+                if 'dsp_dwell' in cmd:
+                    params['dsp_dwell'] = int(cmd['dsp_dwell'])
                 self.sfcw.set_params(**params)
                 await self._broadcast_sfcw_status()
 
@@ -227,11 +243,25 @@ class SDRServer:
                 if self.sfcw.running:
                     await ws.send(json.dumps({'type': 'error', 'message': 'Stop sweep before running coherence test'}))
                 else:
-                    self.sfcw.run_coherence_test(self._sfcw_callback)
+                    # Optional 'num_sweeps' (default SfcwEngine.COHERENCE_SWEEPS = 100).
+                    n = cmd.get('num_sweeps')
+                    self.sfcw.run_coherence_test(self._sfcw_callback,
+                                                 num_sweeps=int(n) if n else None)
                     await self._broadcast_sfcw_status()
 
             elif action == 'sfcw_get_status':
                 await ws.send(json.dumps({'type': 'sfcw_status', **self._get_sfcw_status()}))
+
+            elif action == 'sfcw_binary':
+                # Per connection. Only sfcw_result changes format; every other message
+                # stays JSON. A client that never sends this keeps getting JSON, which is
+                # what the Python tools rely on.
+                enabled = bool(cmd.get('enabled', True))
+                if enabled:
+                    self._binary_clients.add(ws)
+                else:
+                    self._binary_clients.discard(ws)
+                await ws.send(json.dumps({'type': 'sfcw_binary_ack', 'enabled': enabled}))
 
             elif action == 'sweep_capture':
                 if self.sfcw.running and not self.sfcw._warm:
@@ -409,6 +439,7 @@ class SDRServer:
                 self._heartbeat()
                 continue
 
+            h_cal_full = None
             try:
                 if isinstance(data, dict) and 'error' in data:
                     msg = json.dumps({'type': 'sfcw_error', 'message': data['error']})
@@ -417,42 +448,17 @@ class SDRServer:
                 elif isinstance(data, dict) and data.get('type') == 'progress':
                     msg = json.dumps({'type': 'sfcw_progress', 'step': data['step'], 'total': data['total'], 'freq_mhz': round(data['freq_mhz'], 2)})
                 elif isinstance(data, dict) and data.get('type') == 'range_profile':
-                    result_msg = {
-                        'type': 'sfcw_result',
-                        # np.round(...).tolist(), NOT [round(x, n) for x in ...].
-                        # Byte-identical output, 2.778 -> 0.023 ms/sweep (122x). The
-                        # comprehensions were pure Python over ~512 elements and so held
-                        # the GIL for ~2.8 ms in one block -- about 7 RX buffer periods --
-                        # stalling _rx_loop_dual exactly while the next sweep was stepping.
-                        # That backlog is what corrupted a step: the sweep then drained
-                        # pre-retune buffers holding the PREVIOUS frequency's IQ. Measured
-                        # 2026-09-05: settle=1 is 0/299 sweeps contention-free but 18/399
-                        # through the server, so this cost ~42 ms of sweep time in the
-                        # settle margin needed to survive it. Keep this vectorised.
-                        'distances': np.round(data['distances'], 4).tolist(),
-                        'magnitudes': np.round(data['magnitudes'], 2).tolist(),
-                        'h_cal_real': data.get('h_cal_real', []),
-                        'h_cal_imag': data.get('h_cal_imag', []),
-                        'range_resolution': round(data['range_resolution'], 4),
-                        'unambiguous_range': round(data['unambiguous_range'], 4),
-                        'displayed_range_max': round(data['displayed_range_max'], 4),
-                        'num_steps': data['num_steps'],
-                        'step_size': data.get('step_size', 0),
-                        'range_offset': data.get('range_offset', 0),
-                        'timestamp': data['timestamp'],
-                    }
-                    if 'phase_coherence' in data:
-                        result_msg['phase_coherence'] = data['phase_coherence']
-                    if 'sweep_core' in data:
-                        result_msg['sweep_core'] = data['sweep_core']
-                    if 'nios_diag' in data:
-                        result_msg['nios_diag'] = data['nios_diag']
-                    msg = json.dumps(result_msg)
+                    # A dict, not text: each client gets it in the format it asked for.
+                    msg = self._sfcw_result_msg(data)
+                    h_cal_full = data.get('h_cal_full')
                 else:
                     self._heartbeat()
                     continue
 
-                await self._send_to_all(msg)
+                if isinstance(msg, dict):
+                    await self._send_sfcw_result(msg, h_cal_full)
+                else:
+                    await self._send_to_all(msg)
                 self._sfcw_broadcast_count += 1
 
                 if not self.sfcw.running:
@@ -464,9 +470,68 @@ class SDRServer:
 
             self._heartbeat()
 
-    async def _send_to_all(self, msg, timeout=0.5):
-        """Send to all clients CONCURRENTLY. Drop dead/slow ones."""
+    @staticmethod
+    def _sfcw_result_msg(data):
+        """The sfcw_result dict for one range_profile, exactly as JSON clients get it."""
+        result_msg = {
+            'type': 'sfcw_result',
+            # np.round(...).tolist(), NOT [round(x, n) for x in ...].
+            # Byte-identical output, 2.778 -> 0.023 ms/sweep (122x). The
+            # comprehensions were pure Python over ~512 elements and so held
+            # the GIL for ~2.8 ms in one block -- about 7 RX buffer periods --
+            # stalling _rx_loop_dual exactly while the next sweep was stepping.
+            # That backlog is what corrupted a step: the sweep then drained
+            # pre-retune buffers holding the PREVIOUS frequency's IQ. Measured
+            # 2026-09-05: settle=1 is 0/299 sweeps contention-free but 18/399
+            # through the server, so this cost ~42 ms of sweep time in the
+            # settle margin needed to survive it. Keep this vectorised.
+            'distances': np.round(data['distances'], 4).tolist(),
+            'magnitudes': np.round(data['magnitudes'], 2).tolist(),
+            'h_cal_real': data.get('h_cal_real', []),
+            'h_cal_imag': data.get('h_cal_imag', []),
+            'range_resolution': round(data['range_resolution'], 4),
+            'unambiguous_range': round(data['unambiguous_range'], 4),
+            'displayed_range_max': round(data['displayed_range_max'], 4),
+            'num_steps': data['num_steps'],
+            'step_size': data.get('step_size', 0),
+            'range_offset': data.get('range_offset', 0),
+            'timestamp': data['timestamp'],
+        }
+        if 'phase_coherence' in data:
+            result_msg['phase_coherence'] = data['phase_coherence']
+        if 'sweep_core' in data:
+            result_msg['sweep_core'] = data['sweep_core']
+        if 'nios_diag' in data:
+            result_msg['nios_diag'] = data['nios_diag']
+        return result_msg
+
+    async def _send_sfcw_result(self, result_msg, h_cal_full=None):
+        """JSON to ordinary clients, one binary frame to clients that opted in.
+
+        Each encoding is built only if some client needs it, so with just the
+        groundstation connected (binary) the Pi skips json.dumps of the full message.
+        h_cal_full is the engine's unrounded sweep; the binary frame carries it so
+        the groundstation can rebuild the Pi's range profile exactly.
+        """
         clients = set(self.clients)
+        binary = clients & self._binary_clients
+        text = clients - binary
+        frame = encode_sfcw_binary(result_msg, h_cal_full) if binary else None
+        if frame is None:
+            # No usable h_cal to pack: those clients get the JSON instead.
+            text |= binary
+            binary = set()
+        sends = []
+        if text:
+            sends.append(self._send_to_all(json.dumps(result_msg), clients=text))
+        if binary:
+            sends.append(self._send_to_all(frame, clients=binary))
+        if sends:
+            await asyncio.gather(*sends)
+
+    async def _send_to_all(self, msg, timeout=0.5, clients=None):
+        """Send to all clients (or the given subset) CONCURRENTLY. Drop dead/slow ones."""
+        clients = set(self.clients if clients is None else clients)
         if not clients:
             return
         async def _try(c):
@@ -479,6 +544,7 @@ class SDRServer:
         dead = {c for c in results if c is not None}
         if dead:
             self.clients -= dead
+            self._binary_clients -= dead
 
     async def _broadcast_sfcw_status(self):
         msg = json.dumps({'type': 'sfcw_status', **self._get_sfcw_status()})

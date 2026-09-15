@@ -1,6 +1,7 @@
-import { Activity, Radio, Radar, ScanLine, Grid3x3, Map, ChevronLeft, Wifi, WifiOff, Brain, FlaskConical, Move, Layers } from 'lucide-react';
+import { Radio, Radar, ScanLine, Grid3x3, Map, ChevronLeft, Wifi, WifiOff, Brain, FlaskConical, Move, Locate } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import ImuPanel from './ImuPanel';
+import HandheldPanel from './HandheldPanel';
+import HandheldScanPanel from './HandheldScanPanel';
 import RfCalibPanel from './RfCalibPanel';
 import BgModelPanel from './BgModelPanel';
 import SfcwPanel from './SfcwPanel';
@@ -9,10 +10,10 @@ import CscanPanel from './CscanPanel';
 import SarPanel from './SarPanel';
 import MapPanel from './MapPanel';
 import RoverPanel from './RoverPanel';
-import TomoPanel from './TomoPanel';
 
 const PANELS = [
-  { id: 'imu',       label: 'IMU',       icon: Activity },
+  { id: 'handheld',  label: 'Handheld + IMU', icon: Locate },
+  { id: 'handheldscan', label: 'Handheld Scan', icon: ScanLine },
   { id: 'rfcalib',   label: 'RF Calibrate', icon: Radio },
   { id: 'sfcw',      label: 'SFCW',      icon: Radar },
   { id: 'imaging',   label: 'Imaging Bench', icon: FlaskConical },
@@ -20,7 +21,6 @@ const PANELS = [
   { id: 'cscan',     label: 'C-Scan',    icon: ScanLine },
   { id: 'rover',     label: 'Rover Scan', icon: Move },
   { id: 'sar',       label: 'SAR',       icon: Grid3x3 },
-  { id: 'tomo',      label: 'TomoSAR',  icon: Layers },
   { id: 'map',       label: '2D Map',    icon: Map },
 ];
 
@@ -35,6 +35,21 @@ export default function Sidebar({
   imuRate,
   imuData,
   lidarMm,
+  handheldPose,
+  handheldOrigin,
+  onHandheldOriginChange,
+  handheldAssignment,
+  onHandheldAssignmentChange,
+  handheldAvgMs,
+  onHandheldAvgMsChange,
+  handheldTilt,
+  onHandheldTiltChange,
+  handheldMount,
+  onHandheldMountChange,
+  handheldCal,
+  onHandheldCalStart,
+  onHandheldCalFinish,
+  onHandheldCalCancel,
   sdrConnected,
   roverConnected,
   roverStatus,
@@ -67,6 +82,8 @@ export default function Sidebar({
   sfcwBgStats,
   onResetSfcwBgStats,
   sfcwLidarProvenance,
+  sfcwRangeOffsetMismatch,
+  sfcwEmptySweeps,
   onCaptureSfcwBg,
   onLoadSfcwBgModel,
   onClearSfcwBg,
@@ -111,9 +128,6 @@ export default function Sidebar({
   onCscanSmoothChange,
   cscanColormap,
   onCscanColormapChange,
-  cscanKeepSweeps,
-  onCscanKeepSweepsChange,
-  cscanMemory,
   onCscanProjectionChange,
   cscanProjector,
   onCscanProjectorChange,
@@ -146,6 +160,7 @@ export default function Sidebar({
   onSarMaxDepthChange,
   sarEpsilonR,
   onSarEpsilonRChange,
+  sarEpsilonSuggestion,
   sarWindowType,
   onSarWindowTypeChange,
   sarAutoStandoff,
@@ -160,17 +175,16 @@ export default function Sidebar({
   onSarViewModeChange,
   sarColormap,
   onSarColormapChange,
-  tomoParams,
-  onTomoParamsChange,
-  tomoData,
-  tomoResult,
-  tomoProgress,
-  tomoCapturing,
-  tomoBgRef,
-  tomoBgModel,
-  onTomoAction,
-  onTomoCaptureBg,
-  onTomoClearBg,
+  sarDetection,
+  sarDetectProgress,
+  sarDetectError,
+  sarEmptyRefName,
+  onLoadSarEmptyRef,
+  onClearSarEmptyRef,
+  sarHandleEnds,
+  onSarHandleEndsChange,
+  sarDetectMode,
+  onSarDetectModeChange,
   mapBscanData,
   mapGateStart,
   mapGateEnd,
@@ -226,6 +240,29 @@ export default function Sidebar({
   onImagingEffectChange,
   imagingParams,
   onImagingParamsChange,
+  sdrConnected,
+  sfcwRunning,
+  hhScanData,
+  hhScanParams,
+  onHhScanParamsChange,
+  hhScanCapturing,
+  hhCaptureProgress,
+  hhAvgCount,
+  onHhAvgCountChange,
+  hhAutoCapture,
+  onHhStart,
+  onHhPause,
+  onHhStop,
+  onHhCapture,
+  onHhRecapture,
+  onHhClearCell,
+  onHhSetOrigin,
+  onHhClear,
+  onHhExport,
+  onHhImport,
+  hhBeep,
+  onHhBeepChange,
+  hhLastEvent,
 }) {
   return (
     <div className="flex h-screen shrink-0">
@@ -332,8 +369,59 @@ export default function Sidebar({
               />
 
               {/* Panel-specific content */}
-              {activePanel === 'imu' && (
-                <ImuPanel isConnected={isConnected} imuData={imuData} />
+              {activePanel === 'handheldscan' && (
+                <HandheldScanPanel
+                  isConnected={isConnected}
+                  sdrConnected={sdrConnected}
+                  sfcwRunning={sfcwRunning}
+                  pose={handheldPose}
+                  scanData={hhScanData}
+                  scanCapturing={hhScanCapturing}
+                  captureProgress={hhCaptureProgress}
+                  params={hhScanParams}
+                  onParamsChange={onHhScanParamsChange}
+                  avgCount={hhAvgCount}
+                  onAvgCountChange={onHhAvgCountChange}
+                  autoCapture={hhAutoCapture}
+                  onStart={onHhStart}
+                  onPause={onHhPause}
+                  onStop={onHhStop}
+                  onCapture={onHhCapture}
+                  onCaptureAt={onHhCapture}
+                  onRecapture={onHhRecapture}
+                  onClearCell={onHhClearCell}
+                  onClear={onHhClear}
+                  onExport={onHhExport}
+                  onImport={onHhImport}
+                  origin={handheldOrigin}
+                  onSetOrigin={onHhSetOrigin}
+                  beep={hhBeep}
+                  onBeepChange={onHhBeepChange}
+                  lastEvent={hhLastEvent}
+                  lidarMm={lidarMm}
+                  lidarOffsetMm={lidarOffsetMm}
+                />
+              )}
+              {activePanel === 'handheld' && (
+                <HandheldPanel
+                  isConnected={isConnected}
+                  imuData={imuData}
+                  pose={handheldPose}
+                  origin={handheldOrigin}
+                  onOriginChange={onHandheldOriginChange}
+                  assignment={handheldAssignment}
+                  onAssignmentChange={onHandheldAssignmentChange}
+                  avgMs={handheldAvgMs}
+                  onAvgMsChange={onHandheldAvgMsChange}
+                  tiltEnabled={handheldTilt}
+                  onTiltEnabledChange={onHandheldTiltChange}
+                  mount={handheldMount}
+                  onMountChange={onHandheldMountChange}
+                  cal={handheldCal}
+                  onCalStart={onHandheldCalStart}
+                  onCalFinish={onHandheldCalFinish}
+                  onCalCancel={onHandheldCalCancel}
+                />
               )}
               {activePanel === 'rfcalib' && (
                 <RfCalibPanel
@@ -414,6 +502,8 @@ export default function Sidebar({
                   bgStats={sfcwBgStats}
                   onResetBgStats={onResetSfcwBgStats}
                   lidarProvenance={sfcwLidarProvenance}
+                  rangeOffsetMismatch={sfcwRangeOffsetMismatch}
+                  emptySweeps={sfcwEmptySweeps}
                   lidarOffsetMm={lidarOffsetMm}
                   onLidarOffsetChange={onLidarOffsetChange}
                   onCaptureBg={onCaptureSfcwBg}
@@ -480,13 +570,15 @@ export default function Sidebar({
                   onShowGateChange={onBscanShowGateChange}
                   projection={cscanProjection}
                   onProjectionChange={onCscanProjectionChange}
+                  detection={sarDetection}
+                  detectProgress={sarDetectProgress}
+                  detectMode={sarDetectMode}
+                  emptyRefName={sarEmptyRefName}
+                  handleEnds={sarHandleEnds}
                   smooth={cscanSmooth}
                   onSmoothChange={onCscanSmoothChange}
                   colormap={cscanColormap}
                   onColormapChange={onCscanColormapChange}
-                  keepSweeps={cscanKeepSweeps}
-                  onKeepSweepsChange={onCscanKeepSweepsChange}
-                  memory={cscanMemory}
                   projector={cscanProjector}
                   onProjectorChange={onCscanProjectorChange}
                   lidarMm={lidarMm}
@@ -531,6 +623,7 @@ export default function Sidebar({
                   maxDepth={sarMaxDepth}
                   onMaxDepthChange={onSarMaxDepthChange}
                   epsilonR={sarEpsilonR}
+                  epsilonSuggestion={sarEpsilonSuggestion}
                   onEpsilonRChange={onSarEpsilonRChange}
                   windowType={sarWindowType}
                   onWindowTypeChange={onSarWindowTypeChange}
@@ -545,26 +638,18 @@ export default function Sidebar({
                   viewMode={sarViewMode}
                   onViewModeChange={onSarViewModeChange}
                   colormap={sarColormap}
+                  detection={sarDetection}
+                  detectProgress={sarDetectProgress}
+                  detectError={sarDetectError}
+                  emptyRefName={sarEmptyRefName}
+                  onLoadEmptyRef={onLoadSarEmptyRef}
+                  onClearEmptyRef={onClearSarEmptyRef}
+                  handleEnds={sarHandleEnds}
+                  onHandleEndsChange={onSarHandleEndsChange}
+                  detectMode={sarDetectMode}
+                  onDetectModeChange={onSarDetectModeChange}
                   onColormapChange={onSarColormapChange}
                   onScanAction={onBscanAction}
-                />
-              )}
-              {activePanel === 'tomo' && (
-                <TomoPanel
-                  tomoParams={tomoParams}
-                  onTomoParamsChange={onTomoParamsChange}
-                  tomoData={tomoData}
-                  tomoResult={tomoResult}
-                  tomoProgress={tomoProgress}
-                  sfcwRunning={sfcwRunning}
-                  tomoCapturing={tomoCapturing}
-                  tomoBgRef={tomoBgRef}
-                  tomoBgModel={tomoBgModel}
-                  onTomoAction={onTomoAction}
-                  onTomoCaptureBg={onTomoCaptureBg}
-                  onTomoClearBg={onTomoClearBg}
-                  epsilonR={epsilonR}
-                  onEpsilonRChange={onEpsilonRChange}
                 />
               )}
               {activePanel === 'map' && (
@@ -643,17 +728,11 @@ export function Section({ label, children }) {
   );
 }
 
-// `sub` is an optional second line and `warn` tints the value amber; both
-// default off, so every existing call site renders exactly as before.
-export function InfoTile({ label, value, sub, warn }) {
+export function InfoTile({ label, value }) {
   return (
-    <div className={cn(
-      'flex flex-col gap-1 p-3 rounded-xl bg-[#0a0a0a]/50 border',
-      warn ? 'border-amber-500/30' : 'border-white/5',
-    )}>
+    <div className="flex flex-col gap-1 p-3 rounded-xl bg-[#0a0a0a]/50 border border-white/5">
       <span className="text-[10px] font-medium uppercase tracking-wider text-[#555555]">{label}</span>
-      <span className={cn('text-sm font-semibold', warn ? 'text-amber-400' : 'text-white')}>{value}</span>
-      {sub && <span className="text-[9px] font-mono text-white/30 leading-none">{sub}</span>}
+      <span className="text-sm font-semibold text-white">{value}</span>
     </div>
   );
 }

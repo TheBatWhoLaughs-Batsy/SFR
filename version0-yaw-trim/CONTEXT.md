@@ -109,6 +109,15 @@ with a simple framed binary protocol. Requirements:
   provides phase reference. Signal (RX1) divided by reference (RX2) cancels
   random PLL phase offsets between TX and RX synthesizers at each step.
   AD9361 single-synth mode does NOT work (FDD requires both PLLs active).
+- Sweep cores (`sweep_mode`, set with `pi/radar/set_sweep_mode.py`):
+  - `nios` (default): the FPGA's Nios steps the synthesizers, the Pi receives the
+    raw IQ and demodulates each step. ~36 Hz at 51 steps.
+  - `dsp`: the FPGA steps the synthesizers from its own table and also mixes,
+    averages and divides each step, so the Pi reads one small burst of finished
+    `h_cal` values per sweep. ~100 Hz at 51 steps; 2..255 steps. Needs the v15
+    image (`fpga/images/hostedxA9_niosIIf_sweep_dsp_v15_fifo256_signaltap.rbf`).
+    See CLAUDE.md "On-FPGA DSP sweep path".
+  - `standard`: host-driven retune per step over USB (~18 Hz), the fallback.
 
 ## Wiring — BNO085 (I2C mode)
 
@@ -143,12 +152,85 @@ correct and unchanged throughout.
 removed). Device: `/dev/ttyAMA3` (was `/dev/serial0`/`ttyAMA10` — do not revert to that, its
 receiver is dead). Serial console disabled.
 
+### Three heads (2026-09-15): forward = UART2, right = UART3, down = UART1
+
+**The table above is the single-head wiring from 2026-08-24 and is now the RIGHT-facing
+head.** The forward (radar standoff) head moved to UART2. Operator-confirmed wiring:
+
+| Head | Points | Device | Overlay | GPIO (TX/RX) | Header pins |
+|---|---|---|---|---|---|
+| Forward (Z), **standoff** | forward | `/dev/ttyAMA2` | `uart2-pi5` | 4 / 5 | 7 / 29 |
+| Right (X) | right | `/dev/ttyAMA3` | `uart3-pi5` | 8 / 9 | 24 / 21 |
+| Down (Y) | down | `/dev/ttyAMA1` | `uart1-pi5` | 0 / 1 | 27 / 28 |
+
+All three overlays are in `/boot/firmware/config.txt`. **UART1 uses GPIO 0/1, the HAT ID
+EEPROM pins**: the firmware reads that EEPROM at boot only, so reusing them works (verified
+on the Pi), but the HAT's ID EEPROM is unreadable once Linux is up.
+
+`stream.py` opens one `lidar_poll_loop` per head (`--lidar-ports`, PRIMARY FIRST, default
+`/dev/ttyAMA2,/dev/ttyAMA3,/dev/ttyAMA1`). The first port feeds the legacy `lidar_*`
+fields, i.e. the standoff for SFCW/C-scan/SAR/BG model and the rover yaw controller. Every
+head is also published under `lidars.uartN`, and `lidar_primary` names the first. A port
+that fails to open is skipped with a warning. The Handheld panel's Wiring selectors must
+agree with the primary for forward; the panel warns if they do not.
+
+## Handheld Scan panel (2026-09-15)
+
+Left-sidebar panel `handheldscan` ("Handheld Scan") — the C-scan workflow for the
+HAND-CARRIED head. Nothing drives the head; the three-LiDAR position (`handheldPose`,
+IMU-tilt-corrected) says which grid cell it is over, and a capture tags the SFCW
+sweep-after-next as that cell.
+
+Files: `lib/handheldScan.js` (pure geometry, unit-tested), `components/HandheldScanPanel.jsx`,
+`components/HandheldScanDisplay.jsx`; wired through App.jsx / Sidebar.jsx / Viewport.jsx.
+
+**Own state, isolated from C-scan.** `hhScanData` / `hhCaptureRef` are separate from the
+rover/manual `bscanData` / `bscanCaptureRef`, so the two panels never collide. The sweep
+handler's capture branch and `buildCellRecord` are reused, so records, colour scaling and
+export are identical to C-scan and `buildCscanGrid` renders the plan view directly. Grid
+coords are cscanGrid's (origin bottom-left, ix→right, iy→up, snake path, `grid_ix/iy`).
+
+**Transport.** ▶ Start = sweep on (if it is not) AND auto-capture armed. ❚❚ Pause = disarm
+only; the sweep stays up so resume is instant. ■ Stop = sweep off, any capture in flight
+cancelled. Manual Capture works whenever the sweep runs, paused or not.
+
+**Capture readiness** (`captureReadiness`), in order: origin set → position present → inside
+grid → cell empty → forward-axis tilt ≤ 12° → head within the cell's centre zone
+(min(15 mm, 40 % of the half-pitch + 2)). Each failure has a one-line reason on the panel.
+**Auto-capture** fires after a 400 ms dwell over a ready cell; it is a `setTimeout` keyed on
+the ready cell, not a per-render clock, so it does not depend on render cadence.
+
+**Abort on move.** On every sweep of a capture in flight the handler re-checks the live pose:
+if the head has left the tagged cell, or the position has dropped, the looks so far are
+discarded (a smeared record under the wrong index is worse than no record). One low note;
+the panel says why. Sweep stopping from anywhere also cancels an in-flight capture.
+
+**Provenance per cell**, beside the C-scan fields: `hh_x_mm`, `hh_y_mm` (mean head position
+over the looks), `hh_xy_std_mm` (how still the hand was — the aperture the coherent
+average really covered), `hh_tilt_deg`. Each look also carries `hh_x_mm/hh_y_mm`.
+
+**Recapture / Clear this cell** act on the cell under the head. Recapture drops the record
+and tags the next sweep; a re-capture always REPLACES, never duplicates.
+
+**Beep.** Two rising notes on capture, one low note on abort (Web Audio, default on) —
+the operator's eyes are on the wall, not the screen. Panel also shows standoff (forward
+LiDAR minus antenna offset, judged against 0–150 mm), forward tilt, per-head LiDAR status,
+and aim arrows to the centre of the current (or next empty) cell.
+
+Not wired: background subtraction in this panel's display (records carry the provenance, so
+it adds the same way C-scan does it); projector; detection overlay. Deliberately left out.
+
 ## LiDAR → Antenna Offset (measured 2026-08-28)
 
 **165 mm measured; 160 mm used** (5 mm buffer so a true zero-standoff pose reports
 slightly positive). With the antenna aperture placed against the wall, the TF-LC02 reads
 **164.83 mm ± 0.68**. Standoff = `lidar_reading − offset`, so real operation spans a lidar
 reading of roughly **165–315 mm** for 0–150 mm of standoff.
+
+**Re-measure after the 2026-09-15 three-head re-wire** — the standoff now comes from the
+UART2 (forward) head, so if its mounting differs from the old single head this value is
+wrong, and background models captured against the old head are referenced to a different
+point on the module rather than merely stale.
 
 The value was hardcoded at 315 mm in `App.jsx` until 2026-08-28 and did not match this
 mounting. It is now App.jsx state, persisted to `localStorage.lidar_antenna_offset_mm` and
@@ -306,7 +388,7 @@ persisted — the references do not survive a restart either.
 reversing part (wheel mismatch) plus ±0.5 % non-reversing (floor/cable). The latter
 accumulates across a raster, which is why the loops exist.
 
-### Yaw trim (firmware 2.4.0, 2026-09-12)
+### Yaw trim (firmware 2.5.0, 2026-09-12)
 
 The horizontal axis generates ONE base step rate that drives the front wheel and the
 position count. Each rear wheel has its own accumulator fed with the base rate scaled by
@@ -360,7 +442,7 @@ Pi and groundstation are testable without the rig.
 | Sensor stream (IMU + LiDAR) | 9001 | WebSocket | Pi → Browser |
 | Rover control + position | 9002 | WebSocket | Pi ↔ Browser |
 | Rover ← Arduino UNO link | 8765 | WebSocket | UNO → Pi (the UNO dials in) |
-| SDR control + IQ stream | 9003 | WebSocket | Pi ↔ Browser |
+| SDR control + IQ stream | 9003 | WebSocket | Pi ↔ Browser (sweeps as binary frames to the groundstation, JSON to other clients; see CLAUDE.md "binary sweep frames") |
 | Groundstation UI | 5000 | HTTP | PC local |
 
 ## Current Status
@@ -379,11 +461,15 @@ Pi and groundstation are testable without the rig.
 - [x] IMU calibration discovery tool (groundstation panel)
 - [x] BladeRF driver + AquaSense calibration panel (signal generator + oscilloscope)
 - [ ] BladeRF SFCW implementation
+- [x] On-FPGA DSP sweep path (`sweep_mode='dsp'`, v15 image, run on hardware 2026-09-14)
+- [ ] Decide whether to flash v15 to SPI (flash still holds the v1 sweep image)
 - [x] Rover firmware rewrite (ISR stepping, JSON protocol, E-stop, soft limits, calibration)
 - [x] Rover jog control + position tracking from the controller's own step counter
 - [x] Rover automated grid raster (drives the C-Scan panel's grid; Scan Mode = Rover)
-- [x] Rover yaw trim — open-loop differential rear wheels, Pi-owned value, panel control (2.4.0)
+- [x] Rover yaw trim — open-loop differential rear wheels, Pi-owned value, panel control (2.5.0)
 - [x] Rover steering: `manual` / `heading` (IMU) / `track` (IMU + LiDAR cascade)
+- [x] Handheld Scan panel — hand-carried C-scan, cells filled from the 3-LiDAR position
+      (`lib/handheldScan.js`, `HandheldScanPanel/Display.jsx`); manual + dwell auto-capture
 - [x] BNO085 init failure diagnosed: handshake loops were rate-capped below the sensor's
       own report rate, so a sensor left streaming by a previous run starved them. Fixed in
       `bno085.py` (silence features first, drain to empty, handle oversized packets);

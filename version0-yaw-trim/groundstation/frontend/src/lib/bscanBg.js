@@ -126,28 +126,9 @@ export function freqGrid(startFreqMhz, stopFreqMhz, numSteps) {
 // just the average -- so the coherent/incoherent choice stays live after the
 // scan and can be flipped against recorded data. Older records (and v6 imports)
 // carry only the one spectrum, which is the same thing with N = 1.
-//
-// A cell captured with the panel's raw-sweep retention off also has none, and
-// is handled by the same fallback: h_cal is already the coherent mean of the
-// looks that were dropped, so the coherent path is exact and only incoherent
-// averaging is unavailable. Use cellLookCount() to tell the two apart -- the
-// number of looks survives on `sweep_count` even when the looks do not.
 export function cellSweeps(pos) {
   if (Array.isArray(pos.sweeps) && pos.sweeps.length > 0) return pos.sweeps;
   return [{ h_cal_real: pos.h_cal_real, h_cal_imag: pos.h_cal_imag }];
-}
-
-// How many looks went into this cell, whether or not they are still stored.
-export function cellLookCount(pos) {
-  if (Array.isArray(pos.sweeps) && pos.sweeps.length > 0) return pos.sweeps.length;
-  if (pos.sweep_count > 0) return pos.sweep_count;
-  return 1;
-}
-
-// Does this cell still carry the individual looks? Incoherent averaging needs
-// them; everything else in the pipeline reads the coherent mean.
-export function cellHasLooks(pos) {
-  return Array.isArray(pos.sweeps) && pos.sweeps.length > 1;
 }
 
 // Coherent mean of the complex spectra. This is what h_cal on the record means
@@ -201,40 +182,6 @@ export function coherentMean(sweeps, numSteps) {
 // afterwards is not a defined operation, whereas subtracting per sweep and then
 // averaging the resulting magnitudes is exactly "N independent looks at the
 // residual".
-// Per-CELL memo of the result above, keyed on the record's own identity.
-//
-// This is a pure per-cell map with no cross-cell dependency, which is what makes
-// it memoisable at all. It matters because of the continuous raster's live
-// flush: that rewrites bscanData at 4 Hz while a row is being driven, and every
-// cell of every COMPLETED row is byte-for-byte the record it was last time --
-// yet the whole grid was re-subtracted and re-transformed from scratch on each
-// flush. Measured on a 101x15 grid at 8 looks/cell, this function alone was
-// 13.5 ms per call and is called two to three times per flush (the complex
-// result, the SAR one, and the magnitude one when that mode is on); incoherent
-// averaging takes it to 83 ms, because it runs one IFFT PER LOOK.
-//
-// A WeakMap so a record dropped by New Scan, an import, or a row being re-driven
-// takes its cache with it. Several entries per record because the callers ask
-// different questions of the same cell and a single slot would thrash between
-// them: processedBscanData (complex, this panel's background), the magnitude
-// result when that mode is on, and sarProcessedData (complex, SAR's own
-// background toggle and no window). Three, because those are exactly the live
-// callers -- a fourth slot would only ever hold an entry left behind by a
-// settings change, which is cheaper to recompute than to keep.
-//
-// It is NOT free: measured on a 1515-cell grid, each retained option set costs
-// ~4 MB, so the cache holds up to ~12 MB where the two memo results it partly
-// replaces already held ~7 MB. That is the trade -- ~5 MB against 4-8x less
-// work per flush -- and it is bounded, which unbounded per-cell memoisation
-// would not be.
-//
-// SAFETY: the cached object is SHARED between calls, so nothing downstream may
-// mutate a processed record. Checked across the whole frontend -- the displays
-// and cscanGrid read only, svdFilter spreads into new objects, and the SAR
-// worker is handed a projection. Keep it that way.
-const CELL_CACHE = new WeakMap();
-const CELL_CACHE_MAX = 3;
-
 export function applyBscanBg(bscanData, opts, sfcwParams) {
   if (bscanData.length === 0) return bscanData;
   const { enabled, bgRef, bgModel, superFit, mode } = opts;
@@ -244,39 +191,8 @@ export function applyBscanBg(bscanData, opts, sfcwParams) {
   const incoherent = opts.avgMode === 'incoherent';
   const makeWin = windowFn(opts.windowType || 'rectangular', opts.kaiserBeta != null ? opts.kaiserBeta : 3);
 
-  // Everything that changes the answer and is not the record itself. The three
-  // background sources are compared by IDENTITY rather than folded into this
-  // string: they are objects, they are replaced wholesale whenever they change
-  // (capture, load, clear), and hashing their contents every call would cost
-  // more than the work being avoided.
-  const key = `${!!active}|${mode || 'complex'}|${incoherent}|${opts.windowType || 'rectangular'}`
-    + `|${opts.kaiserBeta != null ? opts.kaiserBeta : 3}|${sfcwParams.startFreq}|${sfcwParams.stopFreq}`;
-
   return bscanData.map((pos) => {
     if (!pos.h_cal_real || !pos.h_cal_imag) return pos;
-
-    let slots = CELL_CACHE.get(pos);
-    if (slots) {
-      for (let i = 0; i < slots.length; i++) {
-        const s = slots[i];
-        if (s.key === key && s.bgRef === bgRef && s.bgModel === bgModel && s.superFit === superFit) {
-          // Most-recently-used to the front, so the slot evicted at the cap is
-          // the one no caller has asked for in the longest time.
-          if (i > 0) { slots.splice(i, 1); slots.unshift(s); }
-          return s.out;
-        }
-      }
-    } else {
-      slots = [];
-      CELL_CACHE.set(pos, slots);
-    }
-    const out = computeCell(pos);
-    slots.unshift({ key, bgRef, bgModel, superFit, out });
-    if (slots.length > CELL_CACHE_MAX) slots.length = CELL_CACHE_MAX;
-    return out;
-  });
-
-  function computeCell(pos) {
     const numSteps = pos.h_cal_real.length;
     const freqs = freqGrid(sfcwParams.startFreq, sfcwParams.stopFreq, numSteps);
     const win = makeWin(numSteps);
@@ -307,14 +223,8 @@ export function applyBscanBg(bscanData, opts, sfcwParams) {
     };
 
     const base = {
-      ...pos, freqs,
-      // What was TAKEN, not what is still stored -- a cell whose raw looks were
-      // freed is still an N-look coherent mean and must not read as N = 1.
-      num_sweeps: cellLookCount(pos),
-      // What is still being DONE with them. A freed cell cannot be averaged
-      // incoherently whatever the toggle says, so it reports 'coherent'.
-      avg_mode: sweeps.length > 1 ? (incoherent ? 'incoherent' : 'coherent')
-        : (cellLookCount(pos) > 1 ? 'coherent' : null),
+      ...pos, freqs, num_sweeps: sweeps.length,
+      avg_mode: sweeps.length > 1 ? (incoherent ? 'incoherent' : 'coherent') : null,
     };
 
     if (!active) {
@@ -373,5 +283,5 @@ export function applyBscanBg(bscanData, opts, sfcwParams) {
       h_cal_real: real, h_cal_imag: imag,
       bg_status: bg.status, bg_sub_mode: 'complex',
     };
-  }
+  });
 }

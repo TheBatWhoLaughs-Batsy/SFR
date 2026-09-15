@@ -1,5 +1,6 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { COLORMAPS } from '@/lib/imagingEffects';
+import { effectiveRating } from '@/lib/sarDetect';
 
 const BG = '#000000';
 
@@ -29,20 +30,25 @@ function cohMap(t) {
 // 100x100 cells x two panes x 60 fps is 1.2M fillRect calls a second, which is
 // exactly the cost ImagingDisplay was rewritten to avoid; putImageData plus one
 // scaled drawImage is a single blit instead.
+//
+// Orientation matches the C-scan panel's row B-scan: lateral position runs left to
+// right across the screen and depth INCREASES bottom to top (the wall face is the
+// bottom edge). So image column = position index xi, image row = pixelsZ-1-zi.
 function blit(ctx, off, vals, pixelsX, pixelsZ, vMin, vMax, cmap, dest) {
   const oc = off.canvas;
-  if (oc.width !== pixelsZ || oc.height !== pixelsX) {
-    oc.width = pixelsZ;
-    oc.height = pixelsX;
+  if (oc.width !== pixelsX || oc.height !== pixelsZ) {
+    oc.width = pixelsX;
+    oc.height = pixelsZ;
   }
-  const id = off.createImageData(pixelsZ, pixelsX);
+  const id = off.createImageData(pixelsX, pixelsZ);
   const d = id.data;
   const span = vMax - vMin || 1;
-  for (let xi = 0; xi < pixelsX; xi++) {
-    for (let zi = 0; zi < pixelsZ; zi++) {
+  for (let zi = 0; zi < pixelsZ; zi++) {
+    const row = pixelsZ - 1 - zi;
+    for (let xi = 0; xi < pixelsX; xi++) {
       const v = vals[zi * pixelsX + xi];
       const [r, g, b] = cmap((v - vMin) / span);
-      const o = (xi * pixelsZ + zi) * 4;
+      const o = (row * pixelsX + xi) * 4;
       d[o] = r; d[o + 1] = g; d[o + 2] = b; d[o + 3] = 255;
     }
   }
@@ -174,33 +180,37 @@ function drawPane(canvas, off, sarResult, crosshair, opts) {
   }
   ctx.globalAlpha = 1.0;
 
-  // X-axis labels (depth). True depth below the wall face now, not apparent range.
+  // X-axis labels: lateral position, left to right, in the C-scan grid's frame (a row
+  // that starts part way into the grid starts its axis there too).
+  const apStart = sarResult.apertureStart ?? 0;
   for (let i = 0; i <= xTicks; i++) {
     const x = pad.left + (i / xTicks) * plotW;
     ctx.fillStyle = '#555555';
     ctx.font = '9px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText(`${((i / xTicks) * depthMax * 100).toFixed(1)}`, x, h - pad.bottom + 13);
+    ctx.fillText(`${((apStart + (i / xTicks) * apertureLength) * 100).toFixed(1)}`, x, h - pad.bottom + 13);
   }
+  // Y-axis labels: true depth below the wall face (not apparent range), 0 at the
+  // bottom edge, increasing upwards.
   for (let i = 0; i <= yTicks; i++) {
-    const y = pad.top + (i / yTicks) * plotH;
+    const y = pad.top + (1 - i / yTicks) * plotH;
     ctx.fillStyle = '#555555';
     ctx.font = '9px monospace';
     ctx.textAlign = 'right';
-    ctx.fillText(`${((i / yTicks) * apertureLength * 100).toFixed(1)}`, pad.left - 6, y + 3);
+    ctx.fillText(`${((i / yTicks) * depthMax * 100).toFixed(1)}`, pad.left - 6, y + 3);
   }
 
   ctx.fillStyle = '#444444';
   ctx.font = '9px monospace';
   ctx.textAlign = 'center';
-  ctx.fillText('Depth into wall (cm)', pad.left + plotW / 2, h - pad.bottom + 26);
+  ctx.fillText('Position (cm)', pad.left + plotW / 2, h - pad.bottom + 26);
   ctx.save();
   ctx.translate(12, pad.top + plotH / 2);
   ctx.rotate(-Math.PI / 2);
   ctx.textAlign = 'center';
   ctx.fillStyle = '#444444';
   ctx.font = '9px monospace';
-  ctx.fillText('Position (cm)', 0, 0);
+  ctx.fillText('Depth into wall (cm)', 0, 0);
   ctx.restore();
 
   // Title
@@ -242,14 +252,17 @@ function drawPane(canvas, off, sarResult, crosshair, opts) {
   ctx.fillText(fmt(vMax), barX, pad.top - 4);
   ctx.fillText(fmt(vMin), barX, pad.top + plotH + 10);
 
+  drawDetection(ctx, opts, { pad, plotW, plotH, apStart, apertureLength, depthMax, h });
+
   // Crosshair — reports BOTH quantities wherever it is, so the panes can be read
   // against each other without moving the mouse between them.
   if (crosshair) {
     const relX = (crosshair.x - pad.left) / plotW;
     const relY = (crosshair.y - pad.top) / plotH;
     if (relX >= 0 && relX <= 1 && relY >= 0 && relY <= 1) {
-      const zi = Math.min(pixelsZ - 1, Math.floor(relX * pixelsZ));
-      const xi = Math.min(pixelsX - 1, Math.floor(relY * pixelsX));
+      // Position runs along the screen's x, depth up the screen's y (0 at the bottom).
+      const xi = Math.min(pixelsX - 1, Math.floor(relX * pixelsX));
+      const zi = Math.min(pixelsZ - 1, Math.floor((1 - relY) * pixelsZ));
 
       ctx.setLineDash([3, 3]);
       ctx.strokeStyle = '#ffffff44';
@@ -264,7 +277,7 @@ function drawPane(canvas, off, sarResult, crosshair, opts) {
       const wLabel = weighting
         ? `, weighted ${(dbVal + 20 * Math.log10(Math.max(coherence[zi * pixelsX + xi], COH_FLOOR))).toFixed(1)}dB`
         : '';
-      const label = `pos ${(relY * apertureLength * 100).toFixed(1)}cm, depth ${(relX * depthMax * 100).toFixed(1)}cm, ${ampLabel}${cohLabel}${wLabel}`;
+      const label = `pos ${((apStart + relX * apertureLength) * 100).toFixed(1)}cm, depth ${((1 - relY) * depthMax * 100).toFixed(1)}cm, ${ampLabel}${cohLabel}${wLabel}`;
       ctx.fillStyle = '#ffffff';
       ctx.font = '10px monospace';
       ctx.textAlign = 'left';
@@ -274,7 +287,166 @@ function drawPane(canvas, off, sarResult, crosshair, opts) {
   }
 }
 
-function Pane({ sarResult, mode, scaleMode, dynRange, colormap }) {
+// Target markers from lib/sarDetect.js, drawn on every pane so the amplitude and
+// coherence images can be read against the same circles. A marker is placed at the
+// ACTIVE ROW's own peak when that row saw the target, else at the cross-row consensus
+// (drawn fainter). The circle's diameter is the target's measured -6 dB width in both
+// axes, so it is to scale on the image; a floor keeps thin targets visible.
+const MARKER_STYLE = {
+  confirmed: { stroke: '#4ade80', dash: [], width: 2, label: true },
+  probable: { stroke: '#fbbf24', dash: [5, 4], width: 1.5, label: true },
+  unresolved: { stroke: '#9ca3af', dash: [2, 3], width: 1, label: true },
+  reference: { stroke: '#6b7280', dash: [1, 3], width: 1, label: false },
+};
+// The stretch at each end of the SCAN (not of this row) that detection does not trust or
+// does not search, hatched. Purely visual.
+function hatchEndZones(ctx, det, xPix, pad, plotH) {
+  const zones = [[det.xMin, det.xMin + det.endExcludeCm], [det.xMax - det.endExcludeCm, det.xMax]];
+  for (const [a, b] of zones) {
+    const x0 = xPix(a), x1 = xPix(b);
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(Math.min(x0, x1), pad.top, Math.abs(x1 - x0), plotH);
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let s = Math.min(x0, x1) - plotH; s < Math.max(x0, x1); s += 8) {
+      ctx.moveTo(s, pad.top + plotH); ctx.lineTo(s + plotH, pad.top);
+    }
+    ctx.stroke();
+  }
+}
+
+// Seepage-mode patches (lib/seepageDetect.js): regions, not circles. On the active row the
+// outline is that row's own extent at full strength; a patch that does not reach this row
+// is drawn at its overall extent, faint. The searched depth band is marked with dotted
+// lines and the unsearched ends are hatched.
+const PATCH_DRAW = {
+  moisture: { stroke: '#38bdf8', fill: 'rgba(56,189,248,0.10)', dash: [], width: 2, label: 'possible moisture' },
+  unverified: { stroke: '#fbbf24', fill: 'rgba(251,191,36,0.08)', dash: [5, 4], width: 1.5, label: 'unverified patch' },
+  reference: { stroke: '#6b7280', fill: null, dash: [1, 3], width: 1, label: null },
+};
+function drawSeepage(ctx, opts, g) {
+  const det = opts.detection;
+  const { pad, plotW, plotH, apStart, apertureLength, depthMax } = g;
+  const xPix = (cm) => pad.left + ((cm / 100 - (apStart || 0)) / apertureLength) * plotW;
+  const yPix = (cm) => pad.top + (1 - (cm / 100) / depthMax) * plotH;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(pad.left, pad.top, plotW, plotH);
+  ctx.clip();
+  if (det.endExcludeCm > 0) hatchEndZones(ctx, det, xPix, pad, plotH);
+  ctx.setLineDash([2, 4]);
+  ctx.strokeStyle = 'rgba(56,189,248,0.35)';
+  ctx.lineWidth = 1;
+  for (const z of det.depthBand) {
+    const y = yPix(z);
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + plotW, y); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  let lastLabelX = -Infinity, lastBelow = false;
+  for (const p of det.patches) {
+    const style = PATCH_DRAW[p.rating];
+    if (!style) continue;
+    const row = opts.activeRow != null ? p.perRow.find((r) => r.iy === opts.activeRow) : null;
+    const ext = row || { x0: p.x0, x1: p.x1, z0: p.zMin, z1: p.zMax };
+    // 1 cm of margin: the smoothing width, and it keeps a one-column row visible
+    const xa = xPix(ext.x0 - 1), xb = xPix(ext.x1 + 1);
+    const ya = yPix(ext.z1 + 1), yb = yPix(Math.max(0, ext.z0 - 1));
+    ctx.globalAlpha = row || p.rating === 'reference' ? 1 : 0.45;
+    if (style.fill) { ctx.fillStyle = style.fill; ctx.fillRect(xa, ya, xb - xa, yb - ya); }
+    ctx.setLineDash(style.dash);
+    ctx.strokeStyle = style.stroke;
+    ctx.lineWidth = style.width;
+    ctx.strokeRect(xa, ya, xb - xa, yb - ya);
+    ctx.setLineDash([]);
+    if (style.label) {
+      const label = `${style.label} · ${p.x0.toFixed(1)}-${p.x1.toFixed(1)} cm · ~${p.depth.toFixed(1)} cm`;
+      ctx.font = 'bold 9px monospace';
+      ctx.textAlign = xa > pad.left + plotW * 0.6 ? 'right' : 'left';
+      const lx = ctx.textAlign === 'right' ? xb : xa;
+      const below = (p.xc - lastLabelX) < 10 && !lastBelow;
+      lastLabelX = p.xc; lastBelow = below;
+      const ly = below ? Math.min(pad.top + plotH - 4, yb + 12) : Math.max(pad.top + 10, ya - 4);
+      const tw = ctx.measureText(label).width;
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(ctx.textAlign === 'right' ? lx - tw - 3 : lx - 3, ly - 9, tw + 6, 12);
+      ctx.fillStyle = style.stroke;
+      ctx.fillText(label, lx, ly);
+    }
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+
+function drawDetection(ctx, opts, g) {
+  const det = opts.detection;
+  if (det && det.mode === 'seepage') { drawSeepage(ctx, opts, g); return; }
+  if (!det || !det.targets) return;
+  const { pad, plotW, plotH, apStart, apertureLength, depthMax, h } = g;
+  const xPix = (cm) => pad.left + ((cm / 100 - (apStart || 0)) / apertureLength) * plotW;
+  const yPix = (cm) => pad.top + (1 - (cm / 100) / depthMax) * plotH;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(pad.left, pad.top, plotW, plotH);
+  ctx.clip();
+
+  // End zones: the truncated-aperture stretch at each end of the SCAN (not of this
+  // row), hatched. Purely visual; the operator is expected to overscan.
+  if (opts.handleEnds && det.endExcludeCm > 0) hatchEndZones(ctx, det, xPix, pad, plotH);
+
+  // Labels of neighbouring markers are staggered: the second of any pair closer than
+  // 10 cm goes below its circle instead of above, so 33 cm and 36.5 cm can both be read.
+  let lastLabelX = -Infinity, lastBelow = false;
+  for (const t of det.targets) {
+    const rating = effectiveRating(t, opts.handleEnds);
+    const style = MARKER_STYLE[rating];
+    if (!style) continue;
+    const row = opts.activeRow != null ? t.perRow.find((r) => r.iy === opts.activeRow) : null;
+    const seen = !!(row && row.seen && Number.isFinite(row.x));
+    // not seen in this row: where the fitted LINE crosses it, so a slanted pipe's faint
+    // marker still sits on the pipe rather than at its mid-height position
+    const x = seen ? row.x : (row && Number.isFinite(row.xPred) ? row.xPred : t.x);
+    const depth = seen ? row.depth : t.depth;
+    const widthCm = Math.max(2, t.widthCm || 3);
+    const rx = Math.max(6, (widthCm / 100 / apertureLength) * plotW / 2);
+    const ry = Math.max(6, (widthCm / 100 / depthMax) * plotH / 2);
+    const cx = xPix(x), cy = yPix(depth);
+    ctx.globalAlpha = seen || rating === 'reference' ? 1 : 0.45;
+    ctx.setLineDash(style.dash);
+    ctx.strokeStyle = style.stroke;
+    ctx.lineWidth = style.width;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+    ctx.stroke();
+    // small tick marks make a thin circle read as a marker rather than a blob edge
+    ctx.beginPath();
+    ctx.moveTo(cx - rx - 4, cy); ctx.lineTo(cx - rx, cy);
+    ctx.moveTo(cx + rx, cy); ctx.lineTo(cx + rx + 4, cy);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (style.label) {
+      const label = rating === 'unresolved'
+        ? `${t.x.toFixed(1)} cm · unresolved (end)`
+        : `${rating} · ${t.x.toFixed(1)} cm · ${depth.toFixed(1)} cm deep`;
+      ctx.font = 'bold 9px monospace';
+      ctx.textAlign = cx > pad.left + plotW * 0.75 ? 'right' : 'left';
+      const lx = ctx.textAlign === 'right' ? cx - rx - 6 : cx + rx + 6;
+      const below = (t.x - lastLabelX) < 10 && !lastBelow;
+      lastLabelX = t.x; lastBelow = below;
+      const ly = below ? Math.min(pad.top + plotH - 4, cy + ry + 12) : Math.max(pad.top + 10, cy - ry - 4);
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      const tw = ctx.measureText(label).width;
+      ctx.fillRect(ctx.textAlign === 'right' ? lx - tw - 3 : lx - 3, ly - 9, tw + 6, 12);
+      ctx.fillStyle = style.stroke;
+      ctx.fillText(label, lx, ly);
+    }
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+
+function Pane({ sarResult, mode, scaleMode, dynRange, colormap, detection, activeRow, handleEnds }) {
   const canvasRef = useRef(null);
   const offRef = useRef(null);
   const animRef = useRef(null);
@@ -286,8 +458,8 @@ function Pane({ sarResult, mode, scaleMode, dynRange, colormap }) {
 
   const draw = useCallback(() => {
     drawPane(canvasRef.current, offRef.current, sarResult, crosshair,
-             { mode, scaleMode: scaleMode || 'db', dynRange, colormap });
-  }, [sarResult, crosshair, mode, scaleMode, dynRange, colormap]);
+             { mode, scaleMode: scaleMode || 'db', dynRange, colormap, detection, activeRow, handleEnds });
+  }, [sarResult, crosshair, mode, scaleMode, dynRange, colormap, detection, activeRow, handleEnds]);
 
   // Kept as a rAF loop rather than a draw-on-change effect for the same reason
   // BscanDisplay is: the canvas sizes itself from getBoundingClientRect(), so
@@ -325,7 +497,7 @@ function Pane({ sarResult, mode, scaleMode, dynRange, colormap }) {
 // more. It did NOT uniquely pick the pipe -- a feature at the opposite aperture edge
 // scored comparably (0.89) -- so read the pair, and treat an edge feature with
 // suspicion until the scan is extended past it.
-export default function SarDisplay({ sarResult, sarProgress, scaleMode, dynRange, viewMode, colormap }) {
+export default function SarDisplay({ sarResult, sarProgress, scaleMode, dynRange, viewMode, colormap, detection, activeRow, handleEnds }) {
   const combined = viewMode === 'combined';
   return (
     <div className="flex flex-col w-full h-full">
@@ -338,12 +510,12 @@ export default function SarDisplay({ sarResult, sarProgress, scaleMode, dynRange
         </div>
       )}
       {combined ? (
-        <Pane sarResult={sarResult} mode="combined" scaleMode={scaleMode} dynRange={dynRange} colormap={colormap} />
+        <Pane sarResult={sarResult} mode="combined" scaleMode={scaleMode} dynRange={dynRange} colormap={colormap} detection={detection} activeRow={activeRow} handleEnds={handleEnds} />
       ) : (
         <>
-          <Pane sarResult={sarResult} mode="amplitude" scaleMode={scaleMode} dynRange={dynRange} colormap={colormap} />
+          <Pane sarResult={sarResult} mode="amplitude" scaleMode={scaleMode} dynRange={dynRange} colormap={colormap} detection={detection} activeRow={activeRow} handleEnds={handleEnds} />
           <div className="h-px bg-white/8 shrink-0" />
-          <Pane sarResult={sarResult} mode="coherence" scaleMode={scaleMode} dynRange={dynRange} colormap={colormap} />
+          <Pane sarResult={sarResult} mode="coherence" scaleMode={scaleMode} dynRange={dynRange} colormap={colormap} detection={detection} activeRow={activeRow} handleEnds={handleEnds} />
         </>
       )}
     </div>

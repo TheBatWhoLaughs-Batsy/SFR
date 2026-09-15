@@ -152,18 +152,16 @@ export const BG_STATUS_TEXT = {
 // row with holes in it (an undone cell, a partial raster) still gets the right
 // spacing instead of closing the gap up.
 //
+// `focusMethod` picks the kernel: 'saft' (default) is the incoherent,
+// magnitude-domain back-projection above; 'das_cf' and 'dmas_cf' are coherent
+// (phase-aware) alternatives from lib/saft.js, weighted by a coherence factor
+// CF^focusGamma that suppresses depths where the aperture disagrees. They need
+// a complex range profile per trace (built here from h_cal, windowed exactly
+// like the live display) rather than the magnitude profile SAFT reads.
+//
 // A cell whose background failed contributes to nothing: it is un-subtracted
 // and sits 20-30 dB above its neighbours, so letting it into an aperture would
 // smear that error across every cell within half an aperture of it.
-// Focused values, cached per GRID ROW and keyed on the params object's identity.
-//
-// A WeakMap so changing any focus/gate/metric setting (which produces a new
-// params object -- App memoises one) drops the whole cache with it, and so that
-// a params object nobody holds any more takes its cache away. Rows are keyed by
-// grid_iy inside it, and validated by comparing the RECORD IDENTITIES the row is
-// made of, so a stale entry cannot survive a cell being re-captured.
-const FOCUS_CACHE = new WeakMap();
-
 export function computeCellValues(scanData, params) {
   const gateStartM = params.gateStart / 100;
   const gateEndM = params.gateEnd / 100;
@@ -186,6 +184,12 @@ export function computeCellValues(scanData, params) {
   const gamma = params.focusGamma != null ? params.focusGamma : 1.0;
   const coherent = method === 'das_cf' || method === 'dmas_cf';
 
+  // DAS+CF and DMAS+CF need a COMPLEX range profile per trace, not just the
+  // magnitude one already stored on each cell -- built here from the raw
+  // h_cal rather than recomputed by every downstream caller, the same
+  // "single source of the number a cell is coloured by" rule the rest of
+  // this function already follows. Skipped entirely for SAFT, which stays
+  // magnitude-domain and unchanged.
   let makeWin = null;
   let kStart = 0;
   if (coherent) {
@@ -201,59 +205,31 @@ export function computeCellValues(scanData, params) {
     const iy = pos.grid_iy != null ? pos.grid_iy : 0;
     let row = rows.get(iy);
     if (!row) { row = []; rows.set(iy, row); }
-    row.push({
+    const trace = {
       i,
-      pos,
       n: pos.grid_ix != null ? pos.grid_ix : i,
       magnitudes: pos.magnitudes,
       distances: pos.distances,
-    });
+    };
+    if (coherent && pos.h_cal_real && pos.h_cal_imag) {
+      const ns = pos.h_cal_real.length;
+      const win = makeWin(ns);
+      const cp = computeComplexRangeProfile(
+        pos.h_cal_real, pos.h_cal_imag, ns, pos.step_size, pos.range_offset, win);
+      trace.cre = cp.re;
+      trace.cim = cp.im;
+      trace.cdists = cp.distances;
+    }
+    row.push(trace);
   }
 
-  let cache = FOCUS_CACHE.get(params);
-  if (!cache) { cache = new Map(); FOCUS_CACHE.set(params, cache); }
-
-  for (const [iy, traces] of rows) {
+  for (const traces of rows.values()) {
     traces.sort((a, b) => a.n - b.n);
-
-    // A row whose records are the same objects, in the same order, has the same
-    // focused values -- because focusing is PER ROW and only along it, so a row
-    // has no dependency on anything outside itself. That is the invariant this
-    // reuses, and it is the one that matters during a continuous raster: the
-    // live flush rewrites bscanData at 4 Hz, but only the row being driven has
-    // changed, and the completed rows above it were being re-back-projected
-    // every time. Measured on a 1515-cell grid: 46 ms -> ~3 ms for a flush that
-    // touched one row.
-    const prev = cache.get(iy);
-    if (prev && prev.traces.length === traces.length
-        && traces.every((t, k) => prev.traces[k] === t.pos)) {
-      for (let k = 0; k < traces.length; k++) out[traces[k].i] = prev.values[k];
-      continue;
-    }
-
     // The depth axis is the record's own, so a gate that falls outside it gives
     // no depths and every cell in the row reads "outside gate" -- the same
     // answer gatedIntensity gives, rather than a focused image of nothing.
     const depths = gateDepths(traces[0].distances, gateStartM, gateEndM);
-    if (depths.length === 0) { cache.delete(iy); continue; }
-
-    // The complex profiles the coherent methods need, computed only for a row
-    // that is actually being recomputed -- they are one IFFT per trace and were
-    // previously built for every row on every call, cache hit or not.
-    if (coherent) {
-      for (const t of traces) {
-        const p = t.pos;
-        if (!p.h_cal_real || !p.h_cal_imag) continue;
-        const ns = p.h_cal_real.length;
-        const cp = computeComplexRangeProfile(
-          p.h_cal_real, p.h_cal_imag, ns, p.step_size, p.range_offset, makeWin(ns));
-        t.cre = cp.re;
-        t.cim = cp.im;
-        t.cdists = cp.distances;
-      }
-    }
-
-    const values = new Array(traces.length);
+    if (depths.length === 0) continue;
     for (let k = 0; k < traces.length; k++) {
       let profile;
       if (method === 'das_cf') {
@@ -263,10 +239,8 @@ export function computeCellValues(scanData, params) {
       } else {
         profile = saftFocusedProfile(traces, k, depths, stepM, halfAp);
       }
-      values[k] = metricOnProfile(profile, metric);
-      out[traces[k].i] = values[k];
+      out[traces[k].i] = metricOnProfile(profile, metric);
     }
-    cache.set(iy, { traces: traces.map(t => t.pos), values });
   }
   return out;
 }
@@ -276,14 +250,7 @@ export function computeCellValues(scanData, params) {
 // that was captured but has no range bin inside the gate keeps its entry with a
 // non-finite value, so the display can tell "empty" from "gated out"; a cell
 // whose background failed is flagged invalid and contributes to no scale.
-// `cellValues` is optional and is the SAME array computeCellValues would
-// return -- pass it when the caller already has one. It used to be computed
-// here AND in computeGridScales AND again on every animation frame, and with
-// Focus on it is the dominant term in all three: a SAFT back-projection over
-// the aperture, per cell, per gate depth (measured, 1515 cells: 47.3 ms).
-// Computing it once per update and handing it to both is worth more than any
-// micro-optimisation inside it.
-export function buildCscanGrid(scanData, params, cellValues) {
+export function buildCscanGrid(scanData, params) {
   const { hCount, vCount } = params;
   const h = Math.max(1, hCount);
   const v = Math.max(1, vCount);
@@ -292,7 +259,7 @@ export function buildCscanGrid(scanData, params, cellValues) {
   let min = Infinity;
   let max = -Infinity;
 
-  const values = cellValues || computeCellValues(scanData, params);
+  const values = computeCellValues(scanData, params);
 
   for (let i = 0; i < scanData.length; i++) {
     const pos = scanData[i];
@@ -339,18 +306,26 @@ export function buildCscanGrid(scanData, params, cellValues) {
 const SCALE_P_LO = 0.01;
 const SCALE_P_HI = 0.999;
 
+// Every bin of one cell that is allowed to vote on a colour scale. A cell whose
+// background failed is excluded -- it is un-subtracted and would set the top of
+// the scale on its own.
+function pushCellValues(pos, out) {
+  if (!pos || !pos.magnitudes || !pos.distances) return;
+  if (bgFailed(pos.bg_status)) return;
+  const mags = pos.magnitudes;
+  const dists = pos.distances;
+  for (let i = 0; i < mags.length && i < dists.length; i++) {
+    const v = mags[i];
+    if (isFinite(v)) out.push(v);
+  }
+}
+
 // Percentile limits from an already-collected population of dB values. Sorts in
-// place, so hand it a scratch buffer.
-//
-// A Float64Array sorts NUMERICALLY with no comparator, which is 3.3x faster than
-// the plain-Array-plus-comparator this used to be (measured, 174k values -- the
-// population of a 101x15 grid: 49.4 ms -> 14.8 ms) and gives bit-identical
-// limits, a sort being a sort. The comparator branch is kept because a plain
-// Array sorts LEXICOGRAPHICALLY without one, which would be silently wrong.
+// place, so hand it a scratch array.
 function limitsFrom(vals) {
   if (vals.length === 0) return { min: -90, max: -20, n: 0, degenerate: true };
 
-  if (ArrayBuffer.isView(vals)) vals.sort(); else vals.sort((a, b) => a - b);
+  vals.sort((a, b) => a - b);
   const at = (p) => vals[Math.min(vals.length - 1, Math.max(0, Math.round(p * (vals.length - 1))))];
   let min = at(SCALE_P_LO);
   let max = at(SCALE_P_HI);
@@ -369,66 +344,10 @@ function limitsFrom(vals) {
   return { min, max, n: vals.length, degenerate };
 }
 
-// Does this cell get to vote on a colour scale, and over how many bins? A cell
-// whose background failed is excluded -- it is un-subtracted and would set the
-// top of the scale on its own.
-function cellBinCount(pos) {
-  if (!pos || !pos.magnitudes || !pos.distances) return 0;
-  if (bgFailed(pos.bg_status)) return 0;
-  return Math.min(pos.magnitudes.length, pos.distances.length);
-}
-
-// BOTH bin-domain colour scales in one pass: global, and one per grid row.
-//
-// They were two functions walking the same 174k-value population separately,
-// each building a plain Array by `push` and sorting it with a comparator. This
-// collects into preallocated Float64Arrays (sized from the bin counts, which are
-// known without touching an element, then trimmed to the finite ones) and sorts
-// natively. Measured on a 1515-cell grid: 31.0 + 18.3 ms -> 16 ms for both.
-// The limits are unchanged -- same population, same percentiles, same sort order.
-export function computeBinScales(scanData) {
-  // Pass 1: upper bounds, from lengths only. Non-finite bins are rare, so the
-  // buffers are trimmed rather than counted exactly.
-  let cap = 0;
-  const rowCap = new Map();
-  for (const pos of scanData) {
-    const n = cellBinCount(pos);
-    if (!n) continue;
-    cap += n;
-    const iy = pos.grid_iy != null ? pos.grid_iy : 0;
-    rowCap.set(iy, (rowCap.get(iy) || 0) + n);
-  }
-
-  const all = new Float64Array(cap);
-  let ai = 0;
-  const rows = new Map();
-  for (const [iy, n] of rowCap) rows.set(iy, { buf: new Float64Array(n), i: 0 });
-
-  // Pass 2: fill. Global and per-row share the walk, which is the other half of
-  // what the two separate functions were paying for.
-  for (const pos of scanData) {
-    const n = cellBinCount(pos);
-    if (!n) continue;
-    const r = rows.get(pos.grid_iy != null ? pos.grid_iy : 0);
-    const mags = pos.magnitudes;
-    for (let i = 0; i < n; i++) {
-      const v = mags[i];
-      if (!isFinite(v)) continue;
-      all[ai++] = v;
-      r.buf[r.i++] = v;
-    }
-  }
-
-  const rowLimits = new Map();
-  for (const [iy, r] of rows) rowLimits.set(iy, limitsFrom(r.buf.subarray(0, r.i)));
-  return { global: limitsFrom(all.subarray(0, ai)), rows: rowLimits };
-}
-
-// ONE set of colour limits for the whole panel. Thin wrapper: call
-// computeBinScales directly when both scopes are wanted, which is the normal
-// case and half the work.
 export function computeSharedScale(scanData) {
-  return computeBinScales(scanData).global;
+  const vals = [];
+  for (const pos of scanData) pushCellValues(pos, vals);
+  return limitsFrom(vals);
 }
 
 // PER-ROW colour limits: the same percentile treatment, but with the population
@@ -446,7 +365,17 @@ export function computeSharedScale(scanData) {
 // Data with no grid indices (an imported linear scan) all lands in row 0, so
 // per-row is identical to global there.
 export function computeRowScales(scanData) {
-  return computeBinScales(scanData).rows;
+  const byRow = new Map();
+  for (const pos of scanData) {
+    if (!pos) continue;
+    const iy = pos.grid_iy != null ? pos.grid_iy : 0;
+    let vals = byRow.get(iy);
+    if (!vals) { vals = []; byRow.set(iy, vals); }
+    pushCellValues(pos, vals);
+  }
+  const out = new Map();
+  for (const [iy, vals] of byRow) out.set(iy, limitsFrom(vals));
+  return out;
 }
 
 // UNLINKED colour limits for the plan view: the population is the GATED CELL
@@ -466,12 +395,11 @@ export function computeRowScales(scanData) {
 // need the same population and it is one pass either way. Cells with no bin
 // inside the gate are skipped, not floored: they are drawn as "gated out" in
 // their own colour and have no value to contribute.
-export function computeGridScales(scanData, params, cellValues) {
+export function computeGridScales(scanData, params) {
   const all = [];
   const byRow = new Map();
   // The same values the grid draws, focusing included -- see computeCellValues.
-  // Shared with buildCscanGrid when the caller passes it in; see there.
-  const values = cellValues || computeCellValues(scanData, params);
+  const values = computeCellValues(scanData, params);
 
   for (let i = 0; i < scanData.length; i++) {
     const pos = scanData[i];

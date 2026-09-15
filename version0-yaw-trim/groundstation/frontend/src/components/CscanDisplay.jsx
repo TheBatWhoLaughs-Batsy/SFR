@@ -1,12 +1,19 @@
-import { useRef, useEffect, useState, useMemo } from 'react';
+import { useRef, useEffect, useState } from 'react';
 import { orderedCellForIndex, buildCscanGrid, cscanLayout, BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
 // One implementation, shared with the Imaging Bench and the SAR panel -- the
 // same rule CFAR and the window functions follow. The local `jet` this replaces
 // was checked bit-identical to the library's over 100k samples plus the
 // non-finite cases, so the default image is unchanged.
 import { COLORMAPS } from '@/lib/imagingEffects';
+import { pipeOverlay, cellUnitsX } from '@/lib/detectionOverlay';
 
 const BG = '#000000';
+// Source = SAR detections: a captured cell is drawn as scanned ground, a confirmed pipe as a
+// white band and (when enabled) a probable pipe as an amber one -- the same amber the SAR
+// panel uses for probable markers. No colormap is involved.
+const SCANNED_FILL = '#2e2e2e';
+const PIPE_FILL = '#ffffff';
+const PROBABLE_FILL = '#fbbf24';
 // Uncaptured. The FILL cannot be the discriminator once a perceptually-uniform
 // map is selectable: inferno's own bottom is near-black, so #0d0d0d sits 15 RGB
 // units from a legitimately low-valued cell and no dark fill does better --
@@ -162,7 +169,7 @@ function drawSmoothField(ctx, canvas, grid, L, valueAt, cmap) {
   return true;
 }
 
-function drawCscan(canvas, grid, scanData, params, crosshair, selected, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless, smooth, colormap) {
+function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless, smooth, colormap, detection, handleEnds) {
   // `isConnected` is false for a frame or two while the projector window is
   // being torn down, and drawing into a canvas whose document is going away
   // throws in some browsers.
@@ -192,14 +199,16 @@ function drawCscan(canvas, grid, scanData, params, crosshair, selected, nextInde
   // Falls back to jet, which is what every stored screenshot and every habit on
   // this bench is calibrated to.
   const cmap = COLORMAPS[colormap] || COLORMAPS.jet;
-  // The grid arrives already built. It used to be rebuilt HERE, i.e. inside the
-  // rAF loop, 60 times a second whether or not anything had changed -- and with
-  // Focus on that is a full SAFT back-projection over every cell every frame
-  // (measured on a 1515-cell grid: 3.5 ms/frame unfocused, 47.3 ms focused, the
-  // latter a hard 21 fps ceiling and the whole main thread on its own, twice
-  // over with the projector open). Nothing it depends on changes per frame; the
-  // pulse, the crosshair and the layout do, and those are still per frame.
+  const grid = buildCscanGrid(scanData, params);
   const total = grid.hCount * grid.vCount;
+  // Source = SAR detections: the cell values are not drawn at all, only which cells were
+  // captured, with the SAR panel's confirmed pipes on top (lib/detectionOverlay.js).
+  const showDetections = !!(projection && projection.source === 'detections');
+  const pipes = showDetections
+    ? pipeOverlay(detection, params, handleEnds, (ix, iy) =>
+      ix >= 0 && ix < grid.hCount && iy >= 0 && iy < grid.vCount && !!grid.cells[iy * grid.hCount + ix],
+    { includeProbable: !!projection.showProbable })
+    : null;
 
   // Colour limits. Dynamic comes from the SHARED scale computed over the whole
   // grid (every bin of every valid cell, percentile-clipped), not from this
@@ -272,7 +281,7 @@ function drawCscan(canvas, grid, scanData, params, crosshair, selected, nextInde
   // value -- uncaptured, gated out, background-failed -- is still drawn as its
   // own sharp square on top, because those are statements about a cell rather
   // than measurements to be blended between.
-  const smoothed = smooth && drawSmoothField(ctx, canvas, grid, L, (ix, iy) => {
+  const smoothed = smooth && !showDetections && drawSmoothField(ctx, canvas, grid, L, (ix, iy) => {
     const cell = grid.cells[iy * grid.hCount + ix];
     if (!cell || cell.invalid || !isFinite(cell.value)) return null;
     return norm(cell.value, limitsFor(iy));
@@ -282,6 +291,21 @@ function drawCscan(canvas, grid, scanData, params, crosshair, selected, nextInde
     for (let ix = 0; ix < grid.hCount; ix++) {
       const cell = grid.cells[iy * grid.hCount + ix];
       const r = cellRect(ix, iy, L);
+      if (showDetections) {
+        // Only whether the cell was captured. Background status and cell values belong to
+        // the grid view; detection works from raw h_cal of its own.
+        if (cell) {
+          ctx.fillStyle = SCANNED_FILL;
+          ctx.fillRect(r.x, r.y, r.w, r.h);
+        } else {
+          ctx.fillStyle = EMPTY_FILL;
+          ctx.fillRect(r.x, r.y, r.w, r.h);
+          ctx.strokeStyle = EMPTY_STROKE;
+          ctx.lineWidth = 1;
+          ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+        }
+        continue;
+      }
       if (cell && cell.invalid) {
         // Captured, but no background could be produced for it. Drawn as an
         // explicit error rather than given a colour it has not earned.
@@ -326,6 +350,35 @@ function drawCscan(canvas, grid, scanData, params, crosshair, selected, nextInde
         ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
       }
     }
+  }
+
+  // Pipes. One band per (pipe, row), running from the line's position at the row's lower
+  // cell edge to its upper edge, so consecutive rows join into one continuous stripe and a
+  // leaning pipe is drawn leaning. White = confirmed, amber = probable; probable bands are
+  // drawn FIRST so a confirmed pipe is never painted over. Clipped to the grid box.
+  if (pipes && pipes.segments.length) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(L.originX, L.originY - L.gridH, L.gridW, L.gridH);
+    ctx.clip();
+    const ordered = [...pipes.segments].sort(
+      (a, b) => (a.rating === 'confirmed' ? 1 : 0) - (b.rating === 'confirmed' ? 1 : 0));
+    for (const sg of ordered) {
+      ctx.fillStyle = sg.rating === 'confirmed' ? PIPE_FILL : PROBABLE_FILL;
+      const yB = Math.round(L.originY - sg.iy * L.cellH);
+      const yT = Math.round(L.originY - (sg.iy + 1) * L.cellH);
+      const xB = L.originX + cellUnitsX(sg.xLowCm, params.hStep) * L.cellW;
+      const xT = L.originX + cellUnitsX(sg.xHighCm, params.hStep) * L.cellW;
+      const hw = Math.max(1, ((sg.widthCm / params.hStep) * L.cellW) / 2);
+      ctx.beginPath();
+      ctx.moveTo(xB - hw, yB);
+      ctx.lineTo(xB + hw, yB);
+      ctx.lineTo(xT + hw, yT);
+      ctx.lineTo(xT - hw, yT);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
   }
 
   // Chromeless is the projector's image: cells, the frame that bounds them and
@@ -456,8 +509,15 @@ function drawCscan(canvas, grid, scanData, params, crosshair, selected, nextInde
   // measured -- the cell values themselves are untouched, but the image is no
   // longer one flat tile per sample.
   const smoothTag = smoothed ? ' · SMOOTH' : '';
+  const rowsWithData = new Set(grid.cells.map((c, i) => (c ? Math.floor(i / grid.hCount) : -1)).filter(v => v >= 0)).size;
+  const detTag = !pipes ? ''
+    : pipes.usable ? `${pipes.confirmed} CONFIRMED${projection.showProbable ? ` · ${pipes.probable} PROBABLE` : ''} · ROWS ${pipes.rowsUsed.length}/${rowsWithData}`
+    : pipes.reason === 'seepage' ? 'SAR PANEL IN SEEPAGE MODE'
+    : pipes.reason === 'geometry' ? 'WAITING FOR DETECTION' : 'NO DETECTION YET';
   ctx.fillText(
-    `C-SCAN (${String(metric).toUpperCase()} @ ${gateStart}-${gateEnd} cm${isDiff ? ' · Δ MAG' : ''}${focusTag}${smoothTag})`,
+    showDetections
+      ? `C-SCAN · SAR DETECTIONS (${detTag})`
+      : `C-SCAN (${String(metric).toUpperCase()} @ ${gateStart}-${gateEnd} cm${isDiff ? ' · Δ MAG' : ''}${focusTag}${smoothTag})`,
     L.pad.left, 14);
   ctx.fillStyle = '#444444';
   ctx.font = '9px monospace';
@@ -478,6 +538,8 @@ function drawCscan(canvas, grid, scanData, params, crosshair, selected, nextInde
       L.pad.left + L.plotW / 2, 14);
   }
 
+  // No colour bar for SAR detections: nothing on the image is a colour-mapped value.
+  if (!showDetections) {
   // Colour bar. Under per-row scaling there is no single range that describes
   // the image, so it shows the SELECTED row's -- the one the B-scan pane beside
   // it is drawn with -- and is labelled PER ROW so it is not read as global.
@@ -531,6 +593,8 @@ function drawCscan(canvas, grid, scanData, params, crosshair, selected, nextInde
     ctx.restore();
   }
 
+  }
+
   // Hover readout
   if (crosshair) {
     const hit = cellAt(crosshair.x, crosshair.y, L, grid.hCount, grid.vCount);
@@ -544,6 +608,7 @@ function drawCscan(canvas, grid, scanData, params, crosshair, selected, nextInde
       const coord = `(${(hit.ix * hStep).toFixed(1)}, ${(hit.iy * vStep).toFixed(1)}) cm`;
       const order = `#${snakeOrderOf(hit, grid.hCount)}`;
       const val = !cell ? 'not captured'
+        : showDetections ? 'captured'
         : cell.invalid ? (BG_STATUS_TEXT[cell.status] || 'INVALID')
         : !isFinite(cell.value) ? 'outside gate'
         : isDiff ? `${cell.value >= 0 ? '+' : ''}${cell.value.toFixed(2)} dB`
@@ -570,21 +635,12 @@ export default function CscanDisplay({
   scanData, params, capturing, sfcwProgress, scaleMode, scaleRange,
   nextIndex, selectedCell, onSelectCell, scanMode, sharedScale, subMode,
   rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless,
-  smooth, colormap, cellValues,
+  smooth, colormap, detection, handleEnds,
 }) {
   const canvasRef = useRef(null);
   const animRef = useRef(null);
   const [crosshair, setCrosshair] = useState(null);
   const isLinear = scaleMode === 'linear';
-
-  // `cellValues` is optional: App computes it once for the panel, the projector
-  // and computeGridScales, so none of them repeat it. Omitted (or a stale one,
-  // which cannot happen here because it is memoised on the same scanData), this
-  // falls back to computing its own and behaves exactly as before.
-  const grid = useMemo(
-    () => buildCscanGrid(scanData, params, cellValues),
-    [scanData, params, cellValues],
-  );
 
   useEffect(() => {
     let start = null;
@@ -601,7 +657,7 @@ export default function CscanDisplay({
       if (start === null) start = t;
       // Breathing highlight on the next target cell, only while a capture is pending.
       const pulse = capturing ? 0.5 + 0.5 * Math.sin((t - start) / 180) : 0;
-      drawCscan(canvas, grid, scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless, smooth, colormap);
+      drawCscan(canvas, scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless, smooth, colormap, detection, handleEnds);
       if (win.closed) return;
       animRef.current = win.requestAnimationFrame(render);
     };
@@ -612,7 +668,7 @@ export default function CscanDisplay({
       // cancelling an unknown id is a no-op either way.
       if (animRef.current && !win.closed) win.cancelAnimationFrame(animRef.current);
     };
-  }, [grid, scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, capturing, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless, smooth, colormap]);
+  }, [scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, capturing, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless, smooth, colormap, detection, handleEnds]);
 
   const pick = (e) => {
     const rect = e.currentTarget.getBoundingClientRect();

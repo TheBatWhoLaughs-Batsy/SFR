@@ -25,6 +25,9 @@ import SarWorker from '../lib/sar.worker.js?worker';
 const SAR_INPUT_FIELDS = [
   'h_cal_real', 'h_cal_imag', 'magnitudes', 'distances',
   'lidar_standoff_mm', 'step_size', 'range_offset',
+  // The worker places aperture positions by grid column, so a missing cell leaves a
+  // gap instead of sliding every later position along by one pitch.
+  'grid_ix',
 ];
 
 function projectForSar(bscanData) {
@@ -35,20 +38,7 @@ function projectForSar(bscanData) {
   });
 }
 
-// `enabled` gates the whole thing on the SAR panel actually being open.
-//
-// Without it this reconstructs at EVERY row change of EVERY raster, whichever
-// panel the operator is looking at -- and the cost is not just the worker's own
-// time: projectForSar allocates a record per cell and postMessage then
-// structured-clones ~17 MB of it SYNCHRONOUSLY on the main thread (~70 ms at
-// 101x15), plus a fresh Worker is spawned each job. That is main-thread time
-// spent on an image nobody is looking at, during the traverse, which is exactly
-// when the browser must stay responsive enough to keep draining its websocket.
-//
-// Gating off deliberately KEEPS the last result rather than clearing it, so
-// switching panels does not blank the SAR image; it is superseded 300 ms after
-// the panel is opened again.
-export function useSarWorker(bscanData, bscanParams, enabled = true) {
+export function useSarWorker(bscanData, bscanParams) {
   const [sarResult, setSarResult] = useState(null);
   const [sarProgress, setSarProgress] = useState(null);
   const workerRef = useRef(null);
@@ -67,14 +57,6 @@ export function useSarWorker(bscanData, bscanParams, enabled = true) {
 
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
-
-    // Not being looked at: hold whatever was last reconstructed and schedule
-    // nothing. A job already in flight is left to finish -- it has already paid
-    // for its clone, and terminating it would only throw that away.
-    if (!enabled) {
-      setSarProgress(null);
-      return;
-    }
 
     if (!bscanData || bscanData.length < 2) {
       setSarResult(null);
@@ -105,7 +87,7 @@ export function useSarWorker(bscanData, bscanParams, enabled = true) {
       // Projected, not the raw records -- see SAR_INPUT_FIELDS above.
       worker.postMessage({ bscanData: projectForSar(bscanData), bscanParams });
     }, 300);
-  }, [bscanData, bscanParams, enabled]);
+  }, [bscanData, bscanParams]);
 
   return { sarResult, sarProgress };
 }

@@ -79,22 +79,6 @@ const MOVE_ACK_FLOOR_MS = 300;
 // against a position it can no longer see.
 const STATUS_STALE_MS = 4000;
 
-// How long the rover websocket may be down before the scan is abandoned.
-//
-// It used to abort on the FIRST tick with `roverConnected` false, which is a
-// hair trigger now that both Pi servers evict a client that fails to accept a
-// frame within 0.5 s (`_send_to_all` / `_fanout`) and useWebSocket reconnects
-// 500 ms later. A browser stalled by its own render work -- which is exactly
-// what a long raster does to it -- gets evicted through no fault of the rig, and
-// losing a minutes-long scan to a reconnect that resolves itself is a far worse
-// outcome than pausing for a second.
-//
-// What makes the pause SAFE is that the tick returns without acting: no move is
-// issued, no arrival is judged, nothing is captured, while the link is down.
-// A genuinely lost link still aborts, one second later; and STATUS_STALE_MS
-// above still covers the other case, a link that is up but silent.
-const LINK_GRACE_MS = 1000;
-
 // Half a step is 65 um on X and 2.5 um on Y, so a millimetre is far looser than
 // the mechanism -- it is here to catch a move that did not happen, not to judge
 // precision.
@@ -326,29 +310,8 @@ export function useRoverScan({
     const now = performance.now();
 
     if (!o.roverConnected || !status || !status.board_connected) {
-      // Hold, do not act, and abort only if it stays down. Nothing below this
-      // point runs while the link is out, so the machine cannot command or judge
-      // anything against a position it cannot see.
-      if (st.linkLostAt == null) {
-        st.linkLostAt = now;
-        st.linkMessage = st.message;
-        st.message = 'Rover link down — holding…';
-        publish();   // once, on the way down; the tick runs at 25 Hz
-      }
-      if (now - st.linkLostAt < LINK_GRACE_MS) return;
-      finish('error', null,
-        `Rover link lost for ${(LINK_GRACE_MS / 1000).toFixed(0)} s mid-scan — `
-        + 'position is no longer trustworthy.', false);
+      finish('error', null, 'Rover link lost mid-scan — position is no longer trustworthy.', false);
       return;
-    }
-    // Back, or never away. The stale-status clock below is deliberately NOT
-    // reset here: a link that drops and returns still has to prove the board is
-    // reporting again, and last_status_at doing so is what proves it.
-    if (st.linkLostAt != null) {
-      st.linkLostAt = null;
-      if (st.linkMessage != null) st.message = st.linkMessage;
-      st.linkMessage = null;
-      publish();   // once, on the way back up
     }
     if (status.estop) {
       finish('error', null, 'E-stop latched — scan aborted.', false);
@@ -633,10 +596,6 @@ export function useRoverScan({
 
     machine.current = {
       phase: 'homing',
-      // When the rover websocket first went down, or null while it is up, and
-      // the phase message to put back when it returns.
-      linkLostAt: null,
-      linkMessage: null,
       traverse: continuous ? 'continuous' : 'stepped',
       grid,
       total: stats.total,

@@ -38,15 +38,33 @@
 // costs 3 dB of per-cell SNR, because it splits the same sweeps across twice
 // as many cells.
 //
-// TIME BASE. Both streams are already stamped on the PI's clock -- sweeps by
-// sfcw_result.timestamp (stamped in _process_h_cal) and rover positions by
-// rover_status.last_status_at (the Pi's ingest of a board frame). So the
-// association is done against one clock and never against performance.now(),
-// which would fold two independent websocket latencies into the answer.
+// TIME BASE. A position is only as good as the time it is labelled with, and
+// the only thing that knows when a position was MEASURED is the board: every
+// status frame carries `ms`, its own clock (the step ISR's tick count -- the
+// same clock that generates the steps). The Pi forwards it as
+// rover_status.board_ms beside last_status_at, the Pi's time of RECEIPT.
+//
+// Receipt is not measurement. The R4's WiFi delivers frames late and in
+// bursts, and a frame processed after a stall in rover_server's board loop is
+// stamped later still. Keying the track on receipt bent the x-vs-time curve
+// wherever that happened. Measured on three 2026-09-13 exports: half of all
+// empty cells had neighbours ONE sweep apart that had been placed 5+ mm apart,
+// and one ~1.3 s stall piled 43 sweeps into a single cell and left the next 30
+// columns empty.
+//
+// So the track is keyed on BOARD time, and a sweep -- stamped on the Pi's clock
+// by sfcw_result.timestamp -- is converted onto it by createBoardClock below.
+// That conversion is one line fitted over a 30 s window, never a per-frame
+// offset, so link jitter cannot reach the positions at all. Neither side ever
+// touches performance.now(), which would fold two websocket latencies in.
+//
+// A Pi or firmware that sends no board_ms falls back to receipt time: the old
+// behaviour, holes and all. The panel's row readout says when that happens.
 //
 // What remains is a single constant: a sweep is stamped ~14 ms AFTER its own
-// phase centre, and a status frame is stamped after its WiFi transit. Their
-// difference is the caller's `latencyMs` -- one scalar per speed, default 0,
+// phase centre, and the clock fit places a measurement one MINIMUM link delay
+// (a few ms) after it happened rather than at zero. Their difference is the
+// caller's `latencyMs` -- one scalar per speed, default 0,
 // and measurable from an out-and-back pass over one row, where the spatial lag
 // between the two directions is exactly 2*v*tau. It is a BIAS, not noise: its
 // sign follows the direction of travel, so in a snake it displaces alternate
@@ -65,8 +83,106 @@ const TRACK_MAX = 600;
 // frame is O(n) at 11 Hz for no reason.
 const TRACK_TRIM = TRACK_MAX >> 2;
 
+// History the board-clock fit looks at, in board seconds. Long enough that the
+// frames which happened to cross the link fastest span a wide baseline -- the
+// drift estimate is only as good as that baseline -- and short enough that the
+// two oscillators' rate difference is a straight line across it.
+const CLOCK_WINDOW_S = 30;
+
+// Largest board-vs-Pi rate difference believed, as a fraction. A fitted slope
+// past this is not oscillator drift but something else -- a Pi clock step, or
+// the first handful of frames after a reset -- and the fit falls back to a
+// pure offset rather than extrapolating a wild slope.
+const CLOCK_MAX_SKEW = 0.01;
+
 /**
- * Rover position history, queried by Pi wall-clock time.
+ * Maps Pi wall-clock time onto the rover board's clock.
+ *
+ * Every status frame gives one pair: when the board measured it (board
+ * seconds) and when the Pi received it (Pi seconds). Their difference is the
+ * clock offset PLUS that frame's transit delay, and a delay can only ever be
+ * positive. So the offset is not the average of the differences -- that carries
+ * the average delay, stalls and all -- but their LOWER boundary: the frames that
+ * happened to cross fastest.
+ *
+ * The boundary is a line, not a constant, because two oscillators never run at
+ * exactly the same rate. It is fitted the standard way for one-way delay
+ * measurements (Moon, Skelly & Towsley, 1999): take the lower convex hull of the
+ * points, and of its edges the one spanning the window's mean time, which is the
+ * line lying under every point with the least total gap. A delayed frame,
+ * however late, lies above the hull and changes nothing. That is the whole
+ * robustness argument, and why a 1 s stall that wrecked receipt-timed positions
+ * does not move this fit at all.
+ *
+ * Accuracy is set by the fastest frames, not the typical ones: the mapping
+ * lands one MINIMUM link delay after truth, a constant that the raster's
+ * latency setting absorbs like every other fixed offset.
+ */
+export function createBoardClock(windowS = CLOCK_WINDOW_S) {
+  let bs = [], ds = [];
+  let model = null;
+
+  function observe(boardS, recvS) {
+    bs.push(boardS);
+    ds.push(recvS - boardS);
+    // Trimmed in chunks, not per frame, for the same reason as the track.
+    if (bs[0] < boardS - windowS * 1.25) {
+      let k = 0;
+      while (bs[k] < boardS - windowS) k++;
+      bs = bs.slice(k); ds = ds.slice(k);
+    }
+    model = null;
+  }
+
+  function fit() {
+    const n = bs.length;
+    if (n === 0) return null;
+    // Lower hull, left to right. Board times are strictly increasing (the track
+    // refuses anything else), so no sort is needed.
+    const hull = [];
+    for (let i = 0; i < n; i++) {
+      while (hull.length >= 2) {
+        const a = hull[hull.length - 2], b = hull[hull.length - 1];
+        const cross = (bs[b] - bs[a]) * (ds[i] - ds[a]) - (ds[b] - ds[a]) * (bs[i] - bs[a]);
+        if (cross > 0) break;
+        hull.pop();
+      }
+      hull.push(i);
+    }
+    if (hull.length >= 2) {
+      let mean = 0;
+      for (let i = 0; i < n; i++) mean += bs[i];
+      mean /= n;
+      let j = 0;
+      while (j < hull.length - 2 && bs[hull[j + 1]] < mean) j++;
+      const a = hull[j], b = hull[j + 1];
+      const skew = (ds[b] - ds[a]) / (bs[b] - bs[a]);
+      if (Math.abs(skew) <= CLOCK_MAX_SKEW) return { b0: bs[a], d0: ds[a], skew };
+    }
+    let d0 = Infinity;
+    for (let i = 0; i < n; i++) if (ds[i] < d0) d0 = ds[i];
+    return { b0: bs[n - 1], d0, skew: 0 };
+  }
+
+  const current = () => model || (model = fit());
+
+  return {
+    observe,
+    // Pi seconds -> board seconds, inverting  pi = b + d0 + skew*(b - b0).
+    toBoard(piS) {
+      const m = current();
+      if (!m) return null;
+      return (piS - m.d0 + m.skew * m.b0) / (1 + m.skew);
+    },
+    model: current,
+    size: () => bs.length,
+    reset() { bs = []; ds = []; model = null; },
+  };
+}
+
+/**
+ * Rover position history, queried by Pi wall-clock time and keyed on the time
+ * each position was measured (board time, when the Pi forwards it).
  *
  * at() INTERPOLATES ONLY and returns null outside the samples it holds. It
  * deliberately never extrapolates: a sweep whose timestamp is newer than the
@@ -78,33 +194,57 @@ const TRACK_TRIM = TRACK_MAX >> 2;
  * a row, where the ramps are.
  */
 export function createTrack(maxSamples = TRACK_MAX) {
-  let ts = [], xs = [], ys = [];
+  let ks = [], xs = [], ys = [];
+  // 'board' (keys are board seconds) or 'pi' (keys are Pi receipt seconds, the
+  // fallback). Keys on two different clocks can be neither ordered nor
+  // interpolated between, so one track never holds both.
+  let timebase = null;
+  const clock = createBoardClock();
 
-  function push({ t, x, y }) {
+  function clear() {
+    ks = []; xs = []; ys = [];
+    timebase = null;
+    clock.reset();
+  }
+
+  function push({ t, boardMs, x, y }) {
     if (!isFinite(t) || !isFinite(x)) return false;
-    const n = ts.length;
-    // Monotonic only. A frame stamped no later than the newest we hold is a
-    // duplicate or a clock step; either way it would make the bracket search
-    // below ambiguous, and there is nothing to gain by sorting it in.
-    if (n && t <= ts[n - 1]) return false;
-    ts.push(t); xs.push(x); ys.push(isFinite(y) ? y : 0);
-    if (ts.length > maxSamples) {
-      ts = ts.slice(TRACK_TRIM); xs = xs.slice(TRACK_TRIM); ys = ys.slice(TRACK_TRIM);
+    const onBoard = Number.isFinite(boardMs);
+    // The Pi or the firmware changed underneath us. Start over, not guess.
+    if (timebase && timebase !== (onBoard ? 'board' : 'pi')) clear();
+    const k = onBoard ? boardMs / 1000 : t;
+    const n = ks.length;
+    if (n && k <= ks[n - 1]) {
+      // Equal: the Pi re-broadcast the frame we already hold (it broadcasts on
+      // `done`, log lines, config changes). Earlier on the Pi clock: a clock
+      // step, which would make the bracket search ambiguous -- ignored.
+      if (!onBoard || k === ks[n - 1]) return false;
+      // Earlier on the BOARD clock: the board restarted, since its clock counts
+      // from power-up (or, after 49.7 days of uptime, wrapped). The history
+      // belongs to a clock that no longer exists.
+      clear();
+    }
+    timebase = onBoard ? 'board' : 'pi';
+    if (onBoard) clock.observe(k, t);
+    ks.push(k); xs.push(x); ys.push(isFinite(y) ? y : 0);
+    if (ks.length > maxSamples) {
+      ks = ks.slice(TRACK_TRIM); xs = xs.slice(TRACK_TRIM); ys = ys.slice(TRACK_TRIM);
     }
     return true;
   }
 
   function at(time) {
-    const n = ts.length;
+    const n = ks.length;
     if (n < 2 || !isFinite(time)) return null;
-    if (time < ts[0] || time > ts[n - 1]) return null;
+    const k = timebase === 'board' ? clock.toBoard(time) : time;
+    if (k === null || k < ks[0] || k > ks[n - 1]) return null;
     let lo = 0, hi = n - 1;
     while (hi - lo > 1) {
       const mid = (lo + hi) >> 1;
-      if (ts[mid] <= time) lo = mid; else hi = mid;
+      if (ks[mid] <= k) lo = mid; else hi = mid;
     }
-    const span = ts[hi] - ts[lo];
-    const f = span > 0 ? (time - ts[lo]) / span : 0;
+    const span = ks[hi] - ks[lo];
+    const f = span > 0 ? (k - ks[lo]) / span : 0;
     return {
       x: xs[lo] + f * (xs[hi] - xs[lo]),
       y: ys[lo] + f * (ys[hi] - ys[lo]),
@@ -116,11 +256,10 @@ export function createTrack(maxSamples = TRACK_MAX) {
   }
 
   return {
-    push, at,
-    newest: () => (ts.length ? ts[ts.length - 1] : null),
-    oldest: () => (ts.length ? ts[0] : null),
-    size: () => ts.length,
-    clear: () => { ts = []; xs = []; ys = []; },
+    push, at, clear,
+    size: () => ks.length,
+    timebase: () => timebase,
+    clockModel: () => (timebase === 'board' ? clock.model() : null),
   };
 }
 
@@ -279,8 +418,9 @@ const PENDING_MAX = 400;
  * the row boundaries are exactly the parts that are hard to reason about and
  * impossible to check from the UI.
  *
- * Both streams are fed with PI wall-clock times: `sfcw_result.timestamp` for a
- * sweep and `rover_status.last_status_at` for a position.
+ * A sweep is fed with its Pi timestamp, `sfcw_result.timestamp`. A position is
+ * fed with `rover_status.last_status_at` (Pi receipt) and `board_ms` (board
+ * measurement); the track keys on the second whenever it is present.
  */
 export function createRowCollector() {
   const track = createTrack();
@@ -288,9 +428,6 @@ export function createRowCollector() {
   let bin = null;
   let geom = null;
   let latencyS = 0;
-  // Sweeps discarded because no interpolant could ever exist for them -- see
-  // drain(). Reported so a row that lost sweeps this way says so.
-  let stranded = 0;
 
   // Resolve everything the track can now bracket. Called from BOTH sockets: a
   // sweep arriving may already be placeable, and a position arriving may place
@@ -300,25 +437,10 @@ export function createRowCollector() {
     let i = 0;
     for (; i < pending.length; i++) {
       const item = pending[i];
-      const t = item.t - latencyS;
-      const at = track.at(t);
-      if (at === null) {
-        // `at` returns null for TWO different reasons and they need opposite
-        // handling. Too NEW is the normal one -- the bracketing status frame has
-        // not arrived yet (~91 ms at 11 Hz) -- and since entries are in
-        // timestamp order nothing after it is resolvable either, so stop.
-        const newest = track.newest();
-        if (newest === null || t > newest) break;
-        // Too OLD, or the track holds fewer than two samples: no interpolant can
-        // ever exist for this sweep. Breaking on it would park it at the head of
-        // the queue for ever and every sweep behind it with it -- the row would
-        // simply stop filling, with nothing saying why. Drop it and carry on.
-        // It takes a position outage longer than the track's ~55 s of history to
-        // reach, so it should never fire; that is exactly why it must not be the
-        // case that silently wedges the raster if it does.
-        stranded += 1;
-        continue;
-      }
+      const at = track.at(item.t - latencyS);
+      // Not yet bracketed. Entries are pushed in timestamp order, so nothing
+      // after this one can be resolvable either -- stop rather than scan on.
+      if (at === null) break;
       // A sweep resolving outside the grid is DROPPED, not clamped: the
       // traverse deliberately overruns both ends of the row so the ramps (where
       // interpolating between status frames is wrong by half an acceleration
@@ -346,7 +468,6 @@ export function createRowCollector() {
     openRow(g) {
       geom = g;
       pending = [];
-      stranded = 0;
       bin = createRowBin({
         iy: g.iy, hCount: g.hCount, hStepMm: g.hStepMm, originXMm: g.originXMm,
       });
@@ -363,13 +484,8 @@ export function createRowCollector() {
         geom,
         cells: bin.cells(),
         summary: {
-          ...bin.summary(), pending: 0,
-          // Both kinds of sweep that never reached a cell: the ones still
-          // waiting for a position that will now never come (by construction
-          // these lie in the overrun past the last cell), and any the track
-          // could never bracket at all.
-          stranded: pending.length + stranded,
-          done: true,
+          ...bin.summary(), pending: 0, stranded: pending.length, done: true,
+          timebase: track.timebase(),
         },
       };
       bin = null; geom = null; pending = [];
@@ -387,8 +503,10 @@ export function createRowCollector() {
     // second thing to keep in step with buildCellRecord.
     liveRow: () => (bin ? { geom, cells: bin.cells(), kept: bin.summary().kept } : null),
     isOpen: () => bin !== null,
-    summary: () => (bin ? { ...bin.summary(), pending: pending.length, stranded } : null),
+    summary: () => (bin
+      ? { ...bin.summary(), pending: pending.length, timebase: track.timebase() }
+      : null),
     trackSize: () => track.size(),
-    reset() { bin = null; geom = null; pending = []; stranded = 0; track.clear(); },
+    reset() { bin = null; geom = null; pending = []; track.clear(); },
   };
 }

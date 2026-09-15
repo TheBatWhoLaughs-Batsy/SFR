@@ -2,7 +2,9 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 
 const RECONNECT_INTERVAL = 500;
 
-export function useWebSocket(url, onMessage) {
+// options.decodeBinary(arrayBuffer) -> message object, or null if the frame is not
+// one it understands. Without it binary frames are ignored, as before.
+export function useWebSocket(url, onMessage, options) {
   const [status, setStatus] = useState('disconnected');
   const wsRef = useRef(null);
   const reconnectTimer = useRef(null);
@@ -10,6 +12,9 @@ export function useWebSocket(url, onMessage) {
   onMessageRef.current = onMessage;
   const urlRef = useRef(url);
   urlRef.current = url;
+  const decodeBinaryRef = useRef(options?.decodeBinary);
+  decodeBinaryRef.current = options?.decodeBinary;
+  const binaryWarnedRef = useRef(false);
 
   const connect = useCallback(() => {
     const cur = wsRef.current;
@@ -25,6 +30,9 @@ export function useWebSocket(url, onMessage) {
 
     setStatus('reconnecting');
     const ws = new WebSocket(target);
+    // ArrayBuffer rather than Blob so binary frames decode synchronously and stay in
+    // arrival order. Text frames are unaffected.
+    ws.binaryType = 'arraybuffer';
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -34,6 +42,25 @@ export function useWebSocket(url, onMessage) {
     };
 
     ws.onmessage = (event) => {
+      if (typeof event.data !== 'string') {
+        const decode = decodeBinaryRef.current;
+        if (!decode) return;
+        let msg = null;
+        try {
+          msg = decode(event.data);
+        } catch (err) {
+          msg = null;
+          if (!binaryWarnedRef.current) console.warn(`[ws] ${target}: binary frame failed to decode`, err);
+        }
+        if (msg) {
+          onMessageRef.current?.(msg);
+        } else if (!binaryWarnedRef.current) {
+          // Once per hook, not per frame: at 100 Hz a per-frame warning would bury the console.
+          binaryWarnedRef.current = true;
+          console.warn(`[ws] ${target}: ignoring a binary frame this client does not understand`);
+        }
+        return;
+      }
       try {
         const msg = JSON.parse(event.data);
         onMessageRef.current?.(msg);

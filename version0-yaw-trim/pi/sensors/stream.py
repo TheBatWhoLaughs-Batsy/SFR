@@ -9,7 +9,7 @@ import signal
 import websockets
 
 from bno085 import BNO085
-from tflc02 import TFLC02
+from tflc02 import TFLC02, is_link_reason, is_out_of_range_reason
 from imu_calibration import CalibratedIMU
 
 clients = set()
@@ -45,6 +45,75 @@ LIDAR_POLL_HZ = 200
 # it cannot fire between two genuinely-new measurements.
 LIDAR_STABLE_REPUBLISH_S = 0.25
 
+# How long the LiDAR must fail CONTINUOUSLY before it is worth a log line.
+#
+# Scattered single failures are normal and must stay silent: a non-zero error
+# code at a poor target angle is documented at 30-40% of reads on this bench,
+# and a line per occurrence would be ~60/s of noise that trains the operator to
+# ignore the one line a real fault prints (the same trap the `_sweep_core`
+# 2-tuple error fell into). 1.0 s is not an arbitrary threshold -- it is exactly
+# LIDAR_CARRY_MS in App.jsx, i.e. the point at which the groundstation stops
+# carrying the last good reading forward and `lidar_standoff_mm` actually goes
+# null. Past here, C-scan cells start recording a null standoff and (under a BG
+# model) rendering as INVALID red crosses, so anything this log reports is
+# something the operator is about to see on screen.
+LIDAR_DROPOUT_WARN_S = 1.0
+
+# A dropout that persists gets one progress line at this interval rather than
+# silence, so a long one is distinguishable from a hung process.
+LIDAR_DROPOUT_REPEAT_S = 15.0
+
+# The three TF-LC02 heads, PRIMARY FIRST. Order is load-bearing, not cosmetic.
+#
+# The packet's top-level `lidar` / `lidar_seq` / `lidar_ts` / `lidar_err` /
+# `lidar_last_good_*` fields mirror the FIRST port in this list, and those are the
+# fields the entire groundstation reads: App.jsx's `lidarMm` (so the SFCW, C-scan
+# and BG Model standoff readouts), bgContinuous.js's standoff track, every C-scan
+# cell's `lidar_standoff_mm`, the BG model's input, SAR's per-position standoff
+# correction, and rover_server's yaw controller (which dedupes on `lidar_seq`).
+#
+# So the FORWARD-facing head must be first: it is the one the radar antenna looks
+# along. On 2026-09-15 the heads were re-wired -- forward is now uart2, right-facing
+# is uart3, down-facing is uart1 -- so /dev/ttyAMA2 is first. Before that date the
+# standoff came from uart3. Records captured before the swap were measured against
+# whichever head was forward then; if the forward head's MOUNTING changed with the
+# re-wire, re-measure the LiDAR->antenna offset and treat existing BG models and
+# Super Fit references as suspect. The other heads are published ALONGSIDE the
+# primary under `lidars` (the Handheld panel reads them), never in place of it.
+LIDAR_PORTS_DEFAULT = ['/dev/ttyAMA2', '/dev/ttyAMA3', '/dev/ttyAMA1']
+
+
+def lidar_name(port):
+    """Short stable key for a LiDAR, used for logging and the `lidars` packet field.
+
+    /dev/ttyAMA3 -> uart3, which is how the wiring, config.txt and the operator all
+    refer to these. Falls back to the bare device name for anything else, so an
+    unusual port is still distinguishable rather than colliding."""
+    base = port.rsplit('/', 1)[-1]
+    if base.startswith('ttyAMA') and base[6:].isdigit():
+        return f'uart{base[6:]}'
+    return base
+
+
+def _lidar_entry(port, st, now):
+    """One head's public view, as published under the packet's `lidars` field.
+
+    Field names are deliberately NOT the `lidar_*` spellings used at the top level:
+    those are a flat legacy namespace and these are already scoped by the head's
+    key, so `lidars.uart1.mm` reads better than `lidars.uart1.lidar_mm`. `now` is
+    passed in rather than read here so every head in one packet is aged against the
+    same instant."""
+    return {
+        'port': port,
+        'mm': st['dist'],
+        'seq': st['seq'],
+        'ts': st['ts'],
+        'err': st['err'],
+        'last_good_mm': st['good_mm'],
+        'last_good_age_s': (None if st['good_t'] is None
+                            else now - st['good_t']),
+    }
+
 
 async def register(ws):
     clients.add(ws)
@@ -52,11 +121,84 @@ async def register(ws):
         await ws.wait_closed()
     finally:
         clients.discard(ws)
+        _send_fails.pop(ws, None)
+
+
+# How long one client gets to accept a frame before it is dropped as dead.
+#
+# `websockets.send()` awaits until the frame reaches the transport, and there
+# used to be no bound on that -- so a single client that stopped draining (a
+# browser whose main thread is wedged, or a tab killed without a FIN, which
+# leaves a half-open TCP connection the 20 s keepalive has not reaped yet)
+# blocked this loop and took EVERY other client down with it.
+#
+# Measured 2026-09-11, one client that never reads: a healthy client alongside
+# it went from 48.3 Hz with a 25 ms worst gap to 34.0 Hz with a **10,000 ms**
+# worst gap. That is exactly the reported symptom -- the standoff readout
+# freezing for 5-10 s while the Pi-side LiDAR was provably healthy (zero dropout
+# lines in the log across the whole period). It is a LiDAR blackout in the UI
+# that has nothing to do with the LiDAR.
+#
+# 0.5 s matches `_send_to_all` in sdr_server.py and `_fanout` in
+# rover_server.py, which were fixed for the identical bug. A client that cannot
+# take a frame in half a second is not rendering it anyway, and the
+# groundstation reconnects in RECONNECT_INTERVAL = 500 ms -- so dropping it
+# costs that client ~1 s of data and costs every other client nothing, against
+# the 10 s freeze it inflicts on all of them if it is kept.
+BROADCAST_TIMEOUT_S = 0.5
+
+# Consecutive timeouts before a client is dropped. One timeout is not evidence of
+# a dead client -- the groundstation holds THREE sockets (9001 sensor, 9002 rover,
+# 9003 SDR) drained by one main thread, so a GC pause or a heavy C-scan derive can
+# blow a single 0.5 s deadline on a tab that is otherwise perfectly healthy.
+# Evicting it there would force a reconnect, and a reconnect gap past
+# LIDAR_CARRY_MS is itself a null standoff and therefore an INVALID C-scan cell --
+# i.e. the cure would cause the disease.
+#
+# Three strikes still evicts a genuinely dead client in ~1.5 s, and costs the other
+# clients nothing worse than 2 Hz for that period (gather sends concurrently, so
+# healthy clients get each frame immediately; only the loop's next iteration is
+# delayed). 2 Hz keeps readings flowing well inside the 1 s carry window, so even
+# the eviction interval cannot produce a null standoff.
+BROADCAST_FAIL_LIMIT = 3
+_send_fails = {}
 
 
 async def broadcast(msg):
-    if clients:
-        await asyncio.gather(*(c.send(msg) for c in clients), return_exceptions=True)
+    if not clients:
+        return
+    # Snapshot: `clients` is mutated by register()'s add/discard on this same
+    # event loop, so every await below is a point at which the set can change
+    # underneath an iterator. stream.py happened to be safe (the generator was
+    # unpacked before the first await) where rover_server.py was not and raised
+    # `Set changed size during iteration`; taking a copy makes it safe by
+    # construction rather than by accident.
+    targets = list(clients)
+    results = await asyncio.gather(
+        *(asyncio.wait_for(c.send(msg), BROADCAST_TIMEOUT_S) for c in targets),
+        return_exceptions=True)
+    for c, r in zip(targets, results):
+        if isinstance(r, BaseException):
+            n = _send_fails.get(c, 0) + 1
+            _send_fails[c] = n
+            if n >= BROADCAST_FAIL_LIMIT:
+                print(f"[sensors] dropping client after {n} consecutive send "
+                      f"failures ({type(r).__name__})", flush=True)
+                clients.discard(c)
+                _send_fails.pop(c, None)
+                # Fire-and-forget: awaiting close() here would reintroduce
+                # exactly the unbounded wait this function exists to remove.
+                asyncio.create_task(_close_quietly(c))
+        else:
+            # CONSECUTIVE, so a tab that hiccups once an hour is never evicted.
+            _send_fails.pop(c, None)
+
+
+async def _close_quietly(ws):
+    try:
+        await ws.close()
+    except Exception:
+        pass
 
 
 async def imu_poll_loop(imu, state):
@@ -86,9 +228,16 @@ async def imu_poll_loop(imu, state):
                 return
 
 
-async def lidar_poll_loop(lidar, state, rate=LIDAR_POLL_HZ):
-    """Reads the LiDAR in its own loop, publishing the latest reading into
-    `state`.
+async def lidar_poll_loop(lidar, state, rate=LIDAR_POLL_HZ, label='lidar',
+                          primary=True):
+    """Reads one LiDAR in its own loop, publishing the latest reading into `state`.
+
+    One task per head, each with its own `state`, so the heads are fully
+    independent: a head that is unplugged, dark or out of range blocks only its
+    own 100 ms UART timeout and cannot slow, stall or null another. `label` names
+    the head in every log line -- with three of them a bare "LiDAR recovered"
+    would be unattributable -- and `primary` selects the dropout hint, because
+    only the primary head's standoff reaches the C-scan/BG-model path.
 
     Polled at LIDAR_POLL_HZ (200), which is far above the sensor's own 11-17 Hz
     measurement rate ON PURPOSE -- see the constant for why: fast polling buys a
@@ -118,33 +267,118 @@ async def lidar_poll_loop(lidar, state, rate=LIDAR_POLL_HZ):
     interval = 1.0 / rate if rate and rate > 0 else 0.0
     last_dist = None
     last_pub = 0.0
+    # State for the dropout log. `reasons` tallies WHY the reads in the current
+    # failure run failed, which is the whole point: a run of `sensor:4` is the
+    # module saying it cannot range the target (aim the head), a run of
+    # `link:no_bytes` is the module not answering (check power/wiring). Those
+    # two were indistinguishable before 2026-09-11 and sent the last
+    # investigation after the cables for days.
+    fail_since = None
+    fail_reasons = {}
+    fail_reported = False
+    fail_last_report = 0.0
+
+    def summarise(reasons):
+        parts = sorted(reasons.items(), key=lambda kv: -kv[1])
+        return ', '.join(f'{k} x{v}' for k, v in parts[:4])
+
     while True:
         t0 = time.monotonic()
         try:
-            dist = await loop.run_in_executor(None, lidar.read_distance)
-            state['dist'] = dist
-            if dist is not None:
-                now = time.time()
-                # A changed value is unambiguously a new measurement. An
-                # unchanged one is ambiguous, so it is republished only once it
-                # has outlived any plausible internal period.
-                if dist != last_dist or (now - last_pub) >= LIDAR_STABLE_REPUBLISH_S:
-                    state['seq'] += 1
-                    state['ts'] = now
-                    last_pub = now
-                last_dist = dist
-            fail_streak = 0
+            dist, reason = await loop.run_in_executor(None, lidar.read_distance_detail)
         except Exception as e:
             fail_streak += 1
             if fail_streak == 1:
-                print(f"WARNING: LiDAR read failed ({e!r})")
-            state['dist'] = None
+                print(f"WARNING: [{label}] LiDAR read raised ({e!r})", flush=True)
+            dist, reason = None, f'exception:{type(e).__name__}'
+        else:
+            fail_streak = 0
+
+        state['dist'] = dist
+        state['err'] = None if dist is not None else reason
+
+        if dist is not None:
+            now = time.time()
+            state['good_mm'] = dist
+            state['good_t'] = now
+            # A changed value is unambiguously a new measurement. An unchanged
+            # one is ambiguous, so it is republished only once it has outlived
+            # any plausible internal period.
+            if dist != last_dist or (now - last_pub) >= LIDAR_STABLE_REPUBLISH_S:
+                state['seq'] += 1
+                state['ts'] = now
+                last_pub = now
+            last_dist = dist
+            if fail_reported:
+                dur = t0 - fail_since
+                print(f"[{label}] LiDAR recovered after {dur:.1f}s "
+                      f"({summarise(fail_reasons)}); reading {dist} mm", flush=True)
+            fail_since = None
+            fail_reasons = {}
+            fail_reported = False
+        else:
+            if fail_since is None:
+                fail_since = t0
+                fail_reasons = {}
+                fail_reported = False
+            fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+            dur = t0 - fail_since
+            # Silent below the threshold: scattered invalid returns are normal
+            # and the groundstation carries the last good reading across them.
+            due = (not fail_reported and dur >= LIDAR_DROPOUT_WARN_S) or \
+                  (fail_reported and (t0 - fail_last_report) >= LIDAR_DROPOUT_REPEAT_S)
+            if due:
+                fail_reported = True
+                fail_last_report = t0
+                link = any(is_link_reason(r) for r in fail_reasons)
+                oor = sum(v for r, v in fail_reasons.items() if is_out_of_range_reason(r))
+                total = sum(fail_reasons.values())
+                if link:
+                    hint = "module NOT answering -- check power/wiring/baud"
+                elif oor > 0.5 * total:
+                    # Not a fault. The module is healthy and the target is simply
+                    # beyond what it can measure; it says so with the 8888 sentinel.
+                    hint = ("target OUT OF RANGE -- the module is working and "
+                            "returns its 8888 sentinel. Aim it at something closer")
+                else:
+                    hint = ("module IS answering and reports no valid return -- "
+                            "aim/reflectivity, not wiring")
+                # Only the primary head feeds the standoff every downstream
+                # consumer reads, so only it can invalidate a capture. Saying so
+                # for an auxiliary head would send the operator looking for
+                # damage that cannot exist -- and a warning that overstates its
+                # consequences is how a log line gets learned and then ignored.
+                impact = ("Standoff is null downstream; C-scan cells captured now "
+                          "will be INVALID under a BG model."
+                          if primary else
+                          "Auxiliary head: no effect on standoff or captures.")
+                print(f"WARNING: [{label}] no valid LiDAR reading for {dur:.1f}s "
+                      f"[{summarise(fail_reasons)}] -- {hint}. {impact}", flush=True)
+
         if interval:
             await asyncio.sleep(max(0, interval - (time.monotonic() - t0)))
 
 
-async def sensor_loop(rate, skip_cal=False, lidar_rate=LIDAR_POLL_HZ):
-    lidar = TFLC02()
+async def sensor_loop(rate, skip_cal=False, lidar_rate=LIDAR_POLL_HZ,
+                      lidar_ports=None):
+    # Each head is opened independently and a failure to open is a warning, not a
+    # raise. This is the same invariant the IMU already has and it exists for the
+    # same reason: on 2026-08-24 an IMU constructor throwing took the LiDAR down
+    # with it and presented as "the lidar isn't working". With three heads the
+    # equivalent is worse -- one unplugged auxiliary head would cost the primary
+    # standoff and therefore every capture. A missing head is simply absent from
+    # `lidars`; the rest stream normally.
+    lidar_ports = list(lidar_ports or LIDAR_PORTS_DEFAULT)
+    lidars = []          # [(name, port, TFLC02)] in the requested order
+    for port in lidar_ports:
+        try:
+            lidars.append((lidar_name(port), port, TFLC02(port=port)))
+        except Exception as e:
+            print(f"WARNING: LiDAR on {port} ({lidar_name(port)}) failed to open "
+                  f"({e!r}), continuing without it", flush=True)
+    if not lidars:
+        print("WARNING: no LiDAR opened on any of "
+              f"{', '.join(lidar_ports)} -- streaming without standoff", flush=True)
 
     imu = None
     try:
@@ -154,7 +388,9 @@ async def sensor_loop(rate, skip_cal=False, lidar_rate=LIDAR_POLL_HZ):
     except Exception as e:
         print(f"WARNING: IMU init failed ({e!r}), streaming without IMU")
 
-    print(f"TF-LC02 on {lidar.ser.port}")
+    for i, (name, port, _) in enumerate(lidars):
+        print(f"TF-LC02 on {port} as '{name}'"
+              f"{'  <- PRIMARY (top-level lidar fields)' if i == 0 else ''}")
 
     interval = 1.0 / rate
     print(f"Streaming sensors at {rate}Hz on ws://0.0.0.0:9001")
@@ -163,16 +399,35 @@ async def sensor_loop(rate, skip_cal=False, lidar_rate=LIDAR_POLL_HZ):
     # seq increments once per distinct MEASUREMENT (see lidar_poll_loop), so a
     # consumer can dedupe both the repeats that come from broadcasting faster
     # than the LiDAR updates and the repeats that come from polling faster.
-    lidar_state = {'dist': None, 'seq': 0, 'ts': None}
-    print(f"LiDAR polled at {lidar_rate}Hz "
-          f"(sensor measures internally at ~11-17Hz; seq counts measurements, not polls)")
-    poll_tasks = [asyncio.create_task(lidar_poll_loop(lidar, lidar_state, lidar_rate))]
+    # One state dict per head; they never share, so a dropout on one cannot
+    # blank another.
+    lidar_states = {name: {'dist': None, 'seq': 0, 'ts': None, 'err': None,
+                           'good_mm': None, 'good_t': None}
+                    for name, _, _ in lidars}
+    # The primary's state object, reused below for the legacy top-level fields.
+    # An empty dict when no head opened at all, so the packet keeps its shape
+    # (all-null) rather than the broadcast loop raising on every iteration.
+    primary_name = lidars[0][0] if lidars else None
+    primary_state = (lidar_states[primary_name] if primary_name else
+                     {'dist': None, 'seq': 0, 'ts': None, 'err': None,
+                      'good_mm': None, 'good_t': None})
+    if lidars:
+        print(f"LiDAR polled at {lidar_rate}Hz "
+              f"(sensor measures internally at ~11-17Hz; seq counts measurements, not polls)")
+    poll_tasks = [
+        asyncio.create_task(lidar_poll_loop(dev, lidar_states[name], lidar_rate,
+                                            label=name, primary=(i == 0)))
+        for i, (name, _, dev) in enumerate(lidars)]
     if imu is not None:
         poll_tasks.append(asyncio.create_task(imu_poll_loop(imu, imu_state)))
 
     try:
         while True:
             t0 = time.monotonic()
+            # One wall-clock instant for the whole packet: the per-head ages and
+            # `timestamp` are then mutually consistent rather than each drifting
+            # by however long the dict took to build.
+            now = time.time()
 
             packet = {
                 'accel': imu_state['accel'],
@@ -184,13 +439,38 @@ async def sensor_loop(rate, skip_cal=False, lidar_rate=LIDAR_POLL_HZ):
                 # enabled. rover_server's yaw controller consumes this.
                 'yaw_deg': imu_state['yaw_deg'],
                 'quat': imu_state['quat'],
-                'lidar': lidar_state['dist'],
+                'lidar': primary_state['dist'],
                 # Provenance for the LiDAR sample: seq identifies the
                 # MEASUREMENT and ts is when that measurement was first seen
                 # (not when this packet was sent, and not when it was re-read).
-                'lidar_seq': lidar_state['seq'],
-                'lidar_ts': lidar_state['ts'],
-                'timestamp': time.time(),
+                'lidar_seq': primary_state['seq'],
+                'lidar_ts': primary_state['ts'],
+                # Why the most recent read failed, or None when it succeeded.
+                # `lidar` going null says only THAT a read failed; this says
+                # which of five distinct causes it was. Additive fields -- a
+                # groundstation that predates them simply ignores them.
+                'lidar_err': primary_state['err'],
+                # The last reading that was actually valid, and how old it is.
+                # `lidar` is wiped to null by a SINGLE failed read, so on a
+                # bench where 30-40% of reads return a non-zero error code it
+                # flaps at high rate even when the sensor is perfectly healthy.
+                # Publishing the last good value with its age lets a consumer
+                # distinguish "one bad read" from "the sensor has been dark for
+                # nine seconds" without having to reconstruct that itself.
+                'lidar_last_good_mm': primary_state['good_mm'],
+                'lidar_last_good_age_s': (
+                    None if primary_state['good_t'] is None
+                    else now - primary_state['good_t']),
+                # Every head, including the primary, keyed by uart name. PURELY
+                # ADDITIVE: the fields above keep their exact meaning and a
+                # groundstation that predates this ignores these two, which is the
+                # same rule `lidar_err` and `lidar_last_good_*` were added under.
+                # `lidar_primary` names which entry the legacy fields mirror, so a
+                # consumer never has to assume the ordering.
+                'lidar_primary': primary_name,
+                'lidars': {name: _lidar_entry(port, lidar_states[name], now)
+                           for name, port, _ in lidars},
+                'timestamp': now,
             }
 
             await broadcast(json.dumps(packet))
@@ -209,7 +489,11 @@ async def sensor_loop(rate, skip_cal=False, lidar_rate=LIDAR_POLL_HZ):
                 imu.close()
             except Exception:
                 pass
-        lidar.close()
+        for name, _, dev in lidars:
+            try:
+                dev.close()
+            except Exception as e:
+                print(f"WARNING: closing LiDAR '{name}' raised ({e!r})", flush=True)
 
 
 async def main():
@@ -217,6 +501,15 @@ async def main():
     parser.add_argument('--port', type=int, default=9001, help='WebSocket port (default: 9001)')
     parser.add_argument('--rate', type=int, default=50, help='Sample rate in Hz (default: 50)')
     parser.add_argument('--skip-cal', action='store_true', help='Skip gyro calibration (use saved)')
+    parser.add_argument('--lidar-ports', type=str,
+                        default=','.join(LIDAR_PORTS_DEFAULT),
+                        help='Comma-separated TF-LC02 serial ports, PRIMARY FIRST '
+                             f'(default: {",".join(LIDAR_PORTS_DEFAULT)}). The first '
+                             'port supplies the packet\'s top-level lidar/lidar_seq/'
+                             'lidar_ts fields that the groundstation and rover yaw '
+                             'controller read; the rest are published under `lidars` '
+                             'only. A port that fails to open is skipped with a '
+                             'warning, never fatal.')
     parser.add_argument('--lidar-rate', type=float, default=LIDAR_POLL_HZ,
                         help=f'LiDAR poll rate in Hz (default: {LIDAR_POLL_HZ}; '
                              '0 = uncapped. Sets timestamp precision, not the '
@@ -243,8 +536,10 @@ async def main():
             request_stop()
 
     async with websockets.serve(register, '0.0.0.0', args.port):
+        ports = [p.strip() for p in args.lidar_ports.split(',') if p.strip()]
         task = asyncio.create_task(sensor_loop(args.rate, skip_cal=args.skip_cal,
-                                              lidar_rate=args.lidar_rate))
+                                              lidar_rate=args.lidar_rate,
+                                              lidar_ports=ports))
         task.add_done_callback(log_task_exception)
         await stop
         task.cancel()

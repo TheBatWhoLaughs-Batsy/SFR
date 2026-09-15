@@ -85,7 +85,7 @@ BOARD_AXIS = {'x': 'h', 'y': 'v'}
 # this side was checking, the rejection was silent apart from one line in the
 # rover log. Mirrored here so an oversized command is caught and named rather
 # than discovered as a config that mysteriously never took effect.
-BOARD_RX_LIMIT = 320        # rover/config.h RX_BUFFER_SIZE, raised 256 -> 320 in firmware 2.4.0
+BOARD_RX_LIMIT = 320        # rover/config.h RX_BUFFER_SIZE, raised 256 -> 320 in firmware 2.5.0
 
 LOG_LINES = 80
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rover_state.json')
@@ -221,6 +221,15 @@ class Rover:
         self.board_fw = None
         self.board_pos_valid = False
         self.last_status_at = None
+        # The board's own clock (`ms` on its status frame: the step ISR's tick
+        # count) for the frame last_status_at was stamped from. last_status_at is
+        # when the Pi RECEIVED the position; board_ms is when the board MEASURED
+        # it. WiFi delivers frames late and in bursts, so only the second can
+        # label a moving position -- the continuous C-scan raster fits a mapping
+        # between the two clocks and keys positions on board time. Deliberately
+        # not cleared on disconnect: the pair must stay consistent so a
+        # re-broadcast of the last frame reads as a duplicate.
+        self.board_ms = None
 
         # Definitive move completion. The board sends exactly ONE `done` per
         # dispatched move, when every axis it commanded has stopped -- so this
@@ -427,6 +436,7 @@ class Rover:
             'position_conflict': self.position_conflict,
             'board_pos_valid': self.board_pos_valid,
             'last_status_at': self.last_status_at,
+            'board_ms': self.board_ms,
             'yaw': {**self.yaw.snapshot(), 'manual_pct': int(round(self.config['yaw_trim_pct'])),
                     'board_pct': self._board_yaw},
             'moves_done': self.moves_done,
@@ -619,6 +629,8 @@ class Rover:
         # the gap between sending and the next status.
         self._board_queue = self.queue_depth + (1 if self.moving else 0)
         self.last_status_at = time.time()
+        ms = msg.get('ms')
+        self.board_ms = int(ms) if isinstance(ms, (int, float)) else None
 
         # If anything cut a move short -- a soft limit, a stop, an E-stop -- the
         # ideal has run ahead of where the rover actually is. Snap it back, or
