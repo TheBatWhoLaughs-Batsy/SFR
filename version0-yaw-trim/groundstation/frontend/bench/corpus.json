@@ -1,0 +1,200 @@
+{
+  "sets": [
+    {
+      "id": "sfr-2026-09-20",
+      "dir": "~/Desktop/new sfr benchmarking",
+      "captured": "2026-09-20T18:08..18:29 local",
+      "notes": [
+        "First labelled set taken after rx1_gain 25 -> 12 (2026-09-19). Every scan: 70 columns",
+        "x 1 cm, 6 rows x 2 cm, rover continuous at 100 mm/s, settle 0, num_buffers 1,",
+        "tx1/rx1 50/12, tx2/rx2 45/5, range_offset 0.378, no gaps, standoff 29-67 mm.",
+        "Empty scans bracket the session (18:08 and 18:29).",
+        "",
+        "LABELS ARE IN A WALL FRAME, NOT THE SCAN'S. The operator's tape is fixed to the wall;",
+        "each raster starts wherever the rover was jogged to, and this set's starts span 9 cm",
+        "(rover_x at column 0: 2037.9 .. 2046.8 cm). So a label is converted to a column with",
+        "   x_scan = label + tapeZeroRailCm[frame] - railX0Cm(scan)",
+        "where railX0Cm comes from the scan's own rover_x. tapeZeroRailCm is ONE number per",
+        "frame, fitted over the whole set against the confirmed detections only (weak detections",
+        "are dense enough that fitting against them matches any offset, which is how the first",
+        "attempt talked itself into a 10% scale error). Residual +-1.5 cm; the same labelled",
+        "position lands up to 3 cm apart in different scans, so THE TRUTH IS +-3 cm AND THE",
+        "POSITION METRIC IS LIMITED BY THE TAPE, NOT THE DETECTOR. Hence a 4 cm tolerance.",
+        "Frame A holds one labelled target, which fixes its own tape zero, so `1 pipe 12cm.json`",
+        "tests rating and false alarms but not position.",
+        "",
+        "TWO ODOMETER FRAMES. The rover's position is relative to the last declared origin, and",
+        "between 18:12 and 18:16 it was re-declared: 'empty.json' and '1 pipe 12cm.json' read",
+        "~4.5 cm high against every later scan. Evidence: within each group the radar along-track",
+        "residual correlates 0.94-0.99 at the lag the rail predicts, across the groups 0.72-0.89",
+        "at a lag that does not fit. Detection is unaffected (each scan is self-contained); only",
+        "cross-scan work -- the empty reference, and this scoring -- needs the frame."
+      ],
+      "geometry": {
+        "wallThicknessCm": 15.2,
+        "epsilonR": 4.84,
+        "startFreqMHz": 2000,
+        "epsilonRNote": "4.84 (n = 2.2 exactly), the operator's own calculation, 2026-09-20. It is inside the band three independent measurements agree on, and the benchmark cannot separate 4.6 from 5.2 (all give 11/12 and 10/10), so the derived value is taken rather than the score-optimal one. The three: the front/back-face echo separation from permittivityEstimate is 33-36 cm -> er 4.8-5.8 at a 15.2 cm wall; the wall defect must image INSIDE the wall and the pipes behind it, which needs er >= ~4.8; and detection over both labelled sets falls away outside 4.6-5.2 (er 4 -> 10/12, 5.4 -> 9/12, 6 -> 9/12 and 9/10, 7 -> 9/12 and 7/10). Air is 1 on both sides: the layered model already uses air for the standoff gap and again beyond the back face. er and thickness are degenerate; what is measured is n*T = 33.4 cm."
+      },
+      "tapeZeroRailCm": {
+        "A": 2044.8,
+        "B": 2036.8
+      },
+      "knownFeatures": [
+        {
+          "x": 36,
+          "note": "the wall's own defect/reflector -- operator-confirmed, present in every scan including the empties, and the ONLY such feature. Rated detections here are neither a hit nor a false alarm: a detector that did not see it would be broken. Images at 12-16 cm depth, i.e. at the back face, in every scan."
+        }
+      ],
+      "toleranceCm": 4,
+      "scans": [
+        {
+          "file": "empty.json",
+          "role": "empty",
+          "frame": "A",
+          "pipes": []
+        },
+        {
+          "file": "1 pipe 12cm.json",
+          "role": "target",
+          "frame": "A",
+          "pipes": [
+            12
+          ]
+        },
+        {
+          "file": "2 pipe 14cm 31cm.json",
+          "role": "target",
+          "frame": "B",
+          "pipes": [
+            14,
+            31
+          ]
+        },
+        {
+          "file": "3 pipe 15cm 31cm 50cm.json",
+          "role": "target",
+          "frame": "B",
+          "pipes": [
+            15,
+            31,
+            50
+          ]
+        },
+        {
+          "file": "2 pipe 31cm 50cm.json",
+          "role": "target",
+          "frame": "B",
+          "pipes": [
+            31,
+            50
+          ]
+        },
+        {
+          "file": "3 pipe 17.5cm 50cm 68cm.json",
+          "role": "target",
+          "frame": "B",
+          "pipes": [
+            17.5,
+            50,
+            68
+          ]
+        },
+        {
+          "file": "1 pipe 48cm.json",
+          "role": "target",
+          "frame": "B",
+          "pipes": [
+            48
+          ]
+        },
+        {
+          "file": "empty 2.json",
+          "role": "empty",
+          "frame": "B",
+          "pipes": []
+        }
+      ]
+    },
+    {
+      "id": "gw2-2026-09-13",
+      "dir": "~/Downloads",
+      "captured": "2026-09-13 15:48 .. 2026-09-14 01:04 local",
+      "notes": [
+        "The set the CURRENT thresholds were fitted on, kept as the cross-check: same gw2 wall but",
+        "rx1_gain 25 (compressed), 140 columns x 0.5 cm, 6 rows x 1 cm. Ground truth is the operator's",
+        "confirmation recorded in CLAUDE.md ('Ground truth for that set', 2026-09-14) and is in SCAN",
+        "coordinates, so no tapeZeroRailCm and no frame: labels are columns as-is.",
+        "`1pipe.json` is a SECOND EMPTY -- the file name overstates by one, like every name in that set.",
+        "`empty gw.json` was taken 3.5 h earlier than the rest and does not contain the 36 cm defect,",
+        "which entered the scene between 19:27 and 19:28; `1pipe` does. 2rods1pipe has long gaps in",
+        "rows 0 and 2 (the frozen-rover-position bug) and is from a different session earlier that day."
+      ],
+      "geometry": {
+        "wallThicknessCm": 15.2,
+        "epsilonR": 4.84,
+        "startFreqMHz": 2000,
+        "epsilonRNote": "4.84 (n = 2.2 exactly), the operator's own calculation, 2026-09-20. It is inside the band three independent measurements agree on, and the benchmark cannot separate 4.6 from 5.2 (all give 11/12 and 10/10), so the derived value is taken rather than the score-optimal one. The three: the front/back-face echo separation from permittivityEstimate is 33-36 cm -> er 4.8-5.8 at a 15.2 cm wall; the wall defect must image INSIDE the wall and the pipes behind it, which needs er >= ~4.8; and detection over both labelled sets falls away outside 4.6-5.2 (er 4 -> 10/12, 5.4 -> 9/12, 6 -> 9/12 and 9/10, 7 -> 9/12 and 7/10). Air is 1 on both sides: the layered model already uses air for the standoff gap and again beyond the back face. er and thickness are degenerate; what is measured is n*T = 33.4 cm."
+      },
+      "knownFeatures": [
+        {
+          "x": 36,
+          "note": "the wall defect. Absent from 'empty gw' and the 19:2x scans before it appeared."
+        }
+      ],
+      "toleranceCm": 4,
+      "scans": [
+        {
+          "file": "empty gw.json",
+          "role": "empty",
+          "pipes": []
+        },
+        {
+          "file": "1pipe.json",
+          "role": "empty",
+          "pipes": []
+        },
+        {
+          "file": "2rods1pipe.json",
+          "role": "target",
+          "pipes": [
+            12,
+            20.5,
+            54
+          ]
+        },
+        {
+          "file": "3rods.json",
+          "role": "target",
+          "pipes": [
+            12,
+            54
+          ]
+        },
+        {
+          "file": "2pipes.json",
+          "role": "target",
+          "pipes": [
+            54
+          ]
+        },
+        {
+          "file": "2pipeasagain.json",
+          "role": "target",
+          "pipes": [
+            17
+          ]
+        },
+        {
+          "file": "4pipes.json",
+          "role": "target",
+          "pipes": [
+            17,
+            32,
+            58
+          ]
+        }
+      ]
+    }
+  ]
+}

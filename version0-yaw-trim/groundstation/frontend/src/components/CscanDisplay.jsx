@@ -1,5 +1,6 @@
 import { useRef, useEffect, useState } from 'react';
-import { orderedCellForIndex, buildCscanGrid, cscanLayout, BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
+import { orderedCellForIndex, buildCscanGrid, cscanLayout, BG_STATUS, BG_STATUS_TEXT,
+  layoutCellRect as cellRect, layoutCellAt as cellAt, canvasOffsetIn } from '@/lib/cscanGrid';
 // One implementation, shared with the Imaging Bench and the SAR panel -- the
 // same rule CFAR and the window functions follow. The local `jet` this replaces
 // was checked bit-identical to the library's over 100k samples plus the
@@ -32,52 +33,8 @@ const GATED_OUT_FILL = '#3a3a3a';
 const INVALID_FILL = '#2a0a10';
 const INVALID_STROKE = '#ff4d6d';
 
-// A cell's rectangle, SNAPPED so the grid tiles exactly.
-//
-// Each edge is rounded from the cell BOUNDARY, not from a position plus a
-// width, so column ix's right edge and column ix+1's left edge are the same
-// expression and therefore the same pixel: no gap, and no overlap.
-//
-// It used to return the raw fractional rectangle, and the fills compensated for
-// the resulting hairline gaps with `Math.ceil(r.w) + 0.5` -- which overdraws
-// each cell by up to 1.5 px into the neighbour below and to its right. On a
-// coarse grid that is a few percent of a cell; on the 101-column rasters this
-// rig actually captures (~10 px a cell at a typical pane width) it is ~15% of
-// the cell, i.e. every cell visibly bleeding into the next. A plan view is a
-// measurement, so a cell must cover its own area and nothing else.
-//
-// Rounding costs at most half a pixel of placement against the exact geometry,
-// and it does NOT accumulate -- each edge is rounded from its own absolute
-// boundary rather than from the previous edge -- so the to-scale projection
-// stays true to within a pixel across the whole grid.
-function cellRect(ix, iy, L) {
-  const x0 = Math.round(L.originX + ix * L.cellW);
-  const x1 = Math.round(L.originX + (ix + 1) * L.cellW);
-  const y1 = Math.round(L.originY - iy * L.cellH);
-  const y0 = Math.round(L.originY - (iy + 1) * L.cellH);
-  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
-}
-
-function cellAt(px, py, L, hCount, vCount) {
-  const ix = Math.floor((px - L.originX) / L.cellW);
-  const iy = Math.floor((L.originY - py) / L.cellH);
-  if (ix < 0 || ix >= hCount || iy < 0 || iy >= vCount) return null;
-  return { ix, iy };
-}
-
 function snakeOrderOf(cell, hCount) {
   return cell.iy * hCount + (cell.iy % 2 === 0 ? cell.ix : hCount - 1 - cell.ix) + 1;
-}
-
-// Where this canvas sits inside the viewport (the whole area right of the
-// sidebar). To-scale placement is measured from the viewport, so that the grid
-// holds still on the wall when the Live Sweep pane appears or a row opens and
-// the canvas itself moves.
-function canvasOffsetIn(rootRef, rect) {
-  const root = rootRef && rootRef.current;
-  if (!root) return { x: 0, y: 0 };
-  const r = root.getBoundingClientRect();
-  return { x: rect.left - r.left, y: rect.top - r.top };
 }
 
 // The plan view resampled BILINEARLY between cell centres instead of painted as

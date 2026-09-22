@@ -1,6 +1,6 @@
 import { useRef, useEffect, useState, lazy, Suspense } from 'react';
 import { cn } from '@/lib/utils';
-import { Activity, Radio, Radar, ScanLine, Grid3x3, Map, Zap, Brain, FlaskConical, Move, X, ChevronLeft, ChevronRight, Box, Locate } from 'lucide-react';
+import { Activity, Radio, Radar, ScanLine, Grid3x3, Map, Zap, Brain, FlaskConical, Move, X, ChevronLeft, ChevronRight, Box, Locate, Projector, HardDriveDownload, Maximize, Minimize } from 'lucide-react';
 import ImuDisplay from './ImuDisplay';
 import { HandheldPositionReadout, HandheldLidarReadout, ImuReadout } from './HandheldReadouts';
 import WaveformDisplay from './WaveformDisplay';
@@ -14,7 +14,8 @@ import MapDisplay from './MapDisplay';
 import BgModelDisplay from './BgModelDisplay';
 import ImagingDisplay from './ImagingDisplay';
 import RoverDisplay from './RoverDisplay';
-import HandheldScanDisplay from './HandheldScanDisplay';
+import ProjectorDemoDisplay from './ProjectorDemoDisplay';
+import HandheldCaptureDisplay from './HandheldCaptureDisplay';
 import { planViewScales } from '@/lib/cscanGrid';
 
 // three.js is only pulled in when the operator opens the 3D view.
@@ -100,9 +101,9 @@ export default function Viewport({
   roverTrail,
   roverLog,
   handheldPose,
-  hhScanData,
-  hhScanParams,
-  hhScanReady,
+  projectorDemo,
+  handheldCapture,
+  handheldRough,
 }) {
   // SAR panel: image vs 3D digital twin of the wall. Off by default.
   const [sar3d, setSar3d] = useState(false);
@@ -119,6 +120,8 @@ export default function Viewport({
   // is measured from this element's top-left corner, so the projected grid does
   // not move when the Live Sweep pane appears or a row's B-scan opens.
   const cscanRootRef = useRef(null);
+  // Projector Demo: to-scale placement is measured from this element, like the C-scan's.
+  const projDemoRootRef = useRef(null);
   // Called unconditionally, before any of the per-panel early returns -- hooks cannot
   // live inside those branches. Idles to null whenever the SFCW pane is not the one up.
   // The sweep rate is measured in App.jsx from EVERY sfcw_result, before the
@@ -136,6 +139,38 @@ export default function Viewport({
     ? { ms: sweepPeriodMs, hz: 1000 / sweepPeriodMs }
     : null;
 
+  // Browser fullscreen, for the home screen's button (phones and tablets opening
+  // http://10.42.0.1:5000 have no F11). Tracked from the fullscreenchange event --
+  // not from the click -- so leaving fullscreen via the system gesture / Esc keeps
+  // the label honest. webkit-prefixed variants cover older Safari; iPhone Safari
+  // has no Fullscreen API at all, so there the button is not rendered rather than
+  // rendered broken (Add to Home Screen is the fullscreen route on iPhone).
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  useEffect(() => {
+    const onChange = () =>
+      setIsFullscreen(!!(document.fullscreenElement || document.webkitFullscreenElement));
+    document.addEventListener('fullscreenchange', onChange);
+    document.addEventListener('webkitfullscreenchange', onChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange);
+      document.removeEventListener('webkitfullscreenchange', onChange);
+    };
+  }, []);
+  const fullscreenSupported = typeof document !== 'undefined'
+    && !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement || document.webkitFullscreenElement) {
+      (document.exitFullscreen || document.webkitExitFullscreen)?.call(document);
+    } else {
+      const el = document.documentElement;
+      const req = el.requestFullscreen || el.webkitRequestFullscreen;
+      // The promise rejects when the browser refuses (permission, iframe policy);
+      // the fullscreenchange listener above never fires then, so the label stays
+      // right on its own -- just keep the rejection from surfacing as an error.
+      try { req?.call(el)?.catch?.(() => {}); } catch { /* older sync throwers */ }
+    }
+  };
+
   if (!activePanel) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center bg-black select-none">
@@ -148,39 +183,14 @@ export default function Viewport({
         <p className="text-[16px] font-medium tracking-[0.4em] uppercase text-white/30">
           Groundstation
         </p>
-      </div>
-    );
-  }
-
-  if (activePanel === 'handheldscan') {
-    const live = isConnected && !!handheldPose?.connected;
-    const posLive = handheldPose?.pos?.x != null && handheldPose?.pos?.y != null;
-    return (
-      <div className="flex-1 flex flex-col h-screen overflow-hidden bg-black">
-        <PaneHeader
-          icon={ScanLine}
-          label="Handheld Scan"
-          active={live}
-          color="cyan"
-          meta={hhScanParams
-            ? `${hhScanParams.hCount}×${hhScanParams.vCount} cells · ${hhScanData?.length ?? 0} captured`
-            : null}
-        />
-        <div className="flex-1 min-h-0 relative">
-          <HandheldScanDisplay
-            scanData={hhScanData || []}
-            params={hhScanParams}
-            pose={handheldPose}
-            ready={!!hhScanReady}
-          />
-          {!posLive && (
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-              <span className="text-xs text-[#333333] uppercase tracking-widest font-medium">
-                No handheld position
-              </span>
-            </div>
-          )}
-        </div>
+        {fullscreenSupported && (
+          <button type="button" onClick={toggleFullscreen}
+            title={isFullscreen ? 'Leave browser fullscreen' : 'Take the browser fullscreen'}
+            className="mt-8 flex items-center gap-2 px-4 py-2 rounded-md text-[11px] font-medium tracking-[0.15em] uppercase border transition-colors bg-white/5 border-white/10 text-white/60 hover:text-white hover:bg-white/10">
+            {isFullscreen ? <Minimize size={14} strokeWidth={2} /> : <Maximize size={14} strokeWidth={2} />}
+            {isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+          </button>
+        )}
       </div>
     );
   }
@@ -692,6 +702,118 @@ export default function Viewport({
               </div>
             );
           })()}
+        </div>
+      </div>
+    );
+  }
+
+  if (activePanel === 'projdemo' && projectorDemo) {
+    const d = projectorDemo;
+    const drawing = d.mode === 'draw';
+    const grid = d.activeGrid;
+    const modeLabel = drawing ? 'Draw' : d.mode === 'rover' ? 'Rover' : 'Handheld';
+    const rover = d.mode === 'rover';
+    const handheld = d.mode === 'handheld';
+    const run = rover ? d.roverRun : handheld ? d.handheldRun : null;
+    const total = grid ? grid.hCount * grid.vCount : 0;
+    return (
+      <div ref={projDemoRootRef} className="flex-1 flex flex-col h-screen overflow-hidden bg-black">
+        <div className="relative flex flex-col min-h-0" style={{ flex: '1 1 0%' }}>
+          <PaneHeader icon={Projector} label={`Projector Demo · ${modeLabel}`} active={!!grid} color="cyan" />
+          <div className="flex-1 min-h-0 relative overflow-hidden">
+            <ProjectorDemoDisplay
+              grid={grid}
+              // Every mode follows the projection calibration, so the monitor shows what the
+              // projector does -- in Draw, a stroke lands where the projector shows it.
+              projection={d.projection}
+              editable={drawing}
+              tool={d.tool}
+              // Hover outline in the brush's own colour: pipe yellow, seepage green.
+              color={d.tool === 'seepage' ? '#5ec962' : '#fde725'}
+              lattice={!drawing}
+              onPaint={d.paintDraw}
+              rootRef={projDemoRootRef}
+              // Rover and handheld: cells not reached yet are dimmed; the one in front of the
+              // rover or module is outlined.
+              dullUncovered={!drawing}
+              covered={run ? run.covered : null}
+              currentCell={run ? run.currentCell : null}
+              title={drawing ? `DRAW · ${String(d.tool).toUpperCase()} BRUSH · RIGHT-DRAG ERASES`
+                : rover ? `ROVER · ${run ? run.coveredCount : 0} / ${total} COVERED${run && run.active ? ' · RUNNING' : ''}`
+                  : `HANDHELD · ${run ? run.coveredCount : 0} / ${total} REACHED${run && run.active ? (run.playing ? ' · PLAYING' : ' · PAUSED') : ''}`}
+            />
+            {!grid && (
+              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                <span className="text-xs text-[#333333] uppercase tracking-widest font-medium">No grid loaded — import one</span>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (activePanel === 'hhcapture' && handheldCapture) {
+    const c = handheldCapture;
+    const rv = handheldRough;
+    const roughView = rv?.view === 'rough';
+    const total = c.grid.hCount * c.grid.vCount;
+    const state = !c.session.active ? '' : c.session.playing ? ' · SCANNING' : ' · PAUSED';
+    const pct = total ? Math.round((100 * c.stats.captured) / total) : 0;
+    const name = (c.session.active ? c.session.name : c.lastSession?.name || c.name) || 'PATCH';
+    const segBtn = (on) => cn('px-2 py-0.5 rounded-md text-[10px] font-medium border transition-colors',
+      on ? 'bg-[#22d3ee]/10 border-[#22d3ee]/30 text-[#22d3ee]' : 'bg-white/5 border-white/10 text-white/50 hover:text-white');
+    // Status: coverage. Rough output: a BG-subtracted plan view of the first sweep in each cell.
+    const viewSwitch = rv && (
+      <span className="flex items-center gap-1">
+        <button type="button" className={segBtn(!roughView)} onClick={() => rv.setView('status')}>Status</button>
+        <button type="button" className={segBtn(roughView)} onClick={() => rv.setView('rough')}>Rough output</button>
+      </span>
+    );
+    return (
+      <div className="flex-1 flex flex-col h-screen overflow-hidden bg-black">
+        <div className="relative flex flex-col min-h-0" style={{ flex: '1 1 0%' }}>
+          <PaneHeader icon={HardDriveDownload} label="Handheld Capture" active={c.session.active} color="cyan" meta={viewSwitch} />
+          <div className="flex-1 min-h-0 relative overflow-hidden">
+            {!roughView && (
+              <HandheldCaptureDisplay
+                grid={c.grid}
+                countsRef={c.countsRef}
+                version={c.version}
+                minSweeps={c.minSweeps}
+                livePosRef={c.livePosRef}
+                active={c.session.active}
+                playing={c.session.playing}
+                title={`${name} · ${c.stats.captured} / ${total} CELLS (${pct}%) · ${c.stats.sweeps} SWEEPS RECORDED`
+                  + `${c.stats.thin ? ` · ${c.stats.thin} THIN` : ''}${state}`}
+              />
+            )}
+            {roughView && rv.grid && rv.params && (
+              <CscanDisplay
+                scanData={rv.processed}
+                params={rv.params}
+                capturing={false}
+                scaleMode={rv.settings.scaleMode}
+                scaleRange={rv.settings.scaleRange}
+                sharedScale={rv.plan.global}
+                rowScales={rv.plan.rows}
+                scaleScope="global"
+                scaleLink={rv.plan.effectiveLink}
+                subMode={rv.bgModel && rv.settings.bgApplied ? rv.settings.subMode : 'complex'}
+                nextIndex={null}
+                scanMode="manual"
+                smooth={rv.settings.smooth}
+                colormap={rv.settings.colormap}
+              />
+            )}
+            {roughView && (!rv.grid || rv.cells === 0) && (
+              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                <span className="text-xs text-[#333333] uppercase tracking-widest font-medium">
+                  {rv.grid ? 'No cells scanned yet' : 'Start a session and scan to see rough output'}
+                </span>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     );

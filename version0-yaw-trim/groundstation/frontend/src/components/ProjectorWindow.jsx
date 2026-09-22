@@ -19,14 +19,15 @@ import { createPortal } from 'react-dom';
 // keep in sync. Everything the operator changes on the panel appears on the
 // wall on the next frame.
 
-const WINDOW_NAME = 'cscan-projector';
-
 // Module scope on purpose: this has to survive the mount → unmount → mount that
 // React StrictMode performs on every effect in development, and the module
 // reload that HMR performs on top of it. See `reclaim` below.
-let liveWindow = null;
+//
+// Keyed by window NAME, so two projector windows (the C-scan's and the Projector
+// Demo's) can be open at once without reclaiming each other.
+const liveWindows = new Map();
 
-function openProjectorWindow(t) {
+function openProjectorWindow(t, name, title) {
   // `popup=yes` drops the tab strip and toolbar, so the window is already most
   // of the way to a clean output surface before fullscreen is asked for.
   const feat = [
@@ -37,7 +38,7 @@ function openProjectorWindow(t) {
     `height=${Math.round(t ? t.height : 800)}`,
   ].filter(Boolean).join(',');
 
-  const win = window.open('', WINDOW_NAME, feat);
+  const win = window.open('', name, feat);
   if (!win) return null;
   const doc = win.document;
 
@@ -47,7 +48,7 @@ function openProjectorWindow(t) {
   // root and a second copy of the stylesheet on every hot reload.
   let el = doc.querySelector('[data-projector-root]');
   if (!el) {
-    doc.title = 'C-Scan Projection';
+    doc.title = title;
     doc.body.style.cssText = 'margin:0;padding:0;background:#000;overflow:hidden;cursor:none;';
     doc.documentElement.style.cssText = 'background:#000;';
 
@@ -77,7 +78,9 @@ function openProjectorWindow(t) {
   return { win, doc, el, hint: doc.querySelector('[data-projector-hint]'), closeTimer: null };
 }
 
-export default function ProjectorWindow({ target, onClose, rootRef, children }) {
+export default function ProjectorWindow({
+  target, onClose, rootRef, children, name = 'cscan-projector', title = 'C-Scan Projection',
+}) {
   const [container, setContainer] = useState(null);
   // The window is opened from an effect with no dependencies, so the target is
   // read through a ref rather than closed over.
@@ -102,14 +105,14 @@ export default function ProjectorWindow({ target, onClose, rootRef, children }) 
     // The close is therefore deferred by a tick, and a remount inside that tick
     // takes the same window back. A genuine unmount has no remount to cancel
     // it, so the window still closes.
-    let rec = liveWindow;
+    let rec = liveWindows.get(name);
     if (rec && rec.win && !rec.win.closed) {
       clearTimeout(rec.closeTimer);
       rec.closeTimer = null;
     } else {
-      rec = openProjectorWindow(targetRef.current);
+      rec = openProjectorWindow(targetRef.current, name, title);
       if (!rec) { closeRef.current('blocked'); return undefined; }
-      liveWindow = rec;
+      liveWindows.set(name, rec);
     }
 
     const { win, doc, el, hint } = rec;
@@ -154,7 +157,7 @@ export default function ProjectorWindow({ target, onClose, rootRef, children }) 
 
     // The operator can close the projector window directly; the panel has to
     // follow, or its button would keep claiming a window that is gone.
-    const onGone = () => { liveWindow = null; closeRef.current('closed'); };
+    const onGone = () => { liveWindows.delete(name); closeRef.current('closed'); };
     win.addEventListener('pagehide', onGone);
     // A popup outlives a reload of its opener, which would leave an orphaned
     // window nothing can control.
@@ -171,7 +174,7 @@ export default function ProjectorWindow({ target, onClose, rootRef, children }) 
       // followed immediately by another mount, and tearing the portal down and
       // back up would flash the projected image for no reason.
       rec.closeTimer = setTimeout(() => {
-        if (liveWindow === rec) liveWindow = null;
+        if (liveWindows.get(name) === rec) liveWindows.delete(name);
         try { win.close(); } catch { /* already gone */ }
       }, 0);
     };

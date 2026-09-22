@@ -135,13 +135,14 @@
 // associates but fails to get a lease -- the classic symptom is that it works
 // until it is power-cycled and then only comes back after a ROUTER restart,
 // because the AP is still holding a stale lease for its MAC. Pick an address
-// outside the router's DHCP pool.
+// outside the AP's DHCP pool (the Pi's sfr-pi network hands out 10.42.0.10-254,
+// so .2-.9 are free; the Pi itself is 10.42.0.1 and is also the gateway).
 //
 // #define USE_STATIC_IP
-#define STATIC_IP      192, 168, 1,  77
-#define STATIC_GATEWAY 192, 168, 1,   1
+#define STATIC_IP      10,  42, 0,   5
+#define STATIC_GATEWAY 10,  42, 0,   1
 #define STATIC_SUBNET  255, 255, 255, 0
-#define STATIC_DNS     192, 168, 1,   1
+#define STATIC_DNS     10,  42, 0,   1
 
 // How long to wait for a DHCP lease before treating the attempt as failed and
 // starting over. Associating is not the same as being on the network.

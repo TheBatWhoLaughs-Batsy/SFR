@@ -70,27 +70,27 @@ export const MIN_MOVE_MS = 500;
 // and a status frame has come back, so requiring a link round trip plus one
 // status period closes that window. The token path below is exact and skips
 // it entirely.
-const MOVE_ACK_FLOOR_MS = 300;
+export const MOVE_ACK_FLOOR_MS = 300;
 
 // The link is up but the Pi has stopped telling us anything. Distinct from
 // `board_connected` going false, which is the Pi reporting a known state; this
 // is the Pi (or the browser tab) having gone quiet while the gantry may still
 // be driving. There are no endstops, so a raster must not keep issuing moves
 // against a position it can no longer see.
-const STATUS_STALE_MS = 4000;
+export const STATUS_STALE_MS = 4000;
 
 // Half a step is 65 um on X and 2.5 um on Y, so a millimetre is far looser than
 // the mechanism -- it is here to catch a move that did not happen, not to judge
 // precision.
-const POS_TOL_MM = 1.0;
+export const POS_TOL_MM = 1.0;
 
 // How long the rover may sit idle at the wrong place before we call it a
 // failure rather than a slow arrival.
-const POS_GRACE_MS = 3000;
+export const POS_GRACE_MS = 3000;
 
 // Floor under the distance-derived move timeout, so short moves still get a
 // sane allowance for acceleration and link latency.
-const MOVE_TIMEOUT_FLOOR_MS = 6000;
+export const MOVE_TIMEOUT_FLOOR_MS = 6000;
 
 // Sweeps free-run, so anything approaching this means the sweep died. Budget
 // for one cell's capture in STEPPED mode. A cell takes `sweepsPerCell` sweeps,
@@ -126,12 +126,33 @@ function clampAxis(value, lo, hi) {
 // Mirror of the Pi's own clamp in `move_to_mm`. Applied here as well so the
 // arrival check compares against the position the rover will actually reach --
 // the board clamps silently and still reports the move `completed`.
-function clampTarget(target, cfg) {
+export function clampTarget(target, cfg) {
   if (!cfg || !cfg.limits_enabled) return { ...target };
   return {
     x_mm: clampAxis(target.x_mm, cfg.x_min_mm, cfg.x_max_mm),
     y_mm: clampAxis(target.y_mm, cfg.y_min_mm, cfg.y_max_mm),
   };
+}
+
+// Has the move `st` issued finished? Three completion signals, best first:
+//  1. our own token echoed back -- exact, and immune to anyone else's
+//     move finishing while ours is in flight;
+//  2. `moves_done` advancing, floored by a link round trip so a `done`
+//     already in flight when we issued cannot be read as ours;
+//  3. a plain timer, for a Pi that reports neither.
+// `st` carries issuedAt, moveToken, tokenSupported and movesDoneAtIssue as set
+// when the move was sent. Shared with the Projector Demo's rover run.
+export function moveCompletion(st, status, now) {
+  const since = now - st.issuedAt;
+  const tokenPath = st.tokenSupported && st.moveToken != null
+    && typeof status.last_done_token !== 'undefined';
+  const counterPath = st.movesDoneAtIssue != null && typeof status.moves_done === 'number';
+  const completed = tokenPath
+    ? status.last_done_token === st.moveToken
+    : counterPath
+      ? (status.moves_done > st.movesDoneAtIssue && since >= MOVE_ACK_FLOOR_MS)
+      : since >= MIN_MOVE_MS;
+  return { exact: tokenPath || counterPath, completed, since };
 }
 
 export function useRoverScan({
@@ -289,9 +310,27 @@ export function useRoverScan({
     st.row = { index: rowFromTop, iy: tr.iy, dir: tr.dir };
     st.cell = { ix: tr.dir > 0 ? 0 : st.grid.hCount - 1, iy: tr.iy };
     st.index = rowFromTop * st.grid.hCount;
-    issueMove('row_start', { x_mm: tr.entryX, y_mm: tr.y_mm },
+    const entry = { x_mm: tr.entryX, y_mm: tr.y_mm };
+
+    // Already parked on this row's entry point -- the normal case for the first
+    // row, since homing drives straight there. Go directly to the settle rather
+    // than issuing a zero-length move, so the first row starts like every other
+    // row does.
+    const status = optsRef.current.roverStatus;
+    const want = clampTarget(entry, status?.config);
+    if (st.target && status
+        && Math.hypot(st.target.x_mm - want.x_mm, st.target.y_mm - want.y_mm) < 1e-6
+        && Math.hypot(status.x_mm - want.x_mm, status.y_mm - want.y_mm) <= POS_TOL_MM
+        && !status.moving && (status.pending_moves | 0) === 0 && (status.queue_depth | 0) === 0) {
+      st.message = `Row ${rowFromTop + 1} of ${st.rowsTotal} — starting`;
+      st.phase = 'row_settle';
+      st.settleUntil = performance.now() + st.settleMs;
+      publish();
+      return;
+    }
+    issueMove('row_start', entry,
       `Row ${rowFromTop + 1} of ${st.rowsTotal} — driving to start`);
-  }, [issueMove]);
+  }, [issueMove, publish]);
 
   const closeRow = useCallback(() => {
     const st = machine.current;
@@ -346,21 +385,8 @@ export function useRoverScan({
         // stopped, so this cannot fire during the ack-before-dispatch window and
         // there is nothing to wait out. Falls back to the timer on a Pi that does
         // not report it.
-        // Three completion signals, best first:
-        //  1. our own token echoed back -- exact, and immune to anyone else's
-        //     move finishing while ours is in flight;
-        //  2. `moves_done` advancing, floored by a link round trip so a `done`
-        //     already in flight when we issued cannot be read as ours;
-        //  3. a plain timer, for a Pi that reports neither.
-        const tokenPath = st.tokenSupported && st.moveToken != null
-          && typeof status.last_done_token !== 'undefined';
-        const counterPath = st.movesDoneAtIssue != null && typeof status.moves_done === 'number';
-        const exact = tokenPath || counterPath;
-        const completed = tokenPath
-          ? status.last_done_token === st.moveToken
-          : counterPath
-            ? (status.moves_done > st.movesDoneAtIssue && since >= MOVE_ACK_FLOOR_MS)
-            : since >= MIN_MOVE_MS;
+        // Token, then counter, then timer -- see moveCompletion().
+        const { exact, completed } = moveCompletion(st, status, now);
 
         // A move that ended as anything but `completed` did not go where it was
         // told -- a soft limit, a stop, an e-stop. Targets are already clamped
@@ -394,7 +420,10 @@ export function useRoverScan({
               // known position -- with the sweep already running -- to capture
               // a background reference before the gantry starts moving.
               st.phase = 'ready';
-              st.message = 'At grid origin — capture a background reference now if you want one.';
+              st.message = (st.traverse === 'continuous'
+                ? 'At the first row\'s run-up point'
+                : 'At grid origin')
+                + ' — capture a background reference now if you want one.';
               publish();
             } else if (st.phase === 'traversing') {
               closeRow();
@@ -451,6 +480,21 @@ export function useRoverScan({
       // is already outside the grid, so the ramp that follows costs no cells.
       case 'row_settle':
         if (now >= st.settleUntil) {
+          // Do not traverse until the Pi reports the scan speed as the rail's
+          // max speed, or the row runs at whatever speed the rail already had.
+          if (st.speedApplied) {
+            const cur = Number(status.config?.x_max_speed);
+            if (!(Math.abs(cur - st.speedMmS) <= 0.5)) {
+              if (st.speedWaitSince == null) st.speedWaitSince = now;
+              else if (now - st.speedWaitSince > 3000) {
+                finish('error', null,
+                  `Scan speed ${st.speedMmS} mm/s was not applied to the rover `
+                  + `(it reports ${isFinite(cur) ? cur : '?'} mm/s). Scan aborted.`, false);
+              }
+              return;
+            }
+            st.speedWaitSince = null;
+          }
           const tr = st.rowGeom;
           st.rowOpen = true;
           o.onRowOpen({
@@ -525,7 +569,7 @@ export function useRoverScan({
     const continuous = grid.roverTraverse !== 'stepped';
     const cfg = status.config;
 
-    const speedMmS = Math.max(1, Number(grid.roverSpeedMmS) || 60);
+    const speedMmS = Math.max(1, Number(grid.roverSpeedMmS) || 300);
     // The pitch is part of the overrun: cells are keyed by rounding position to
     // the nearest column, so a run-up shorter than half a pitch is inside the
     // first column rather than outside the grid.
@@ -637,7 +681,15 @@ export function useRoverScan({
 
     o.onStartSweep();
     // One move on both axes, so the rover travels left and up together.
-    issueMove('homing', { x_mm: origin.x, y_mm: origin.y },
+    // Continuous homes straight to the first row's RUN-UP point (the grid's
+    // left edge minus the overrun) rather than to the origin, so the raster
+    // does not back up by the overrun and then drive forward again.
+    let home = { x_mm: origin.x, y_mm: origin.y };
+    if (continuous) {
+      const tr = rowTraverse(resumeRow, grid, origin, overrunMm);
+      home = { x_mm: tr.entryX, y_mm: tr.y_mm };
+    }
+    issueMove('homing', home,
       anchored
         ? `Returning to the grid origin this scan was anchored at — resuming on row ${resumeRow + 1} of ${grid.vCount}`
         : 'Returning to grid origin');

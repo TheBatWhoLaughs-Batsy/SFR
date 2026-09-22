@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import signal
 import sys
 import time as _time
@@ -12,6 +13,25 @@ import websockets
 from bladerf_driver import BladeRFDriver
 from sfcw_engine import SFCWEngine
 from sfcw_wire import encode_sfcw_binary
+
+
+# VS Code Remote's port auto-forward (and any port scanner) probes a listening
+# port by opening a TCP connection and closing it without sending a byte.
+# websockets >= 14 logs each probe as a full "opening handshake failed"
+# EOFError traceback ("connection closed while reading HTTP request line") --
+# pure noise, no client was ever there. Suppress exactly that case; a real
+# client sending a malformed handshake still logs in full.
+class _IgnoreEmptyHandshake(logging.Filter):
+    def filter(self, record):
+        exc = record.exc_info[1] if record.exc_info else None
+        while exc is not None:
+            if isinstance(exc, EOFError):
+                return False
+            exc = exc.__cause__
+        return True
+
+
+logging.getLogger('websockets.server').addFilter(_IgnoreEmptyHandshake())
 
 SCALE = 2047
 PORT = 9003

@@ -46,10 +46,28 @@ function ifftInPlace(re, im) {
   }
 }
 
-function complexSvdFilter(hCalReals, hCalImags, numPositions, numSteps, k, strength) {
+// How spread out a left singular vector is along the scan, as a fraction of the aperture:
+// the participation ratio of |u|^2 over the number of positions. A wall or coupling term is
+// present at EVERY position, so it comes out near 1; a compact scatterer is only seen from
+// the positions whose beam reaches it -- about 2*z*tan(theta) of aperture, a third of a
+// 70 cm scan at 17 cm depth -- so it comes out well below. This is what lets the rank be
+// chosen per scan rather than fixed; see `svdAdaptive`.
+export function spreadFraction(uRe, uIm, numPositions) {
+  let tot = 0;
+  const p = new Float64Array(numPositions);
+  for (let i = 0; i < numPositions; i++) { p[i] = uRe[i] * uRe[i] + uIm[i] * uIm[i]; tot += p[i]; }
+  if (tot <= 0) return 1;
+  let sq = 0;
+  for (let i = 0; i < numPositions; i++) { const q = p[i] / tot; sq += q * q; }
+  return sq > 0 ? 1 / (sq * numPositions) : 1;
+}
+
+function complexSvdFilter(hCalReals, hCalImags, numPositions, numSteps, k, strength, opts = {}) {
   // SVD clutter filter on complex h_cal matrix (numPositions × numSteps)
-  // Removes the first k spatial components (walls, static clutter)
-  if (k < 1 || numPositions < 2) return { reals: hCalReals, imags: hCalImags };
+  // Removes the first k spatial components (walls, static clutter). With opts.adaptive,
+  // k is an UPPER BOUND: a component is removed only while it still looks like clutter by
+  // spreadFraction, and the number actually removed comes back as `rank`.
+  if (k < 1 || numPositions < 2) return { reals: hCalReals, imags: hCalImags, rank: 0 };
 
   // Work with flat arrays: re[p*numSteps + s], im[p*numSteps + s]
   const re = new Float64Array(numPositions * numSteps);
@@ -62,6 +80,9 @@ function complexSvdFilter(hCalReals, hCalImags, numPositions, numSteps, k, stren
   }
 
   const s = Math.max(0, Math.min(1, strength));
+  const adaptive = !!opts.adaptive;
+  const spreadMin = opts.spreadFrac != null ? opts.spreadFrac : 0.5;
+  let rank = 0;
 
   for (let comp = 0; comp < k; comp++) {
     // Power iteration to find dominant singular vector
@@ -128,6 +149,11 @@ function complexSvdFilter(hCalReals, hCalImags, numPositions, numSteps, k, stren
       if (diff < 1e-10) break;
     }
 
+    // Adaptive: stop at the first component that is localised along the scan. Components
+    // come out in energy order, so once one looks like a target, every later one does too.
+    if (adaptive && spreadFraction(uRe, uIm, numPositions) < spreadMin) break;
+    rank++;
+
     // Subtract: A -= s * sigma * u * v^H
     for (let p = 0; p < numPositions; p++) {
       for (let j = 0; j < numSteps; j++) {
@@ -153,7 +179,7 @@ function complexSvdFilter(hCalReals, hCalImags, numPositions, numSteps, k, stren
     filteredReals.push(r);
     filteredImags.push(i);
   }
-  return { reals: filteredReals, imags: filteredImags };
+  return { reals: filteredReals, imags: filteredImags, rank };
 }
 
 // The window used to be a hardcoded Hanning. It is a parameter now, defaulting to
@@ -506,6 +532,8 @@ function prepare(bscanData, bscanParams) {
     epsilonR, n, autoStandoff, standoffN, medianMm, standoffMinMm, standoffMaxMm,
     standoffSpreadMm, standoffNegativeN, standoffs, maxStandoff, distances, numBins,
     apparentAvailable, standoffOverRange, standoffSuspect, wallT, layered, reachable,
+    apertureNormalize: !!bscanParams.apertureNormalize,
+    apertureTan: bscanParams.apertureAngleDeg > 0 ? Math.tan(bscanParams.apertureAngleDeg * Math.PI / 180) : 0,
     depthMax, depthClipped, depthAt, progressEvery, gridIx, byGrid, minIx, positionSource,
     missingColumns, duplicateColumns, apertureLength, antennaX, image, coherence, minContrib,
   };
@@ -516,10 +544,14 @@ function prepare(bscanData, bscanParams) {
     ctx.kStart = 2 * Math.PI * startFreq / SPEED_OF_LIGHT;
 
     // Apply complex SVD clutter filter to h_cal before range profile computation
+    let svdRank = 0;
     let hCalReals = bscanData.map(p => p.h_cal_real);
     let hCalImags = bscanData.map(p => p.h_cal_imag);
     if (bscanParams.svdEnabled && bscanParams.svdK >= 1) {
-      const filtered = complexSvdFilter(hCalReals, hCalImags, numPositions, numSteps, bscanParams.svdK, bscanParams.svdStrength);
+      const filtered = complexSvdFilter(hCalReals, hCalImags, numPositions, numSteps, bscanParams.svdK, bscanParams.svdStrength,
+        { adaptive: !!bscanParams.svdAdaptive, spreadFrac: bscanParams.svdSpreadFrac });
+      svdRank = filtered.rank;
+      ctx.svdRank = svdRank;
       hCalReals = filtered.reals;
       hCalImags = filtered.imags;
     }
@@ -646,10 +678,18 @@ function accumulateRow(c, p, zi, depth, sp, tbl) {
   const tblX = tbl ? tbl.X : null;
   const tblL = tbl ? tbl.L : null;
   const row = zi * pixelsX;
+  // INTEGRATION HALF-ANGLE. Without it every position contributes to every pixel: on a
+  // 70 cm scan a pixel 17 cm deep is summed over +-35 cm of aperture, i.e. out to 64
+  // degrees, where the antenna barely illuminates and the refracted ray is near grazing.
+  // Those contributions carry little signal and full clutter. The limit is taken in the
+  // wall, tan(theta) * depth, plus the standoff's own reach so shallow pixels keep an
+  // aperture at all. 0 disables it, which is what the code did before.
+  const maxDx = c.apertureTan > 0 ? c.apertureTan * (depth + sp) : Infinity;
 
   for (let xi = 0; xi < pixelsX; xi++) {
     const lateral = (xi / (pixelsX - 1)) * apertureLength;
     const dx = lateral - antX;
+    if (dx > maxDx || dx < -maxDx) continue;
 
     let R;
     if (layered) {
@@ -688,10 +728,17 @@ function accumulateRow(c, p, zi, depth, sp, tbl) {
 }
 
 function finalizeCoherent(c) {
-  const { accRe, accIm, accAbs, accN, image, coherence, minContrib } = c;
+  const { accRe, accIm, accAbs, accN, image, coherence, minContrib, apertureNormalize } = c;
   for (let i = 0; i < image.length; i++) {
     const mag = Math.sqrt(accRe[i] * accRe[i] + accIm[i] * accIm[i]);
-    image[i] = 20 * Math.log10(mag + 1e-12);
+    // APERTURE NORMALISATION (optional). The back-projection is a SUM, so a pixel reached
+    // by fewer positions is dimmer for a reason that has nothing to do with what is there:
+    // near the ends of a scan the aperture simply runs out, and at depth z with a half-angle
+    // theta a target needs 2*z*tan(theta) of it. Dividing by the number of contributions
+    // makes the pixel an AVERAGE, which is the reflectivity estimate rather than a count of
+    // how much of the aperture survived -- at the cost of being noisier where support is
+    // thin, which is what `coherence` is there to report.
+    image[i] = 20 * Math.log10((apertureNormalize ? mag / Math.max(1, accN[i]) : mag) + 1e-12);
 
     // Debias before storing. N contributions with random phases still sum to about
     // 1/sqrt(N) of their incoherent total, so the RAW ratio is not comparable between
@@ -776,7 +823,11 @@ function toResult(c) {
       coherent: c.hasHcal,
       epsilonR: c.epsilonR,
       windowType: bscanParams.windowType || 'rectangular',
+      // How many clutter components were actually removed. Fixed rank: whatever was asked
+      // for. Adaptive: however many looked like clutter, which is the point of it.
+      svdRank: c.svdRank || 0,
       standoffN: c.standoffN,
+      apertureAngleDeg: bscanParams.apertureAngleDeg || 0,
       // Reported so the panel can say what the standoff column actually is, rather
       // than only how many cells carried one. `reachableDepth` is the un-clipped
       // bound: it stays visible even after Max Depth has been fitted down to it, so

@@ -32,6 +32,13 @@ services = [
     [sys.executable, '-u', os.path.join(base, 'sensors', 'stream.py')],
     [sys.executable, '-u', os.path.join(base, 'radar', 'sdr_server.py')],
     [sys.executable, '-u', os.path.join(base, 'rover', 'rover_server.py')],
+    # The groundstation itself: Flask serving frontend/dist + the /api/models
+    # store on port 5000, so any device on sfr-pi just opens
+    # http://10.42.0.1:5000 -- no PC-side repo needed. No --debug here: the
+    # Flask reloader forks a child our terminate() would orphan. Benchmarked
+    # 2026-09-20: serving costs nothing against a 135 Hz sweep (CLAUDE.md).
+    [sys.executable, '-u',
+     os.path.join(os.path.dirname(base), 'groundstation', 'app.py')],
 ]
 
 print(f"Starting {len(services)} service(s)...")

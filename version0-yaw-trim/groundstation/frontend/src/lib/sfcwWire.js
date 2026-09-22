@@ -72,6 +72,11 @@ export function decodeSfcwBinary(buffer) {
   defineLazy(msg, 'magnitudes', () => piProfile().magnitudes);
   msg.h_cal_real = Array.from(re, (x) => roundHalfEven(x, 1e8));
   msg.h_cal_imag = Array.from(im, (x) => roundHalfEven(x, 1e8));
+  // The unrounded values, for a recorder that wants the frame's full precision (the Handheld
+  // Capture panel). Non-enumerable, so spread, JSON.stringify and structuredClone of the
+  // message are unchanged; copies, so nothing written to them can reach the profile above.
+  Object.defineProperty(msg, 'h_cal_full_real', { value: Float64Array.from(re), enumerable: false });
+  Object.defineProperty(msg, 'h_cal_full_imag', { value: Float64Array.from(im), enumerable: false });
   for (const key of Object.keys(header)) {
     if (key !== 'type') msg[key] = header[key];
   }

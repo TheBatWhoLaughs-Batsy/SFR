@@ -315,6 +315,35 @@ export function computeHandheldPosition(msg, origin, assignment = DEFAULT_ASSIGN
   };
 }
 
+/** Position along one axis from ONE measurement: `mm` taken at attitude `quat`, against
+ *  `origin`. The same arithmetic computeHandheldPosition applies per sample (tilt-corrected
+ *  perpendicular distance when both attitudes are known), without its averaging window, for
+ *  consumers that time each measurement themselves (the Handheld Capture panel). Returns null
+ *  with no origin on that axis, no reading, or a beam past grazing -- where the panel falls
+ *  back to the raw reading, a recorder should not place anything. */
+export function axisPositionMm(axisKey, mm, quat, origin, { mount = null, tilt = true } = {}) {
+  const a = HANDHELD_AXES.find((x) => x.key === axisKey);
+  const originMm = origin?.[axisKey];
+  if (!a || !Number.isFinite(mm) || !Number.isFinite(originMm)) return null;
+  const q = qNormalize(quat);
+  const q0 = qNormalize(origin?.q?.[axisKey]);
+  let used = mm;
+  if (tilt && q && q0) {
+    const g = beamGeometry(mountVectors(mount)[axisKey], qRelative(q0, q), mm, null);
+    if (!g.available || g.hMm == null) return null;
+    used = g.hMm + g.leverMm;
+  }
+  return a.sign * (originMm - used);
+}
+
+/** True when the sensor stream carries all three handheld LiDARs: every assigned head is in
+ *  the packet. A head that is present but out of range still counts (its reading is 'lost',
+ *  not 'absent'), so this says the hardware is there, not that every reading is good. */
+export function allHandheldLidarsPresent(pose, connected = true) {
+  if (!connected || !pose || !pose.connected || pose.legacy) return false;
+  return HANDHELD_AXES.every(a => pose.axes[a.key] && pose.axes[a.key].status !== 'absent');
+}
+
 /** New origin from the current readings. Axes with no fresh reading keep
  *  whatever origin they had (possibly none), and are reported in `kept`.
  *

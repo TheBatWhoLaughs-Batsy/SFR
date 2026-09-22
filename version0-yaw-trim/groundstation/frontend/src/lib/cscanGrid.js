@@ -729,6 +729,52 @@ export function cscanLayout(w, h, params, projection, canvasOffset) {
   };
 }
 
+// A cell's rectangle on a `cscanLayout`, SNAPPED so the grid tiles exactly.
+//
+// Each edge is rounded from the cell BOUNDARY, not from a position plus a
+// width, so column ix's right edge and column ix+1's left edge are the same
+// expression and therefore the same pixel: no gap, and no overlap.
+//
+// It used to return the raw fractional rectangle, and the fills compensated for
+// the resulting hairline gaps with `Math.ceil(r.w) + 0.5` -- which overdraws
+// each cell by up to 1.5 px into the neighbour below and to its right. On a
+// coarse grid that is a few percent of a cell; on the 101-column rasters this
+// rig actually captures (~10 px a cell at a typical pane width) it is ~15% of
+// the cell, i.e. every cell visibly bleeding into the next. A plan view is a
+// measurement, so a cell must cover its own area and nothing else.
+//
+// Rounding costs at most half a pixel of placement against the exact geometry,
+// and it does NOT accumulate -- each edge is rounded from its own absolute
+// boundary rather than from the previous edge -- so the to-scale projection
+// stays true to within a pixel across the whole grid.
+//
+// Shared by the C-scan plan view and the Projector Demo grid.
+export function layoutCellRect(ix, iy, L) {
+  const x0 = Math.round(L.originX + ix * L.cellW);
+  const x1 = Math.round(L.originX + (ix + 1) * L.cellW);
+  const y1 = Math.round(L.originY - iy * L.cellH);
+  const y0 = Math.round(L.originY - (iy + 1) * L.cellH);
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
+
+// The cell under a canvas point, or null outside the grid.
+export function layoutCellAt(px, py, L, hCount, vCount) {
+  const ix = Math.floor((px - L.originX) / L.cellW);
+  const iy = Math.floor((L.originY - py) / L.cellH);
+  if (ix < 0 || ix >= hCount || iy < 0 || iy >= vCount) return null;
+  return { ix, iy };
+}
+
+// Where a canvas sits inside the element to-scale placement is measured from
+// (the viewport, or the projector window's container), so the grid holds still
+// on the wall when panes around the canvas change.
+export function canvasOffsetIn(rootRef, rect) {
+  const root = rootRef && rootRef.current;
+  if (!root) return { x: 0, y: 0 };
+  const r = root.getBoundingClientRect();
+  return { x: rect.left - r.left, y: rect.top - r.top };
+}
+
 // Which population the PLAN VIEW's dynamic colour limits come from.
 //
 // Linked, both panes read one set of limits over every bin of every cell, so a

@@ -1,29 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import DetectWorker from '../lib/sarDetect.worker.js?worker';
+// The projection lives in lib/sarDetect.js so the Node harness (bench/run.mjs) uses the
+// same one; re-exported here for callers that had it from this module.
+import { projectRowsForDetect } from '../lib/sarDetect';
 
-// Same projection discipline as useSarWorker: postMessage structured-clones, and a
-// C-scan record's `sweeps` alone can be hundreds of MB. grid_iy is needed here so the
-// worker can split the scan into rows.
-const DETECT_FIELDS = [
-  'h_cal_real', 'h_cal_imag', 'magnitudes', 'distances',
-  'lidar_standoff_mm', 'step_size', 'range_offset', 'grid_ix', 'grid_iy',
-];
-
-export function projectRowsForDetect(bscanData) {
-  if (!bscanData || bscanData.length < 2 || !bscanData[0].h_cal_real) return [];
-  const byRow = new Map();
-  for (const pos of bscanData) {
-    const iy = Number.isFinite(pos.grid_iy) ? pos.grid_iy : 0;
-    if (!byRow.has(iy)) byRow.set(iy, []);
-    const out = {};
-    for (const k of DETECT_FIELDS) out[k] = pos[k];
-    if (!Number.isFinite(out.grid_ix)) out.grid_ix = byRow.get(iy).length;
-    byRow.get(iy).push(out);
-  }
-  return [...byRow.entries()].sort((a, b) => a[0] - b[0])
-    .map(([iy, cells]) => ({ iy, cells: cells.sort((a, b) => a.grid_ix - b.grid_ix) }))
-    .filter((r) => r.cells.length >= 2);
-}
+export { projectRowsForDetect };
 
 /**
  * Runs lib/sarDetect.js in a worker whenever the scan, the reference or the geometry

@@ -210,9 +210,22 @@ DSP_MIN_DWELL = 1088 + 2400
 # samples/step (table indices 2, 2), dwell 3456: the shortest dwell the Nios
 # II/f held stably in the 2026-09-07 measurement (it rails at ~3030 samples
 # per retune; 3456 = 54 units of 64). Guard = 3456 - 2112 = 1344 samples.
-# Sweep 51 x 3456 / 10.24 MS/s = 17.2 ms, ~58 Hz. 512 of settle is the value
-# UNDER TEST: benchmark_sweep.py --mode dsp --flush N gives S_repeat vs settle.
-DSP_DEFAULT_FLUSH_SEL = 2
+# Sweep 51 x 3456 / 10.24 MS/s = 17.2 ms, ~58 Hz.
+#
+# FLUSH 512 -> 128 (sel 2 -> 6), 2026-09-20. 512 samples of settle was 4x more
+# than the AD9361 fastlock needs. Measured (dsp mode, rx1=12, interleaved,
+# 800 sweeps/step, dwell held to isolate FLUSH quality from rate): S_repeat is
+# flat 40.2 dB at FLUSH 512 down to 39.9 dB at 128 -- inside the control spread,
+# 0/780 corrupt at every step -- and only softens at 64 (first z>8 cell, zmax
+# 8.2). 128 is the settling floor with full margin. With the dwell shrunk to
+# match (128 + 1200 + 16 guard = 1344), a 1400-sweep confirmation gave
+# 135.7 Hz at 39.9 dB, 0/1399 corrupt, 1/71400 robust-z cells: +35% fps over
+# the 100 Hz default at unchanged quality, because it was settling allowance
+# that was never used. NOT the retune corruption settle_count guards in the
+# host cores -- the FPGA gate only releases a WHOLE sweep. If a sweep ever
+# corrupts, this is NOT the first suspect (check the RX1 level and the TX2->RX2
+# loopback); to revert, set this back to 2 and DSP_DEFAULT_DWELL to 1856.
+DSP_DEFAULT_FLUSH_SEL = 6
 # accum-1200 branch: ACCUM 1600 -> 1200 (table index 3, 12 whole tone
 # cycles). Integration 156 -> 117 us per step: -1.25 dB of per-point SNR
 # (10*log10(1200/1600)), which coherent averaging of two sweeps at the
@@ -220,10 +233,13 @@ DSP_DEFAULT_FLUSH_SEL = 2
 # against stepper-pipeline (1600) before keeping it.
 DSP_DEFAULT_ACCUM_SEL = 3
 # fpga-stepper: the step boundary is exact, so the dwell is need + a small
-# guard: 512 + 1200 + 144 = 1856 (29 units of 64; _sweep_core_dsp still
-# rounds the dwell to 64). 51 x 1856 / 10.24 MS/s = 9.2 ms acquisition,
-# ~97 Hz with the host pipelined. (1600: 2240; Nios-timed v12: 3456.)
-DSP_DEFAULT_DWELL     = 1856 if DSP_STEPPER else 3456
+# guard: with FLUSH 128 (sel 6, see DSP_DEFAULT_FLUSH_SEL) the need is
+# 128 + 1200 = 1328, and dwell 1344 = 21 units of 64 leaves a 16-sample guard.
+# 51 x 1344 / 10.24 MS/s = 6.7 ms acquisition, ~136 Hz with the host pipelined.
+# (FLUSH 512: 1856/~97 Hz; 1600 accum: 2240; Nios-timed v12: 3456.)
+# DSP_DEFAULT_FLUSH_SEL and this dwell are ONE operating point -- change them
+# together, keeping dwell >= FLUSH_N + ACCUM_N.
+DSP_DEFAULT_DWELL     = 1344 if DSP_STEPPER else 3456
 # dsp mode has no host-side slicer, so the NIOS_MIN_DWELL 4096 stability
 # argument does not apply; the floor is the Nios's own retune rail.
 DSP_DWELL_FLOOR       = 3072
@@ -372,7 +388,36 @@ class SFCWEngine:
         # not settling and more settling will not fix it.
         self.settle_count = 0
         self.tx1_gain = 50
-        self.rx1_gain = 25
+        # rx1_gain 25 -> 12 (2026-09-19). 25 dB put the ANTENNA channel into the
+        # same level-dependent regime the reference channel was found in on
+        # 2026-08-29, and it was worth ~10 dB of S_repeat. Measured interleaved
+        # (configs rotated every 40 sweeps, so a bench episode hits both):
+        #   standard core, 1300 sweeps each: rx1=25 31.7 dB, rx1=12 41.4, rx1=8 41.8
+        #   nios core,      900 sweeps each: rx1=25 31.8 dB, rx1=12 41.7 / 41.9
+        # Paired per chunk, rx1=12 beat rx1=25 in 33 of 33 chunks (+8.3 dB mean,
+        # t = +15.6); the duplicate control pair differed by 0.2 dB. rx1=8 is
+        # indistinguishable from 12 (+0.18 dB, t = +0.3), so 12 is taken for the
+        # 4 dB more signal it keeps. Per-step robust-z stayed clean (2/66,300
+        # cells beyond 8 sigma, worst z 8.2), so this is not buying repeatability
+        # by losing steps.
+        #
+        # At 25 dB the RX1 ADC peak railed on 2-5% of sweeps AND, more to the
+        # point, per-sweep deviation tracked per-sweep RX1 peak (corr +0.24..+0.39
+        # at 25 dB, +0.07 at 12 dB) -- so the damage is a continuous level
+        # dependence, not the rail itself. The tell is that the excess was
+        # concentrated where |h_cal| is largest: at 25 dB the hottest quarter of
+        # the profile wobbled 1.95% against 1.3% for the rest, and at 12 dB all
+        # four quartiles collapse onto ~0.5%.
+        #
+        # _warn_if_adc_hot could never have caught it: it needs 8 CONSECUTIVE hot
+        # sweeps and the railing is a few percent of sweeps, scattered. Aim RX1 at
+        # a few hundred counts peak, the same band the reference is held in.
+        #
+        # CHANGING THIS INVALIDATES EVERY BG MODEL, SUPER FIT REFERENCE AND
+        # CAPTURED bgRef taken at the old gain -- a gain change re-calibrates
+        # h_cal and is NOT a scalar: |h_cal| at rx1=12 over rx1=25 runs 0.176 to
+        # 0.263 across 2-5 GHz, a 1.5:1 frequency-dependent change. Recapture.
+        self.rx1_gain = 12
         # Reference-channel (TX2 -> loopback cable -> RX2) gains. These set the level
         # the reference lands at on RX2's ADC, and that level is the single largest
         # driver of sweep-to-sweep variability in the whole system: h_cal = h_signal /
@@ -506,6 +551,26 @@ class SFCWEngine:
         # This is where most of the speed lives (48 -> 28.5 ms engine-direct);
         # the cost is that a failure surfaces one sweep late, as a fallback.
         self.nios_pipeline = True
+
+        # --- Diagnostic hooks for the per-retune wobble probe (default OFF) ---
+        # The wire only ever carries h_cal = h_signal / h_reference, so nothing
+        # downstream can tell a wobble in the antenna channel from one in the
+        # reference. These two flags expose the halves, and cost one bool test
+        # per sweep when off. Used by pi/radar/probe_wobble.py.
+        #
+        #   keep_raw_channels  -> _last_channels = (sig, ref), one complex
+        #                         phasor per step, BEFORE the division. Tiny.
+        #   keep_full_capture  -> _last_capture = dict with the whole sliced
+        #                         nios capture (~8 MB/sweep) so a probe can
+        #                         re-demodulate sub-windows INSIDE each dwell.
+        #                         Only ever enable this for a few sweeps.
+        #
+        # nios mode only: 'dsp' does the demod and the division on the FPGA and
+        # never sends raw samples, so the halves do not exist on the host.
+        self.keep_raw_channels = False
+        self.keep_full_capture = False
+        self._last_channels = None
+        self._last_capture = None
         self._nios_primed = False
         self._nios_primed_steps = 0
         self._nios_primed_key = None
@@ -1036,6 +1101,21 @@ class SFCWEngine:
                         self._callback({'error': 'USB stream died — restart sweep'})
                     break
                 if self._gains_dirty:
+                    # In 'dsp' mode a sweep is normally already IN FLIGHT here
+                    # (DSP_PIPELINE_EXEC), and while the FPGA stepper is
+                    # clocking retunes it owns the AD9361 SPI pins outright --
+                    # bladerf-hosted.vhd muxes adi_spi_* on stp_owner with no
+                    # arbitration, so a host gain write on the Nios SPI master
+                    # is silently lost or, worse, lands half-clocked as a
+                    # corrupted gain word. Measured 2026-09-19: gain re-pushes
+                    # during a live dsp sweep landed at the wrong level or not
+                    # at all (commanded 8 dB -> level unchanged; commanded 12
+                    # -> 27.9x). Drain the in-flight sweep first, exactly as
+                    # re-priming already does, so the stepper is idle and the
+                    # bus is the Nios's when the write goes out. Costs one
+                    # sweep (~10 ms) per gain change.
+                    if self.sweep_mode == 'dsp' and self._nios_primed_steps:
+                        self._dsp_cancel_pending(self._nios_primed_steps)
                     self._apply_gains()
                 range_profile = self._perform_sweep()
                 if range_profile is not None and self._callback:
@@ -2185,9 +2265,12 @@ class SFCWEngine:
 
         def h_cal_at(off):
             ref = reduce_steps(ref_all, off)
+            sig = reduce_steps(sig_all, off)
+            if self.keep_raw_channels:
+                self._last_channels = (sig.copy(), ref.copy())
             ok = np.abs(ref) > 1e-10
             out = np.zeros(num_steps, dtype=np.complex128)
-            out[ok] = reduce_steps(sig_all, off)[ok] / ref[ok]
+            out[ok] = sig[ok] / ref[ok]
             return out, int(num_steps - np.count_nonzero(ok))
 
         # T0 is settled structurally (see the span gate in
@@ -2198,6 +2281,16 @@ class SFCWEngine:
         # aligned sweep to make the scene look more like it used to. See the
         # long note at the span gate for the failure that produced.
         h_cal, dropped = h_cal_at(offset)
+
+        if self.keep_full_capture:
+            # Everything a probe needs to re-slice this sweep itself at a
+            # different window position inside the dwell.
+            self._last_capture = {
+                'sig': sig_all.copy(), 'ref': ref_all.copy(),
+                'offset': int(offset), 'stride': int(stride),
+                'settle': int(settle), 'win': int(win),
+                'num_steps': int(num_steps), 'guard': int(NIOS_WINDOW_GUARD),
+            }
 
         if dropped > num_steps // 5:
             return fallback(f"{dropped}/{num_steps} steps had no reference signal")
@@ -2872,6 +2965,13 @@ class SFCWEngine:
         valid = ref_mag > 1e-10
         h_cal = np.zeros(num_steps, dtype=np.complex128)
         h_cal[valid] = h_signal[valid] / h_reference[valid]
+
+        if self.keep_raw_channels:
+            # See keep_raw_channels in __init__. The standard core is the only
+            # one that can run a CONSTANT-frequency grid: the nios aligner
+            # locates steps by their retune transient, and a retune to the
+            # frequency already tuned produces none.
+            self._last_channels = (h_signal.copy(), h_reference.copy())
 
         adc_peak = {
             'rx1': float(adc_peak_rx1),

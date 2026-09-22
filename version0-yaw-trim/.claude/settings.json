@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/sriva/Desktop/version0/**)",
+      "Glob(//c/Users/sriva/Desktop/version0/**)",
+      "Grep(//c/Users/sriva/Desktop/version0/**)",
+
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git ls-files:*)",
+      "Bash(git branch:*)",
+      "Bash(git blame:*)",
+      "Bash(git stash list:*)",
+      "Bash(git check-ignore:*)",
+      "Bash(git remote -v)",
+
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(rg:*)",
+      "Bash(sed -n:*)",
+      "Bash(awk:*)",
+      "Bash(sort:*)",
+      "Bash(uniq:*)",
+      "Bash(diff:*)",
+      "Bash(stat:*)",
+      "Bash(file:*)",
+      "Bash(which:*)",
+      "Bash(command -v:*)",
+      "Bash(md5sum:*)",
+      "Bash(sha256sum:*)",
+      "Bash(mkdir -p:*)",
+      "Bash(cp:*)",
+
+      "Bash(npm run build:*)",
+      "Bash(npm run bench:*)",
+      "Bash(npm run preview:*)",
+      "Bash(npm ls:*)",
+      "Bash(npm install:*)",
+      "Bash(npm ci:*)",
+      "Bash(node --import ./bench/register.mjs:*)",
+      "Bash(node -e:*)",
+      "Bash(node --version)",
+
+      "Bash(python -m py_compile:*)",
+      "Bash(python3 -m py_compile:*)",
+      "Bash(python -c:*)",
+      "Bash(python3 -c:*)",
+      "Bash(python --version)",
+
+      "Bash(bash rover/test/build_check.sh:*)",
+      "Bash(g++:*)",
+
+      "Bash(ssh sfr@10.42.0.1:*)",
+      "Bash(ssh sfr@sfr.local:*)",
+
+      "PowerShell(Get-ChildItem:*)",
+      "PowerShell(Get-Content:*)",
+      "PowerShell(Select-String:*)",
+      "PowerShell(Test-Path:*)",
+      "PowerShell(Measure-Object:*)",
+
+      "Skill(verify-lib)",
+      "Skill(ui-drive)",
+      "Skill(rf-bench)",
+      "Skill(pi-deploy)",
+      "Skill(think)",
+      "Skill(debug)",
+      "Skill(wrapup)",
+      "Skill(harness)"
+    ],
+    "ask": [
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git merge:*)",
+      "Bash(git rebase:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(npm uninstall:*)",
+      "Bash(pip install:*)",
+      "Bash(pip3 install:*)",
+      "Bash(scp:*)",
+      "Bash(rsync:*)"
+    ],
+    "deny": [
+      "Read(./id_raspi)",
+      "Read(./.env)",
+
+      "Bash(git reset --hard:*)",
+      "Bash(git clean -f:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git filter-branch:*)",
+      "Bash(rm -rf:*)",
+
+      "Bash(bladeRF-cli -L:*)",
+      "Bash(bladeRF-cli --flash-fpga:*)",
+      "Bash(arduino-cli upload:*)",
+      "Bash(usbreset:*)"
+    ]
+  }
+}

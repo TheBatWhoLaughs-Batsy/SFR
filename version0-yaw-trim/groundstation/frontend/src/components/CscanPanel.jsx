@@ -6,7 +6,8 @@ import { orderedCellForIndex, gridStats, gridRoverExtent, gridRoverExtentContinu
   BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
 import { samplingFor, NOMINAL_SWEEP_MS } from '@/lib/roverTrack';
 import { MIN_MOVE_MS } from '@/hooks/useRoverScan';
-import { listDisplays } from './ProjectorWindow';
+import ProjectionControls from './ProjectionControls';
+import EditableField from './EditableField';
 import { pipeOverlay } from '@/lib/detectionOverlay';
 
 const LIDAR_AVG_WINDOW = 20;
@@ -54,10 +55,6 @@ export default function CscanPanel({
   const [lidarAvg, setLidarAvg] = useState(null);
   const [modelList, setModelList] = useState(null);
   const [modelListOpen, setModelListOpen] = useState(false);
-  // Displays offered for the projector window; null when the picker is closed.
-  const [displays, setDisplays] = useState(null);
-  const [projectorNote, setProjectorNote] = useState(null);
-
   useEffect(() => {
     if (lidarMm == null) return;
     const buf = lidarBuf.current;
@@ -106,39 +103,6 @@ export default function CscanPanel({
   // Plan-view scale and placement, defaulted so the panel still renders if the
   // prop is absent.
   const proj = projection || { toScale: false, pxPerCm: 8, leftPx: 60, topPx: 80 };
-  // Relative, so they go through the updater form -- clicking faster than React
-  // re-renders must compose rather than collapse to a single step.
-  const nudgeScale = (f) => onProjectionChange(p => ({
-    ...p,
-    pxPerCm: Math.min(200, Math.max(0.2, Math.round(p.pxPerCm * f * 1000) / 1000)),
-  }));
-  const nudgePlace = (key, d) => onProjectionChange(p => ({
-    ...p,
-    [key]: Math.round((p[key] + d) * 10) / 10,
-  }));
-
-  // Display picker for the projector window. `listDisplays()` needs a user
-  // gesture (it is what prompts for the window-management permission), so it
-  // runs on the click rather than on mount -- and it returns null wherever the
-  // browser will not enumerate displays at all, which is not an error, just the
-  // case where the operator has to drag the window across themselves.
-  const openProjector = async () => {
-    setProjectorNote(null);
-    const displays = await listDisplays();
-    if (!displays || displays.length < 2) {
-      // Nothing to choose between: either the API is unavailable, or this
-      // machine has one screen and the projector is not attached yet.
-      setDisplays(null);
-      onProjectorChange({ target: displays && displays.length === 1 ? displays[0] : null });
-      if (!displays) {
-        setProjectorNote('This browser will not list displays — drag the window to the projector and press F11. Chrome can list them if you allow window management.');
-      } else if (displays.length < 2) {
-        setProjectorNote('Only one display detected. Connect the projector, then reopen to pick it.');
-      }
-      return;
-    }
-    setDisplays(displays);
-  };
   const gridFull = captured >= stats.total;
 
   // ── Rover mode ────────────────────────────────────────────────────────
@@ -491,7 +455,7 @@ export default function CscanPanel({
                     unit="mm/s"
                     onChange={(v) => update('roverSpeedMmS', Math.max(1, Math.round(v)))}
                     min={1}
-                    max={150}
+                    max={300}
                   />
                   {/* Zero by default: the run-up below is settling that has
                       already been paid for, in motion and outside the grid. */}
@@ -1280,183 +1244,16 @@ export default function CscanPanel({
           </div>
         )}
 
-        <button
-          onClick={() => onProjectionChange({ ...proj, toScale: !proj.toScale })}
-          className={cn(
-            'w-full px-3 py-2 rounded-lg text-xs font-medium transition-all border',
-            proj.toScale
-              ? 'bg-[#4aff8a]/10 border-[#4aff8a]/40 text-[#4aff8a]'
-              : 'bg-white/5 border-white/10 text-white/50 hover:text-white/80',
-          )}
-        >
-          {proj.toScale ? '● To scale' : 'Fit to pane'}
-        </button>
-
-        <EditableField
-          label="Scale"
-          value={proj.pxPerCm}
-          unit="px/cm"
-          onChange={(v) => onProjectionChange({ ...proj, pxPerCm: v })}
-          min={0.2}
-          max={200}
-          locked={!proj.toScale}
+        <ProjectionControls
+          projection={proj}
+          onProjectionChange={onProjectionChange}
+          projector={projector}
+          onProjectorChange={onProjectorChange}
+          widthCm={stats.width}
+          heightCm={stats.height}
+          hStep={hStep}
+          vStep={vStep}
         />
-
-        {/* Multiplicative trim, because aligning a projected image is a matter
-            of a few percent either way rather than a fixed number of pixels. */}
-        <div className="grid grid-cols-4 gap-1.5">
-          {[['-5%', 1 / 1.05], ['-1%', 1 / 1.01], ['+1%', 1.01], ['+5%', 1.05]].map(([label, f]) => (
-            <button
-              key={label}
-              disabled={!proj.toScale}
-              onClick={() => nudgeScale(f)}
-              className={cn(
-                'px-2 py-1.5 rounded-lg text-[10px] font-mono font-semibold transition-all border',
-                proj.toScale
-                  ? 'bg-white/5 border-white/10 text-white/60 hover:text-white hover:border-white/25'
-                  : 'bg-[#0a0a0a]/40 border-white/5 text-white/20 cursor-not-allowed',
-              )}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-
-        {/* Placement. Measured from the top-left of the VIEWPORT (everything
-            right of this sidebar), not of the C-scan canvas, so the projected
-            grid holds its position when the Live Sweep pane appears or a row's
-            B-scan opens underneath it. */}
-        <div className="px-1 pt-1 text-[9px] font-medium uppercase tracking-wider text-[#555555]">
-          Grid top-left, from the viewport corner
-        </div>
-        <div className="grid grid-cols-2 gap-2">
-          <EditableField
-            label="Left"
-            value={proj.leftPx}
-            unit="px"
-            onChange={(v) => onProjectionChange({ ...proj, leftPx: v })}
-            min={-20000}
-            max={20000}
-            locked={!proj.toScale}
-          />
-          <EditableField
-            label="Top"
-            value={proj.topPx}
-            unit="px"
-            onChange={(v) => onProjectionChange({ ...proj, topPx: v })}
-            min={-20000}
-            max={20000}
-            locked={!proj.toScale}
-          />
-        </div>
-
-        {[['leftPx', 'Left'], ['topPx', 'Top']].map(([key, label]) => (
-          <div key={key} className="flex items-center gap-1.5">
-            <span className="w-7 shrink-0 text-[9px] font-medium uppercase tracking-wider text-[#555555]">
-              {label}
-            </span>
-            {[-10, -1, 1, 10].map(d => (
-              <button
-                key={d}
-                disabled={!proj.toScale}
-                onClick={() => nudgePlace(key, d)}
-                className={cn(
-                  'flex-1 px-1 py-1.5 rounded-lg text-[10px] font-mono font-semibold transition-all border',
-                  proj.toScale
-                    ? 'bg-white/5 border-white/10 text-white/60 hover:text-white hover:border-white/25'
-                    : 'bg-[#0a0a0a]/40 border-white/5 text-white/20 cursor-not-allowed',
-                )}
-              >
-                {d > 0 ? `+${d}` : d}
-              </button>
-            ))}
-          </div>
-        ))}
-
-        <div className="grid grid-cols-2 gap-2">
-          <InfoTile
-            label="Grid on screen"
-            value={proj.toScale
-              ? `${(stats.width * proj.pxPerCm).toFixed(0)} × ${(stats.height * proj.pxPerCm).toFixed(0)} px`
-              : 'fitted'}
-          />
-          <InfoTile
-            label="Cell on screen"
-            value={proj.toScale
-              ? `${(hStep * proj.pxPerCm).toFixed(1)} × ${(vStep * proj.pxPerCm).toFixed(1)} px`
-              : '—'}
-          />
-        </div>
-
-        {/* Projector output. A second window holding the grid and nothing
-            else, opened on a chosen display and full-screened there. It reads
-            the same scale and placement as the pane above, so this section
-            stays the control surface while the wall shows the result. */}
-        <div className="px-1 pt-1 text-[9px] font-medium uppercase tracking-wider text-[#555555]">
-          Projector output
-        </div>
-        {projector && projector.error === 'blocked' ? null : projector ? (
-          <>
-            <button
-              onClick={() => onProjectorChange(null)}
-              className="w-full px-3 py-2 rounded-lg text-xs font-medium transition-all border bg-[#f59e0b]/10 border-[#f59e0b]/40 text-[#f59e0b]"
-            >
-              ● Close projector window
-            </button>
-            <div className="px-2 text-[9px] text-white/40">
-              Showing on <span className="text-white/70">{projector.target ? projector.target.label : 'a free window'}</span>
-            </div>
-          </>
-        ) : displays ? (
-          <>
-            <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-              Pick the display the projector is on:
-            </div>
-            {displays.map(d => (
-              <button
-                key={d.id}
-                onClick={() => { setDisplays(null); onProjectorChange({ target: d }); }}
-                className="w-full px-3 py-2 rounded-lg text-left text-xs font-medium transition-all border bg-white/5 border-white/10 text-white/70 hover:text-white hover:border-white/25"
-              >
-                {d.label}
-                <span className="ml-2 text-[9px] font-mono text-white/35">
-                  {d.width}×{d.height}{d.isInternal ? ' · built-in' : ''}
-                </span>
-              </button>
-            ))}
-            <button
-              onClick={() => setDisplays(null)}
-              className="w-full px-3 py-1.5 rounded-lg text-[10px] font-medium border bg-transparent border-white/10 text-white/40 hover:text-white/70"
-            >
-              Cancel
-            </button>
-          </>
-        ) : (
-          <button
-            onClick={openProjector}
-            disabled={!proj.toScale}
-            className={cn(
-              'w-full px-3 py-2 rounded-lg text-xs font-medium transition-all border',
-              proj.toScale
-                ? 'bg-[#4aff8a]/10 border-[#4aff8a]/30 text-[#4aff8a] hover:border-[#4aff8a]/60'
-                : 'bg-[#0a0a0a]/40 border-white/5 text-white/20 cursor-not-allowed',
-            )}
-          >
-            Open projector view…
-          </button>
-        )}
-        {projector && projector.error === 'blocked' && (
-          <div className="px-2 py-1.5 rounded-lg bg-[#ff4d6d]/5 border border-[#ff4d6d]/30 text-[9px] text-[#ff4d6d] leading-relaxed">
-            The browser blocked the popup. Allow pop-ups for this page, then try
-            again.
-          </div>
-        )}
-        {projectorNote && (
-          <div className="px-2 py-1.5 rounded-lg bg-[#f59e0b]/5 border border-[#f59e0b]/30 text-[9px] text-[#f59e0b] leading-relaxed">
-            {projectorNote}
-          </div>
-        )}
-
       </Section>
 
       {/* Colour scaling — dynamic tracks the data, manual pins both ends live */}
@@ -1867,64 +1664,6 @@ function SliderRow({ label, value, unit, min, max, step, onChange, disabled, acc
         <span>{min}</span>
         <span>{max}</span>
       </div>
-    </div>
-  );
-}
-
-function EditableField({ label, value, unit, onChange, min, max, locked }) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState('');
-
-  const startEdit = () => {
-    if (locked) return;
-    setDraft(String(value));
-    setEditing(true);
-  };
-
-  const commit = () => {
-    const num = parseFloat(draft);
-    if (!isNaN(num) && num >= min && num <= max) {
-      onChange(num);
-    }
-    setEditing(false);
-  };
-
-  return (
-    <div
-      onClick={!editing ? startEdit : undefined}
-      className={cn(
-        'relative flex flex-col gap-0.5 p-3 rounded-xl border',
-        'transition-all duration-300',
-        locked
-          ? 'border-white/5 bg-[#0a0a0a]/40 opacity-40 cursor-not-allowed'
-          : editing
-            ? 'border-[#6B9BD2]/40 bg-[#6B9BD2]/5 cursor-text'
-            : 'border-white/8 bg-[#0a0a0a]/60 cursor-pointer hover:border-white/20 hover:bg-white/[0.02]',
-      )}
-    >
-      <span className="text-[10px] font-medium uppercase tracking-wider text-[#555555]">{label}</span>
-      {editing ? (
-        <div className="flex items-baseline gap-1">
-          <input
-            autoFocus
-            type="text"
-            value={draft}
-            onChange={e => setDraft(e.target.value)}
-            onBlur={commit}
-            onKeyDown={e => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') setEditing(false); }}
-            className="bg-transparent text-base font-bold font-mono text-white outline-none w-14"
-          />
-          <span className="text-xs font-semibold text-[#888888]">{unit}</span>
-        </div>
-      ) : (
-        <div className="flex items-baseline gap-1">
-          <span className="text-base font-bold font-mono text-white">{value}</span>
-          <span className="text-xs font-semibold text-[#888888]">{unit}</span>
-        </div>
-      )}
-      {editing && (
-        <div className="absolute bottom-0 left-3 right-3 h-px bg-gradient-to-r from-[#6B9BD2] to-[#8BB8E8] rounded-full" />
-      )}
     </div>
   );
 }

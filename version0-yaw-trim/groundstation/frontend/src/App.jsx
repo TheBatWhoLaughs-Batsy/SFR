@@ -20,15 +20,20 @@ import { useRoverScan } from './hooks/useRoverScan';
 import { useRoverBgScan } from './hooks/useRoverBgScan';
 import { DEFAULT_PARAMS as IMAGING_DEFAULT_PARAMS } from './lib/imagingEffects';
 import ProjectorWindow from './components/ProjectorWindow';
+import ProjectorDemoDisplay from './components/ProjectorDemoDisplay';
+import useProjectorDemo from './hooks/useProjectorDemo';
+import useRoverPaint from './hooks/useRoverPaint';
+import useHandheldPaint from './hooks/useHandheldPaint';
+import useHandheldCapture from './hooks/useHandheldCapture';
+import useHandheldRoughView from './hooks/useHandheldRoughView';
 import { decodeSfcwBinary } from './lib/sfcwWire';
 import {
   loadHandheldOrigin, saveHandheldOrigin, loadHandheldAssignment, saveHandheldAssignment,
   loadHandheldAverageMs, saveHandheldAverageMs, createLidarHistory, computeHandheldPosition,
   loadHandheldMount, saveHandheldMount, loadHandheldTiltEnabled, saveHandheldTiltEnabled,
-  HANDHELD_AXES, lidarsByUart, originFromPose,
+  HANDHELD_AXES, lidarsByUart,
 } from './lib/handheldPose';
 import { createMountCalibrator } from './lib/handheldTilt';
-import { captureReadiness, filledCells, cellForPosition, positionSpread } from './lib/handheldScan';
 
 // The SDR socket asks the Pi for sfcw_result as binary frames (see the connect effect
 // and lib/sfcwWire.js). Module-level so the hook sees one stable options object.
@@ -262,7 +267,9 @@ function applyBgToSweep(sfcwResult, bgReal, bgImag, subMode) {
 
 export default function App() {
   const [activePanel, setActivePanel] = useState(null);
-  const [piIp, setPiIp] = useState(() => localStorage.getItem('pi_ip') || '');
+  // 10.42.0.1 is the Pi's fixed address on its own sfr-pi access point (see
+  // "Pi-hosted WiFi network" in CLAUDE.md); a stored value always wins.
+  const [piIp, setPiIp] = useState(() => localStorage.getItem('pi_ip') || '10.42.0.1');
 
   // IMU state
   const [imuData, setImuData] = useState(null);
@@ -373,7 +380,6 @@ export default function App() {
   }, []);
 
   // One computation shared by the panel and the viewport.
-  const hhPoseRef = useRef(null);
   const handheldPose = useMemo(() => computeHandheldPosition(
     imuData, handheldOrigin, handheldAssignment,
     {
@@ -381,7 +387,6 @@ export default function App() {
       mount: handheldMount, tilt: handheldTilt,
     },
   ), [imuData, handheldOrigin, handheldAssignment, handheldAvgMs, handheldMount, handheldTilt]);
-  hhPoseRef.current = handheldPose;
   // Provenance of the standoff used for the most recent sweep (Phase 0.1/0.2):
   // { lidar_standoff_mm, lidar_n, lidar_std, lidar_offset_mm, roll_deg, pitch_deg }
   const [sfcwLidarProvenance, setSfcwLidarProvenance] = useState(null);
@@ -418,6 +423,8 @@ export default function App() {
   // sendSfcwParams is defined after handleSdrMessage (it needs sendSdr, which the
   // websocket hook returns for that handler), so the handler reaches it through a ref.
   const sendSfcwParamsRef = useRef(null);
+  // The Handheld Capture session's raw feeds; the hook is created further down.
+  const handheldCaptureFeedRef = useRef({ sensor: null, sdr: null });
   // True while a sweep THIS tab started is running. Only the owner re-pushes params
   // from the range-offset guard, so two tabs whose panels differ cannot fight.
   const sfcwOwnerRef = useRef(false);
@@ -461,7 +468,13 @@ export default function App() {
     // 21 ms/sweep per unit. See pi/radar/sfcw_engine.py _sweep_core.
     settleCount: 0,
     tx1Gain: 50,
-    rx1Gain: 25,
+    // 25 -> 12 (2026-09-19): 25 dB ran the ANTENNA channel in the same
+    // level-dependent regime the reference channel was found in on 2026-08-29
+    // and cost ~10 dB of S_repeat (interleaved A/B, 1300 sweeps per config,
+    // 33/33 paired chunks). See pi/radar/sfcw_engine.py rx1_gain for the
+    // measurements. NOTE this re-calibrates h_cal and so invalidates every BG
+    // model, Super Fit reference and captured bgRef taken at the old gain.
+    rx1Gain: 12,
     // Reference channel (TX2 -> loopback cable -> RX2). These were previously absent
     // here, so sendSfcwParams never sent them and the Pi kept whatever SFCWEngine last
     // had -- which persists for the life of the sdr_server process, so running
@@ -673,60 +686,6 @@ export default function App() {
   const [bscanData, setBscanData] = useState([]);
   const [bscanCapturing, setBscanCapturing] = useState(false);
   const [bscanBgRef, setBscanBgRef] = useState(null);
-
-  // Handheld Scan panel: its own grid and its own captured cells, kept SEPARATE
-  // from the C-scan's bscanData so the two panels never fight over the same
-  // records or the same capture ref. The position comes from handheldPose
-  // (three LiDARs + IMU); a capture tags the SFCW sweep-after-next as the cell
-  // the head is over, reusing the same buildCellRecord + coherentMean path.
-  const [hhScanData, setHhScanData] = useState([]);
-  const [hhScanCapturing, setHhScanCapturing] = useState(false);
-  const [hhCaptureProgress, setHhCaptureProgress] = useState(null);
-  const [hhAvgCount, setHhAvgCount] = useState(4);
-  const [hhAutoCapture, setHhAutoCapture] = useState(false);
-  // gateStart/gateEnd/metric are what computeCellValues colours a cell by; without
-  // them every cell is NaN and the plan view never colours. Same defaults as the
-  // C-scan. Focus is off: it needs a row of neighbours at a known pitch, which a
-  // hand-carried head does not give.
-  const [hhScanParams, setHhScanParams] = useState({
-    hCount: 8, hStep: 5, vCount: 6, vStep: 5,
-    gateStart: 2, gateEnd: 70, metric: 'peak', focusEnabled: false,
-  });
-  const [hhBeep, setHhBeep] = useState(true);
-  // What the last capture did, for the panel: { kind: 'captured'|'aborted', cell, why, t }.
-  const [hhLastEvent, setHhLastEvent] = useState(null);
-  const hhCaptureRef = useRef(null);
-  const hhScanParamsRef = useRef(hhScanParams);
-  hhScanParamsRef.current = hhScanParams;
-  const hhBeepRef = useRef(hhBeep);
-  hhBeepRef.current = hhBeep;
-
-  // A short tone the operator can hear with their eyes on the wall, not the
-  // screen. Captured = a rising pair; aborted = one low note. Web Audio,
-  // created lazily on first use so autoplay policy is satisfied by the click
-  // that started the sweep.
-  const hhAudioRef = useRef(null);
-  const hhTone = useCallback((kind) => {
-    if (!hhBeepRef.current) return;
-    try {
-      if (!hhAudioRef.current) hhAudioRef.current = new (window.AudioContext || window.webkitAudioContext)();
-      const ac = hhAudioRef.current;
-      const play = (hz, at, ms) => {
-        const o = ac.createOscillator();
-        const g = ac.createGain();
-        o.frequency.value = hz;
-        o.type = 'sine';
-        g.gain.setValueAtTime(0.0001, ac.currentTime + at);
-        g.gain.exponentialRampToValueAtTime(0.15, ac.currentTime + at + 0.01);
-        g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + at + ms / 1000);
-        o.connect(g).connect(ac.destination);
-        o.start(ac.currentTime + at);
-        o.stop(ac.currentTime + at + ms / 1000 + 0.02);
-      };
-      if (kind === 'captured') { play(660, 0, 70); play(990, 0.09, 90); }
-      else play(220, 0, 160);
-    } catch { /* no audio available; the panel still shows the event */ }
-  }, []);
   const [bscanBgModel, setBscanBgModel] = useState(null);
   const [bscanBgCapturing, setBscanBgCapturing] = useState(false);
   const [bgApplied, setBgApplied] = useState(true);
@@ -893,8 +852,9 @@ export default function App() {
     // it sets the sweep spacing (v * 27.5 ms) and therefore how many sweeps
     // each cell gets, since pitch / speed / averaging are one resource. Pushed
     // to the rail as x_max_speed for the duration of the raster and restored
-    // afterwards. The rail's own configured maximum is 150 mm/s.
-    roverSpeedMmS: 100,
+    // afterwards, so it may exceed the rail's configured maximum (150 mm/s).
+    // Panel range 1-300 mm/s, same as the Projector Demo's rover mode.
+    roverSpeedMmS: 300,
     // Constant timing offset between the sweep clock and the rover position
     // clock, ms. Both are already stamped on the Pi's clock, so this is only
     // the residual: a sweep is stamped ~14 ms after its own phase centre and a
@@ -1081,6 +1041,8 @@ export default function App() {
   // C-scan viewport so switching to another panel does not tear down a window
   // that is currently lighting up a wall.
   const [cscanProjector, setCscanProjector] = useState(null);
+  // Projector Demo panel state (draw / rover / handheld grids, its own projector window).
+  const projectorDemo = useProjectorDemo();
   const cscanProjectorRootRef = useRef(null);
 
   // Takes a value OR an updater, like setState, and composes updaters within a
@@ -1424,7 +1386,7 @@ export default function App() {
   // Default 5.4 (2026-09-13): the gw2 bench's 15.2 cm concrete wall, from its back-wall
   // echo (35.2 cm of apparent range behind the face on rod1.json) and confirmed by the
   // rod focusing immediately behind the wall. The panel suggests a value per scan.
-  const [sarEpsilonR, setSarEpsilonR] = useState(5.4);
+  const [sarEpsilonR, setSarEpsilonR] = useState(4.84);
   // Rectangular, not the Hanning that used to be hardcoded in the worker: measured
   // target coherence 0.654 rect / 0.627 kaiser b3 / 0.615 hanning on a real scan.
   const [sarWindowType, setSarWindowType] = useState('rectangular');
@@ -1542,6 +1504,9 @@ export default function App() {
     svdK: sarSvdK,
     svdStrength: sarSvdStrength,
     epsilonR: sarEpsilonR,
+    // Same physical aperture limit the detector uses, so the image and the markers are
+    // built from the same contributions. See DETECT_DEFAULTS.apertureAngleDeg.
+    apertureAngleDeg: 45,
     windowType: sarWindowType,
     // The panel's third window option is labelled "Kaiser B3"; passed explicitly so it
     // is the label's value rather than the worker's fallback for a missing field.
@@ -1746,6 +1711,9 @@ export default function App() {
   // IMU WebSocket
   const handleImuMessage = useCallback((msg) => {
     imuCountRef.current++;
+    // Handheld Capture records every packet raw and builds its position tracks from it,
+    // here rather than from a render, so no packet is ever coalesced away.
+    handheldCaptureFeedRef.current.sensor?.(msg);
     // Every packet, so the Handheld averaging window sees the full 50 Hz stream.
     handheldHistoryRef.current.push(msg);
     // A tilt calibration in progress reads the same stream. Distances are taken
@@ -1808,6 +1776,9 @@ export default function App() {
 
   // SDR WebSocket (RF Calib + SFCW share this connection)
   const handleSdrMessage = useCallback((msg) => {
+    // Handheld Capture records every SDR message exactly as it arrived, before any guard
+    // below changes or drops it.
+    handheldCaptureFeedRef.current.sdr?.(msg);
     if (msg.type === 'status') {
       setSdrStatus(msg);
       setTxActive(msg.tx_active);
@@ -2014,8 +1985,7 @@ export default function App() {
       // path below reads the local `msg`/`provenance` and still sees every sweep.
       const displayNow = performance.now();
       const capturing = bscanCaptureRef.current || sfcwBgCaptureRef.current
-        || bscanBgCaptureRef.current || bgModelAccumRef.current || bgModelTestRef.current
-        || hhCaptureRef.current;
+        || bscanBgCaptureRef.current || bgModelAccumRef.current || bgModelTestRef.current;
       if (capturing || displayNow - sfcwDisplayThrottleRef.current >= 50) {
         sfcwDisplayThrottleRef.current = displayNow;
         setSfcwResult(msg);
@@ -2087,82 +2057,6 @@ export default function App() {
           bscanCaptureRef.current = null;
           setBscanCapturing(false);
           setBscanCaptureProgress(null);
-        }
-      }
-
-      // Handheld scan capture. The operator holds the head over a cell and the
-      // sweep after next is that cell (skip: 1 drops the one already in flight,
-      // which may have started before the head settled). Same fill-the-Avg-budget
-      // logic as the stepped C-scan, and the same buildCellRecord, but into the
-      // separate hhScanData so the two panels stay independent.
-      if (hhCaptureRef.current) {
-        const tag = hhCaptureRef.current;
-        const pose = hhPoseRef.current;
-        const px = pose?.pos?.x;
-        const py = pose?.pos?.y;
-        // The head is in a hand. If it has left the cell it was tagged for, or
-        // the position has dropped out, the looks so far are not this cell's --
-        // throw them away rather than file a smeared record under the wrong
-        // index. The operator hears one low note and the panel says why.
-        const here = (px != null && py != null) ? cellForPosition(px, py, hhScanParamsRef.current) : null;
-        const left = !here || here.ix !== tag.cell.ix || here.iy !== tag.cell.iy;
-        if (left) {
-          hhCaptureRef.current = null;
-          setHhScanCapturing(false);
-          setHhCaptureProgress(null);
-          setHhLastEvent({ kind: 'aborted', cell: tag.cell, t: Date.now(),
-            why: !here ? 'position lost' : 'head left the cell' });
-          hhTone('aborted');
-        } else {
-        const look = {
-          h_cal_real: msg.h_cal_real ? [...msg.h_cal_real] : null,
-          h_cal_imag: msg.h_cal_imag ? [...msg.h_cal_imag] : null,
-          timestamp: msg.timestamp,
-          ...provenance,
-          hh_x_mm: px, hh_y_mm: py,
-        };
-        if (tag.skip > 0) {
-          tag.skip -= 1;
-        } else if (tag.got.length + 1 < tag.need) {
-          tag.got.push(look);
-          setHhCaptureProgress({ got: tag.got.length, need: tag.need });
-        } else {
-          const grid = hhScanParamsRef.current;
-          const sweeps = [...tag.got, look];
-          const spread = positionSpread(sweeps.map(w => ({ x: w.hh_x_mm, y: w.hh_y_mm })));
-          const meta = {
-            magnitudes: [...msg.magnitudes],
-            distances: [...msg.distances],
-            num_steps: msg.num_steps,
-            step_size: msg.step_size,
-            start_freq: msg.start_freq,
-            range_offset: msg.range_offset,
-            range_offset_pi: msg.range_offset_pi,
-          };
-          // Replace any existing record for this cell rather than appending a
-          // duplicate, so re-capturing a cell overwrites it.
-          setHhScanData(prev => {
-            const rec = {
-              ...buildCellRecord({
-                sweeps, meta, cell: tag.cell, grid,
-                rover: null, target: null, roverXStd: null,
-              }),
-              // Where the hand actually held the head, and how still: the mean
-              // position of the looks and their spread. Kept beside the cell
-              // index for the same reason the rover keeps rover_x_mm.
-              hh_x_mm: spread.x, hh_y_mm: spread.y, hh_xy_std_mm: spread.std,
-              hh_tilt_deg: pose?.axes?.z?.tiltDeg ?? null,
-            };
-            const at = prev.findIndex(p => p.grid_ix === tag.cell.ix && p.grid_iy === tag.cell.iy);
-            if (at >= 0) { const next = prev.slice(); next[at] = rec; return next; }
-            return [...prev, rec];
-          });
-          hhCaptureRef.current = null;
-          setHhScanCapturing(false);
-          setHhCaptureProgress(null);
-          setHhLastEvent({ kind: 'captured', cell: tag.cell, t: Date.now(), looks: sweeps.length });
-          hhTone('captured');
-        }
         }
       }
 
@@ -2409,125 +2303,6 @@ export default function App() {
     setBscanCapturing(true);
   }, [bscanProcParams.avgCount]);
 
-  // ── Handheld scan handlers ─────────────────────────────────────────────
-  // The head is hand-carried, so there is no motion to command: a capture just
-  // tags the sweep-after-next as whichever cell the operator is holding over.
-  const requestHhCapture = useCallback((cell) => {
-    if (!cell || hhCaptureRef.current) return;
-    hhCaptureRef.current = {
-      cell, skip: 1, need: Math.max(1, hhAvgCount), got: [],
-    };
-    setHhScanCapturing(true);
-    setHhCaptureProgress({ got: 0, need: Math.max(1, hhAvgCount) });
-  }, [hhAvgCount]);
-
-  const cancelHhCapture = useCallback((why) => {
-    if (!hhCaptureRef.current) return;
-    const cell = hhCaptureRef.current.cell;
-    hhCaptureRef.current = null;
-    setHhScanCapturing(false);
-    setHhCaptureProgress(null);
-    if (why) setHhLastEvent({ kind: 'aborted', cell, t: Date.now(), why });
-  }, []);
-
-  // Start = sweep on (if it is not) AND auto-capture armed. Pause = disarm only,
-  // the sweep keeps running so resume is instant. Stop = sweep off and disarm.
-  const handleHhStart = useCallback(() => {
-    setHhAutoCapture(true);
-    if (sfcwRunning) return;
-    sendSfcwParams();
-    sfcwOwnerRef.current = true;
-    sendSdr({ cmd: 'sfcw_start' });
-  }, [sfcwRunning, sendSfcwParams, sendSdr]);
-
-  const handleHhPause = useCallback(() => {
-    setHhAutoCapture(false);
-  }, []);
-
-  const handleHhStop = useCallback(() => {
-    setHhAutoCapture(false);
-    cancelHhCapture('sweep stopped');
-    sendSdr({ cmd: 'sfcw_stop' });
-  }, [sendSdr, cancelHhCapture]);
-
-  // If the sweep dies underneath a capture (stopped from another panel, SDR
-  // dropped), the tag must not sit armed forever showing "Capturing…".
-  useEffect(() => {
-    if (!sfcwRunning) cancelHhCapture(hhCaptureRef.current ? 'sweep stopped' : null);
-  }, [sfcwRunning, cancelHhCapture]);
-
-  const removeHhCell = useCallback((cell) => {
-    if (!cell) return;
-    setHhScanData(prev => prev.filter(p => !(p.grid_ix === cell.ix && p.grid_iy === cell.iy)));
-  }, []);
-
-  // Recapture: drop the record and tag the next sweep for the same cell. The
-  // centre/tilt gates are the panel's business; by the time this is called it
-  // has already checked them against the live pose.
-  const handleHhRecapture = useCallback((cell) => {
-    if (!cell || hhCaptureRef.current) return;
-    removeHhCell(cell);
-    hhCaptureRef.current = { cell, skip: 1, need: Math.max(1, hhAvgCount), got: [] };
-    setHhScanCapturing(true);
-    setHhCaptureProgress({ got: 0, need: Math.max(1, hhAvgCount) });
-  }, [removeHhCell, hhAvgCount]);
-
-  const handleHhSetOrigin = useCallback(() => {
-    // Reuse the handheld origin machinery: "set origin here" takes the current
-    // per-axis LiDAR readings as the reference the scan grid is measured from.
-    const res = originFromPose(handheldPose, handheldOrigin);
-    handleHandheldOriginChange(res.origin);
-  }, [handheldPose, handheldOrigin, handleHandheldOriginChange]);
-
-  const handleHhClear = useCallback(() => {
-    setHhScanData([]);
-    setHhScanCapturing(false);
-    setHhCaptureProgress(null);
-    setHhLastEvent(null);
-    hhCaptureRef.current = null;
-  }, []);
-
-  const handleHhExport = useCallback(() => {
-    const exportData = {
-      version: 1,
-      kind: 'handheld_cscan',
-      timestamp: new Date().toISOString(),
-      params: hhScanParams,
-      sfcwParams,
-      lidarAntennaOffsetMm: lidarOffsetMm,
-      data: hhScanData,
-    };
-    const blob = new Blob([JSON.stringify(exportData)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `handheld_${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }, [hhScanData, hhScanParams, sfcwParams, lidarOffsetMm]);
-
-  const handleHhImport = useCallback(() => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.json';
-    input.onchange = (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        try {
-          const imported = JSON.parse(ev.target.result);
-          if (imported.data && Array.isArray(imported.data)) {
-            setHhScanData(imported.data);
-            if (imported.params) setHhScanParams(imported.params);
-          }
-        } catch { /* ignore a bad file */ }
-      };
-      reader.readAsText(file);
-    };
-    input.click();
-  }, []);
-
   // How full each grid row is, in the order the rover walks them (0 = the row
   // the origin sits on). This, not a count of non-empty rows, is what a
   // continuous raster resumes on: a row stopped part way through is not done,
@@ -2603,6 +2378,46 @@ export default function App() {
     onRequestCapture: requestRoverBgCapture,
     sweepsPerCapture: bgModelSweepsPerCapture,
   });
+
+  // Projector Demo, rover mode: drive the loaded grid in a snake and track which cells the
+  // rover has been in front of. No sweep involved.
+  const roverPaint = useRoverPaint({
+    grid: projectorDemo.patterns.rover ? projectorDemo.patterns.rover.grid : null,
+    roverStatus,
+    roverConnected: roverConnectionStatus === 'connected',
+    sendRover,
+    otherActive: roverScan.active || roverBgScan.active,
+  });
+  // Projector Demo, handheld mode: light the cells the handheld module reaches, using the
+  // Handheld + IMU panel's position and origin.
+  const handheldPaint = useHandheldPaint({
+    grid: projectorDemo.patterns.handheld ? projectorDemo.patterns.handheld.grid : null,
+    pose: handheldPose,
+    // Same test as isConnected, which is only defined further down.
+    connected: imuStatus === 'connected',
+    // Pi clock of the sensor packet the pose came from, stamped onto each recorded path point.
+    sampleTime: imuData?.timestamp,
+  });
+  const projectorDemoView = { ...projectorDemo, roverRun: roverPaint, handheldRun: handheldPaint };
+
+  // Handheld Capture panel: records every sweep, sensor packet and SDR message raw, streamed
+  // to a session folder on disk, with a coverage map of the patch.
+  const handheldCapture = useHandheldCapture({
+    sfcwRunning,
+    startSweep: startSfcwSweep,
+    stopSweep: stopSfcwSweep,
+    sfcwParams,
+    lidarOffsetMm,
+    origin: handheldOrigin,
+    assignment: handheldAssignment,
+    avgMs: handheldAvgMs,
+    tilt: handheldTilt,
+    mount: handheldMount,
+    sweepPeriodMs,
+  });
+  handheldCaptureFeedRef.current = { sensor: handheldCapture.onSensor, sdr: handheldCapture.onSdr };
+  // Its rough output view: BG model on the first sweep of each cell, drawn as a C-scan plan view.
+  const handheldRough = useHandheldRoughView({ rough: handheldCapture.rough, sfcwParams });
 
   const roverBgScanActive = roverBgScan.active;
   useEffect(() => {
@@ -3025,29 +2840,6 @@ export default function App() {
         imuData={imuData}
         lidarMm={lidarMm}
         handheldPose={handheldPose}
-        sdrConnected={sdrConnectionStatus === 'connected'}
-        sfcwRunning={sfcwRunning}
-        hhScanData={hhScanData}
-        hhScanParams={hhScanParams}
-        onHhScanParamsChange={setHhScanParams}
-        hhScanCapturing={hhScanCapturing}
-        hhCaptureProgress={hhCaptureProgress}
-        hhAvgCount={hhAvgCount}
-        onHhAvgCountChange={setHhAvgCount}
-        hhAutoCapture={hhAutoCapture}
-        onHhStart={handleHhStart}
-        onHhPause={handleHhPause}
-        onHhStop={handleHhStop}
-        onHhCapture={requestHhCapture}
-        onHhRecapture={handleHhRecapture}
-        onHhClearCell={removeHhCell}
-        onHhSetOrigin={handleHhSetOrigin}
-        onHhClear={handleHhClear}
-        onHhExport={handleHhExport}
-        onHhImport={handleHhImport}
-        hhBeep={hhBeep}
-        onHhBeepChange={setHhBeep}
-        hhLastEvent={hhLastEvent}
         handheldOrigin={handheldOrigin}
         onHandheldOriginChange={handleHandheldOriginChange}
         handheldAssignment={handheldAssignment}
@@ -3255,6 +3047,9 @@ export default function App() {
         onImagingEffectChange={setImagingEffect}
         imagingParams={imagingParams}
         onImagingParamsChange={setImagingParams}
+        projectorDemo={projectorDemoView}
+        handheldCapture={handheldCapture}
+        handheldRough={handheldRough}
       />
       <Viewport
         activePanel={activePanel}
@@ -3262,9 +3057,6 @@ export default function App() {
         sweepPeriodMs={sweepPeriodMs}
         imuData={imuData}
         handheldPose={handheldPose}
-        hhScanData={hhScanData}
-        hhScanParams={hhScanParams}
-        hhScanReady={captureReadiness(handheldPose, hhScanParams, filledCells(hhScanData)).ready}
         roverStatus={roverStatus}
         roverTrail={roverTrail}
         roverLog={roverLog}
@@ -3331,6 +3123,9 @@ export default function App() {
         imagingSnapshot={imagingSnapshot}
         imagingEffect={imagingEffect}
         imagingParams={imagingParams}
+        projectorDemo={projectorDemoView}
+        handheldCapture={handheldCapture}
+        handheldRough={handheldRough}
       />
 
       {/* The projected image. A portal into a second window, so it reads the
@@ -3365,6 +3160,29 @@ export default function App() {
             detection={sarDetection}
             handleEnds={sarHandleEnds}
             rootRef={cscanProjectorRootRef}
+          />
+        </ProjectorWindow>
+      )}
+
+      {/* Projector Demo output. Draw: the whole image with grid lines, for aligning the projector
+          and drawing to the real wall. Rover / handheld: the grid lines, plus only the cells the
+          rover or the handheld module has reached, in their colours. */}
+      {projectorDemo.projector && !projectorDemo.projector.error && (
+        <ProjectorWindow
+          name="projector-demo"
+          title="Projector Demo"
+          target={projectorDemo.projector.target}
+          rootRef={projectorDemo.projectorRootRef}
+          onClose={(reason) => projectorDemo.setProjector(reason === 'blocked' ? { error: 'blocked' } : null)}
+        >
+          <ProjectorDemoDisplay
+            chromeless
+            colorMode={projectorDemo.mode === 'draw' ? 'all' : 'covered'}
+            covered={projectorDemo.mode === 'rover' ? roverPaint.covered
+              : projectorDemo.mode === 'handheld' ? handheldPaint.covered : null}
+            grid={projectorDemo.activeGrid}
+            projection={projectorDemo.projection}
+            rootRef={projectorDemo.projectorRootRef}
           />
         </ProjectorWindow>
       )}

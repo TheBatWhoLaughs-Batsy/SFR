@@ -174,52 +174,6 @@ head is also published under `lidars.uartN`, and `lidar_primary` names the first
 that fails to open is skipped with a warning. The Handheld panel's Wiring selectors must
 agree with the primary for forward; the panel warns if they do not.
 
-## Handheld Scan panel (2026-09-15)
-
-Left-sidebar panel `handheldscan` ("Handheld Scan") — the C-scan workflow for the
-HAND-CARRIED head. Nothing drives the head; the three-LiDAR position (`handheldPose`,
-IMU-tilt-corrected) says which grid cell it is over, and a capture tags the SFCW
-sweep-after-next as that cell.
-
-Files: `lib/handheldScan.js` (pure geometry, unit-tested), `components/HandheldScanPanel.jsx`,
-`components/HandheldScanDisplay.jsx`; wired through App.jsx / Sidebar.jsx / Viewport.jsx.
-
-**Own state, isolated from C-scan.** `hhScanData` / `hhCaptureRef` are separate from the
-rover/manual `bscanData` / `bscanCaptureRef`, so the two panels never collide. The sweep
-handler's capture branch and `buildCellRecord` are reused, so records, colour scaling and
-export are identical to C-scan and `buildCscanGrid` renders the plan view directly. Grid
-coords are cscanGrid's (origin bottom-left, ix→right, iy→up, snake path, `grid_ix/iy`).
-
-**Transport.** ▶ Start = sweep on (if it is not) AND auto-capture armed. ❚❚ Pause = disarm
-only; the sweep stays up so resume is instant. ■ Stop = sweep off, any capture in flight
-cancelled. Manual Capture works whenever the sweep runs, paused or not.
-
-**Capture readiness** (`captureReadiness`), in order: origin set → position present → inside
-grid → cell empty → forward-axis tilt ≤ 12° → head within the cell's centre zone
-(min(15 mm, 40 % of the half-pitch + 2)). Each failure has a one-line reason on the panel.
-**Auto-capture** fires after a 400 ms dwell over a ready cell; it is a `setTimeout` keyed on
-the ready cell, not a per-render clock, so it does not depend on render cadence.
-
-**Abort on move.** On every sweep of a capture in flight the handler re-checks the live pose:
-if the head has left the tagged cell, or the position has dropped, the looks so far are
-discarded (a smeared record under the wrong index is worse than no record). One low note;
-the panel says why. Sweep stopping from anywhere also cancels an in-flight capture.
-
-**Provenance per cell**, beside the C-scan fields: `hh_x_mm`, `hh_y_mm` (mean head position
-over the looks), `hh_xy_std_mm` (how still the hand was — the aperture the coherent
-average really covered), `hh_tilt_deg`. Each look also carries `hh_x_mm/hh_y_mm`.
-
-**Recapture / Clear this cell** act on the cell under the head. Recapture drops the record
-and tags the next sweep; a re-capture always REPLACES, never duplicates.
-
-**Beep.** Two rising notes on capture, one low note on abort (Web Audio, default on) —
-the operator's eyes are on the wall, not the screen. Panel also shows standoff (forward
-LiDAR minus antenna offset, judged against 0–150 mm), forward tilt, per-head LiDAR status,
-and aim arrows to the centre of the current (or next empty) cell.
-
-Not wired: background subtraction in this panel's display (records carry the provenance, so
-it adds the same way C-scan does it); projector; detection overlay. Deliberately left out.
-
 ## LiDAR → Antenna Offset (measured 2026-08-28)
 
 **165 mm measured; 160 mm used** (5 mm buffer so a true zero-standoff pose reports
@@ -447,45 +401,16 @@ Pi and groundstation are testable without the rig.
 
 ## Current Status
 
-- [x] Project scaffolded
-- [x] Context documented
-- [x] Hardware connections (IMU + LiDAR wired and tested)
-- [x] IMU driver (BNO085 over I2C, was MPU-6500)
-- [x] LiDAR driver (TF-LC02 over UART)
-- [x] Combined sensor WebSocket stream (port 9001)
-- [x] Groundstation UI — IMU + LiDAR debug panel
-- [x] IMU calibration (gyro bias + accel bias at startup, persisted to imu_cal.json)
-- [ ] IMU axis remapping (IMU frame → body frame: forward/left/up) — done for MPU-6500,
-      confirmed wrong for BNO085, needs re-discovery
-- [x] Madgwick AHRS orientation filter (quaternion-based, groundstation 3D view)
-- [x] IMU calibration discovery tool (groundstation panel)
-- [x] BladeRF driver + AquaSense calibration panel (signal generator + oscilloscope)
-- [ ] BladeRF SFCW implementation
-- [x] On-FPGA DSP sweep path (`sweep_mode='dsp'`, v15 image, run on hardware 2026-09-14)
-- [ ] Decide whether to flash v15 to SPI (flash still holds the v1 sweep image)
-- [x] Rover firmware rewrite (ISR stepping, JSON protocol, E-stop, soft limits, calibration)
-- [x] Rover jog control + position tracking from the controller's own step counter
-- [x] Rover automated grid raster (drives the C-Scan panel's grid; Scan Mode = Rover)
-- [x] Rover yaw trim — open-loop differential rear wheels, Pi-owned value, panel control (2.5.0)
-- [x] Rover steering: `manual` / `heading` (IMU) / `track` (IMU + LiDAR cascade)
-- [x] Handheld Scan panel — hand-carried C-scan, cells filled from the 3-LiDAR position
-      (`lib/handheldScan.js`, `HandheldScanPanel/Display.jsx`); manual + dwell auto-capture
-- [x] BNO085 init failure diagnosed: handshake loops were rate-capped below the sensor's
-      own report rate, so a sensor left streaming by a previous run starved them. Fixed in
-      `bno085.py` (silence features first, drain to empty, handle oversized packets);
-      reproduced and verified against a single-FIFO fake. `bno085_diag.py` added.
-- [ ] Confirm on the rig with `python3 pi/sensors/bno085_diag.py`
-- [ ] Network protocol (formal)
-- [ ] Integration testing
-- [ ] SAR image reconstruction
+Superseded. What works, what is broken and what is next now live in `.harness/STATE.md`, which
+is kept current as work lands. This file covers the physical layer only: hardware, wiring,
+pinouts, ports and radar parameters.
 
 ---
 
 ## Maintenance Rules
 
-**This file and CLAUDE.md must be kept up to date by Claude (or any AI assistant)
-as the project evolves.** Whenever a session produces key information — design
-decisions, hardware discoveries, protocol specs, calibration data, wiring
-pinouts, architectural changes, or anything a future session would need — update
-these files before the session ends. They are the persistent memory of this
-project across sessions, collaborators, and machines.
+This file is the hardware reference and must stay accurate: wiring changes, pinouts, measured
+offsets and port assignments belong here, updated in the same session they are discovered.
+
+Behaviour, architecture and current state belong elsewhere — see `CLAUDE.md` for how project
+memory is maintained.

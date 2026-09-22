@@ -58,7 +58,7 @@ const C = 299792458;
 
 export const DETECT_DEFAULTS = {
   endExcludeCm: 6,          // truncated-aperture zone at each end of the scan
-  trimCols: 8,              // columns dropped for the two trim tests
+  trimCm: 4,                // cm dropped from each end for the two trim tests
   lineMatchCm: 2.0,         // two variants' lines are the same pipe below this mean lateral distance
   rowSupportDb: 6,          // a row "sees" a target when its profile clears this
   rowSupportFrac: 0.6,      // fraction of rows that must see it
@@ -72,12 +72,55 @@ export const DETECT_DEFAULTS = {
                             // crevice reads 4.5-4.7 dB stronger in target scans than in its
                             // control (standoff change); a real pipe next to a weak empty-scan
                             // line read 6.3 dB stronger. 5.5 sits between them.
-  sidelobeCm: 6,            // a probable this close to a stronger confirmed is its sidelobe
+  behindWallMarginCm: 0.2,  // how far in front of the back face still counts as "behind the wall"
+  sidelobeCm: 6,            // a probable this close to a stronger line is its sidelobe
+  sidelobeVsAnyRating: 0,   // 0 = only a CONFIRMED neighbour suppresses (the 2026-09-14 rule).
+                            // 1 = any stronger line does. Measured 2026-09-20: with the far
+                            // pipes rating `probable` rather than confirmed, their own sidelobes
+                            // (3-8 cm away, ~2 cm shallower) were the ENTIRE residual false-alarm
+                            // population -- 6 of 6 on the bench set. A rule that only fires for
+                            // confirmed neighbours cannot suppress the sidelobes of a weak target,
+                            // which is exactly when they are rated. BUT it is off by default: it
+                            // kills 4 of those 6 and takes 2 real pipes with them, because a
+                            // sidelobe can outscore the pipe it belongs to (8.9 dB against 7.4 on
+                            // the 2026-09-20 set). Suppression needs a better rule than "stronger".
   searchMinDepthCm: 5,      // search band, true depth below the wall face (2026-09-14, operator's
   searchMaxDepthCm: 20,     // choice). Was wall thickness -3 .. +11 cm, i.e. 12.2-26.2 on gw2,
                             // which cannot see anything inside the wall (seepage at 5-12 cm).
-  guardedWindowCols: 20,
-  guardedGuardCols: 6,
+  // Rank of the complex SVD that removes along-track clutter. 1 was carried over from the
+  // 2026-09-03 sartt.json work ("rank 1, not higher: at rank 2-3 the peak jumps"). That was a
+  // single-row scan on a different bench. Exposed as a knob so bench/run.mjs can sweep it: a
+  // rail that is not parallel to the wall gives a wall echo whose phase RAMPS along the row,
+  // which is not a rank-1 component, and the residual lands worst where the ramp is steepest.
+  svdK: 1,
+  // With svdAdaptive, svdK is an UPPER BOUND and each component is removed only while its
+  // spatial pattern is DELOCALISED along the scan (sarReconstruct.spreadFraction >=
+  // svdSpreadFrac). Wall and coupling terms are present at every position; a compact
+  // scatterer is seen only from the positions whose beam reaches it. So the rank follows the
+  // scan instead of being a constant that has to be right for every bench at once.
+  svdAdaptive: 0,
+  svdSpreadFrac: 0.5,
+  baseClutter: 'svd',       // 'svd' | 'gfit' -- see variantsFor
+  // Divide the back-projected sum by how many positions actually reached the pixel, so a
+  // target near the end of a scan is not penalised for the aperture running out. See
+  // sarReconstruct.finalizeCoherent.
+  apertureNormalize: 0,
+  // Half-angle, in degrees, of the aperture the back-projection integrates over (0 = all of
+  // it, the old behaviour). Physical: the antenna has a beamwidth and the refracted ray goes
+  // grazing well before the end of a 70 cm scan.
+  // 45 deg, measured 2026-09-20 on both labelled sets: same recall, same false alarms, and
+  // the median position error drops 1.46 -> 1.04 cm on one set and 1.00 -> 0.50 on the other.
+  // Unlimited, a pixel 17 cm deep on a 70 cm scan is summed over +-64 deg of aperture, where
+  // the antenna barely illuminates and the refracted ray is near grazing -- little signal,
+  // full clutter. 40 and 50 measured worse than 45 and 60; 20 collapses (3/12).
+  apertureAngleDeg: 45,
+  // The guarded along-track fit's support, IN CENTIMETRES. These were column counts
+  // (20 and 6) until 2026-09-20, so their physical size doubled when the operator moved
+  // from a 0.5 cm to a 1 cm pitch -- a different clutter model for the same wall. At
+  // 0.5 cm these values reproduce the old columns exactly; at 1 cm they cut the bench
+  // set's false alarms from 4 to 2 with no change in recall.
+  guardedWindowCm: 10,
+  guardedGuardCm: 3,
   guardedAlpha: 0.9,
   // line search
   maxLeanDeg: 45,           // steepest lean searched, degrees from vertical
@@ -370,18 +413,56 @@ function sizeOf(aligned, hStep, fCentreHz) {
 //   emptyReferenceLines     the empty scan's lines, from its base-variant grids
 //   finishDetection         line search, six tests, reference, ratings
 
-export const VARIANTS = [
-  { key: 'base', pre: 'svd', band: 'full', trim: null },
-  { key: 'gfit', pre: 'gfit', band: 'full', trim: null },
-  { key: 'low', pre: 'svd', band: 'low', trim: null },
-  { key: 'high', pre: 'svd', band: 'high', trim: null },
-  { key: 'trimStart', pre: 'svd', band: 'full', trim: 'start' },
-  { key: 'trimEnd', pre: 'svd', band: 'full', trim: 'end' },
-];
+// Which clutter model the five main variants use, and which one the cross-check uses.
+// `baseClutter` picks; the key 'gfit' is kept for the cross-check whichever way round it is,
+// because it is the one test that asks whether two DIFFERENT clutter models agree.
+//   svd  -- rank-`svdK` complex SVD along the scan. Knows no physics: it removes whatever is
+//           largest and most common, which is the wall only because the wall is largest.
+//   gfit -- the guarded along-track fit, coupling + wall*exp(-j 4 pi f alpha d_q / c) with
+//           d_q the LiDAR standoff at each position. It knows where the wall is, so a rail
+//           that is not parallel is modelled rather than left as a second SVD component.
+export function variantsFor(o) {
+  const base = o.baseClutter === 'gfit' ? 'gfit' : 'svd';
+  const alt = base === 'svd' ? 'gfit' : 'svd';
+  return [
+    { key: 'base', pre: base, band: 'full', trim: null },
+    { key: 'gfit', pre: alt, band: 'full', trim: null },
+    { key: 'low', pre: base, band: 'low', trim: null },
+    { key: 'high', pre: base, band: 'high', trim: null },
+    { key: 'trimStart', pre: base, band: 'full', trim: 'start' },
+    { key: 'trimEnd', pre: base, band: 'full', trim: 'end' },
+  ];
+}
+export const VARIANTS = variantsFor({});
 export const VARIANT_KEYS = VARIANTS.map((v) => v.key);
 
 export function usableRows(rows) {
   return (rows || []).filter((r) => r.cells && r.cells.length >= 2 && r.cells[0].h_cal_real);
+}
+
+// Same projection discipline as useSarWorker: postMessage structured-clones, and a C-scan
+// record's `sweeps` alone can be hundreds of MB. grid_iy is needed so the scan can be split
+// into rows. Lives here rather than in the hook so the Node harness (bench/run.mjs) splits a
+// saved scan exactly the way the app does -- two copies of this would drift.
+export const DETECT_FIELDS = [
+  'h_cal_real', 'h_cal_imag', 'magnitudes', 'distances',
+  'lidar_standoff_mm', 'step_size', 'range_offset', 'grid_ix', 'grid_iy',
+];
+
+export function projectRowsForDetect(bscanData) {
+  if (!bscanData || bscanData.length < 2 || !bscanData[0].h_cal_real) return [];
+  const byRow = new Map();
+  for (const pos of bscanData) {
+    const iy = Number.isFinite(pos.grid_iy) ? pos.grid_iy : 0;
+    if (!byRow.has(iy)) byRow.set(iy, []);
+    const out = {};
+    for (const k of DETECT_FIELDS) out[k] = pos[k];
+    if (!Number.isFinite(out.grid_ix)) out.grid_ix = byRow.get(iy).length;
+    byRow.get(iy).push(out);
+  }
+  return [...byRow.entries()].sort((a, b) => a[0] - b[0])
+    .map(([iy, cells]) => ({ iy, cells: cells.sort((a, b) => a.grid_ix - b.grid_ix) }))
+    .filter((r) => r.cells.length >= 2);
 }
 
 /**
@@ -402,6 +483,10 @@ export function planDetection(rows, params, options = {}) {
   const fHiHz = f0Hz + (K - 1) * stepHz;
   const wallT = params.wallThickness > 0 ? params.wallThickness : 15;
   const zlo = Math.max(1, o.searchMinDepthCm), zhi = Math.max(zlo + 1, o.searchMaxDepthCm);
+  // Column counts derived from physical sizes and this scan's own pitch.
+  const trimCols = Math.max(1, Math.round(o.trimCm / hStep));
+  const guardedWindowCols = Math.max(2, Math.round(o.guardedWindowCm / hStep));
+  const guardedGuardCols = Math.max(1, Math.round(o.guardedGuardCm / hStep));
   const allIx = rows.flatMap((r) => r.cells.map((c) => c.grid_ix)).filter(Number.isFinite);
   const ixMin = allIx.length ? Math.min(...allIx) : 0;
   const ixMax = allIx.length ? Math.max(...allIx) : rows[0].cells.length - 1;
@@ -412,29 +497,31 @@ export function planDetection(rows, params, options = {}) {
   const kMid = Math.floor(K / 2);
   const bands = { full: [0, K, f0Hz], low: [0, Math.ceil(K / 2), f0Hz], high: [kMid, K, f0Hz + kMid * stepHz] };
   const baseParams = {
-    stepSize: hStep, maxDepth: zhi + 6, aperture: 1, coherent: true, svdEnabled: true, svdK: 1, svdStrength: 1,
+    stepSize: hStep, maxDepth: zhi + 6, aperture: 1, coherent: true, svdEnabled: true, svdK: o.svdK, svdStrength: 1,
     epsilonR: params.epsilonR, windowType: 'hanning', kaiserBeta: 3, wallThickness: params.wallThickness,
+    svdAdaptive: !!o.svdAdaptive, svdSpreadFrac: o.svdSpreadFrac, apertureNormalize: !!o.apertureNormalize, apertureAngleDeg: o.apertureAngleDeg,
     refraction: params.refraction !== false, autoStandoff: params.autoStandoff !== false,
     manualStandoffMm: params.manualStandoffMm || 0,
   };
-  return { o, params, hStep, vStep, K, stepHz, f0Hz, fHiHz, wallT, zlo, zhi, xAxis, zAxis, bands, baseParams };
+  return { o, params, hStep, vStep, K, stepHz, f0Hz, fHiHz, wallT, zlo, zhi, xAxis, zAxis, bands, baseParams,
+           trimCols, guardedWindowCols, guardedGuardCols, variants: variantsFor(o) };
 }
 
 function variantJob(plan, cells, v) {
-  const { o, bands, stepHz, baseParams } = plan;
+  const { o, bands, stepHz, baseParams, trimCols, guardedWindowCols, guardedGuardCols } = plan;
   let c = cells;
-  if (v.trim === 'start') c = c.slice(o.trimCols);
-  else if (v.trim === 'end') c = c.slice(0, Math.max(2, c.length - o.trimCols));
+  if (v.trim === 'start') c = c.slice(trimCols);
+  else if (v.trim === 'end') c = c.slice(0, Math.max(2, c.length - trimCols));
   const [k0, k1, fb] = bands[v.band];
   c = sliceBand(c, k0, k1);
-  if (v.pre === 'gfit') c = guardedFit(c, { windowCols: o.guardedWindowCols, guardCols: o.guardedGuardCols, f0Hz: fb, stepHz, alpha: o.guardedAlpha });
+  if (v.pre === 'gfit') c = guardedFit(c, { windowCols: guardedWindowCols, guardCols: guardedGuardCols, f0Hz: fb, stepHz, alpha: o.guardedAlpha });
   return [c, { ...baseParams, startFreq: fb / 1e6, svdEnabled: v.pre === 'svd' }];
 }
 
 // One row's variants, reconstructed together so they share ray tables, then resampled
 // onto the common grid. { [variantKey]: grid | null }.
 export function reconstructRowVariants(plan, cells, keys = VARIANT_KEYS) {
-  const vs = VARIANTS.filter((v) => keys.includes(v.key));
+  const vs = (plan.variants || VARIANTS).filter((v) => keys.includes(v.key));
   const results = reconstructMany(vs.map((v) => variantJob(plan, cells, v)));
   const out = {};
   vs.forEach((v, i) => { out[v.key] = results[i] ? gridWeight(results[i], plan.xAxis, plan.zAxis, plan.zlo) : null; });
@@ -477,7 +564,7 @@ export function finishDetection(plan, rowResults, emptyLines = [], usedReference
   // are dropped from THAT variant only; the base variant's row list defines the scan.
   const V = {};
   let baseGrids = [], baseRowYs = [], baseRowIys = [], baseProfiles = [];
-  for (const v of VARIANTS) {
+  for (const v of (plan.variants || VARIANTS)) {
     const profiles = [], grids = [], ys = [], iys = [];
     for (const rr of rowResults) {
       const G = rr.grids ? rr.grids[v.key] : null;
@@ -519,6 +606,13 @@ export function finishDetection(plan, rowResults, emptyLines = [], usedReference
       slope: line.s, driftCm: line.s * span, leanDeg: (Math.atan(line.s) * 180) / Math.PI,
       xBottom: line.x + line.s * (yBottom - yc), xTop: line.x + line.s * (yTop - yc), yMid: yc,
       tests, testsPassed, prominenceDb: prom, edge, inReference: false, reference: null, rating: 'none',
+      // Depth relative to the back face. Measured on the 2026-09-20 labelled set: every
+      // detection on a labelled pipe imaged at 16.0-19.4 cm and every other rated detection
+      // -- including the wall's own defect, which is imaged in all eight scans -- at
+      // 12.2-15.9 cm, against a 15.2 cm wall. Targets are BEHIND the back face; wall
+      // features are inside it. Reported, not gated: a wall defect is worth seeing.
+      depthBelowWallCm: depth - wallT,
+      behindWall: depth >= wallT - (o.behindWallMarginCm || 0),
       ...sizeOf(aligned, hStep, fCentre),
       perRow,
     };
@@ -557,7 +651,8 @@ export function finishDetection(plan, rowResults, emptyLines = [], usedReference
   // STRONGER confirmed target.
   for (const t of targets) {
     if (t.rating !== 'probable') continue;
-    const lobe = targets.find((u) => u !== t && u.rating === 'confirmed' && u.db > t.db
+    const lobe = targets.find((u) => u !== t && u.db > t.db
+      && (o.sidelobeVsAnyRating ? true : u.rating === 'confirmed')
       && meanLineDistance({ x: u.x, s: u.slope }, yc, { x: t.x, s: t.slope }, yc, baseRowYs) <= o.sidelobeCm);
     if (lobe) { t.rating = 'none'; t.sidelobeOf = lobe.x; }
   }
@@ -587,7 +682,7 @@ export function runDetection(rows, params, options = {}, emptyRows = null, onPro
   if (!rows.length) return null;
   const plan = planDetection(rows, params, options);
   const empties = emptyRows ? usableRows(emptyRows) : [];
-  const total = rows.length * VARIANTS.length + empties.length;
+  const total = rows.length * (plan.variants || VARIANTS).length + empties.length;
   let done = 0;
   const rowResults = rows.map((r) => {
     const grids = reconstructRowVariants(plan, r.cells);

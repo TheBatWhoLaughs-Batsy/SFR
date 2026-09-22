@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import time
 import argparse
 import signal
@@ -11,6 +12,25 @@ import websockets
 from bno085 import BNO085
 from tflc02 import TFLC02, is_link_reason, is_out_of_range_reason
 from imu_calibration import CalibratedIMU
+
+
+# VS Code Remote's port auto-forward (and any port scanner) probes a listening
+# port by opening a TCP connection and closing it without sending a byte.
+# websockets >= 14 logs each probe as a full "opening handshake failed"
+# EOFError traceback ("connection closed while reading HTTP request line") --
+# pure noise, no client was ever there. Suppress exactly that case; a real
+# client sending a malformed handshake still logs in full.
+class _IgnoreEmptyHandshake(logging.Filter):
+    def filter(self, record):
+        exc = record.exc_info[1] if record.exc_info else None
+        while exc is not None:
+            if isinstance(exc, EOFError):
+                return False
+            exc = exc.__cause__
+        return True
+
+
+logging.getLogger('websockets.server').addFilter(_IgnoreEmptyHandshake())
 
 clients = set()
 

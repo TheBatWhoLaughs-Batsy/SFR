@@ -2,11 +2,19 @@
 
 For development: run `python run.py` from groundstation/ to start this
 Flask API (port 5000) and the Vite dev server (port 5173) together.
-For production: run `npm run build` in frontend/, then `python app.py`.
+For production: `npm run build` in frontend/, then this app serves dist/.
+On the Pi it runs as the fourth service under pi/start.py, so the whole
+groundstation is at http://10.42.0.1:5000 with no PC involved.
+
+Debug mode (Flask auto-reloader) is OPT-IN via --debug: run.py passes it
+for development, start.py does not. The reloader forks a child process
+that start.py's terminate() would orphan, and an unattended service must
+not restart itself on a half-saved edit.
 """
 
 from flask import Flask, send_from_directory, request, jsonify
 import os
+import sys
 import json
 
 DIST_DIR = os.path.join(os.path.dirname(__file__), 'frontend', 'dist')
@@ -79,4 +87,10 @@ def static_files(path):
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    debug = '--debug' in sys.argv
+    if not os.path.isfile(os.path.join(DIST_DIR, 'index.html')):
+        print('[gs] WARNING: no frontend build at %s -- run `npm run build` '
+              'in frontend/; serving the models API only' % DIST_DIR)
+    print('[gs] serving frontend + models API on http://0.0.0.0:5000'
+          + (' (debug)' if debug else ''))
+    app.run(host='0.0.0.0', port=5000, debug=debug)

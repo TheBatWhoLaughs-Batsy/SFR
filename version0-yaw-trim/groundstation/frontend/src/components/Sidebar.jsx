@@ -1,7 +1,6 @@
-import { Radio, Radar, ScanLine, Grid3x3, Map, ChevronLeft, Wifi, WifiOff, Brain, FlaskConical, Move, Locate } from 'lucide-react';
+import { Radio, Radar, ScanLine, Grid3x3, Map, ChevronLeft, Wifi, WifiOff, Brain, FlaskConical, Move, Locate, Projector, HardDriveDownload } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import HandheldPanel from './HandheldPanel';
-import HandheldScanPanel from './HandheldScanPanel';
 import RfCalibPanel from './RfCalibPanel';
 import BgModelPanel from './BgModelPanel';
 import SfcwPanel from './SfcwPanel';
@@ -10,10 +9,11 @@ import CscanPanel from './CscanPanel';
 import SarPanel from './SarPanel';
 import MapPanel from './MapPanel';
 import RoverPanel from './RoverPanel';
+import ProjectorDemoPanel from './ProjectorDemoPanel';
+import HandheldCapturePanel from './HandheldCapturePanel';
 
 const PANELS = [
   { id: 'handheld',  label: 'Handheld + IMU', icon: Locate },
-  { id: 'handheldscan', label: 'Handheld Scan', icon: ScanLine },
   { id: 'rfcalib',   label: 'RF Calibrate', icon: Radio },
   { id: 'sfcw',      label: 'SFCW',      icon: Radar },
   { id: 'imaging',   label: 'Imaging Bench', icon: FlaskConical },
@@ -22,6 +22,8 @@ const PANELS = [
   { id: 'rover',     label: 'Rover Scan', icon: Move },
   { id: 'sar',       label: 'SAR',       icon: Grid3x3 },
   { id: 'map',       label: '2D Map',    icon: Map },
+  { id: 'projdemo',  label: 'Projector Demo', icon: Projector },
+  { id: 'hhcapture', label: 'Handheld Capture', icon: HardDriveDownload },
 ];
 
 export default function Sidebar({
@@ -240,29 +242,9 @@ export default function Sidebar({
   onImagingEffectChange,
   imagingParams,
   onImagingParamsChange,
-  sdrConnected,
-  sfcwRunning,
-  hhScanData,
-  hhScanParams,
-  onHhScanParamsChange,
-  hhScanCapturing,
-  hhCaptureProgress,
-  hhAvgCount,
-  onHhAvgCountChange,
-  hhAutoCapture,
-  onHhStart,
-  onHhPause,
-  onHhStop,
-  onHhCapture,
-  onHhRecapture,
-  onHhClearCell,
-  onHhSetOrigin,
-  onHhClear,
-  onHhExport,
-  onHhImport,
-  hhBeep,
-  onHhBeepChange,
-  hhLastEvent,
+  projectorDemo,
+  handheldCapture,
+  handheldRough,
 }) {
   return (
     <div className="flex h-screen shrink-0">
@@ -369,39 +351,6 @@ export default function Sidebar({
               />
 
               {/* Panel-specific content */}
-              {activePanel === 'handheldscan' && (
-                <HandheldScanPanel
-                  isConnected={isConnected}
-                  sdrConnected={sdrConnected}
-                  sfcwRunning={sfcwRunning}
-                  pose={handheldPose}
-                  scanData={hhScanData}
-                  scanCapturing={hhScanCapturing}
-                  captureProgress={hhCaptureProgress}
-                  params={hhScanParams}
-                  onParamsChange={onHhScanParamsChange}
-                  avgCount={hhAvgCount}
-                  onAvgCountChange={onHhAvgCountChange}
-                  autoCapture={hhAutoCapture}
-                  onStart={onHhStart}
-                  onPause={onHhPause}
-                  onStop={onHhStop}
-                  onCapture={onHhCapture}
-                  onCaptureAt={onHhCapture}
-                  onRecapture={onHhRecapture}
-                  onClearCell={onHhClearCell}
-                  onClear={onHhClear}
-                  onExport={onHhExport}
-                  onImport={onHhImport}
-                  origin={handheldOrigin}
-                  onSetOrigin={onHhSetOrigin}
-                  beep={hhBeep}
-                  onBeepChange={onHhBeepChange}
-                  lastEvent={hhLastEvent}
-                  lidarMm={lidarMm}
-                  lidarOffsetMm={lidarOffsetMm}
-                />
-              )}
               {activePanel === 'handheld' && (
                 <HandheldPanel
                   isConnected={isConnected}
@@ -650,6 +599,29 @@ export default function Sidebar({
                   onDetectModeChange={onSarDetectModeChange}
                   onColormapChange={onSarColormapChange}
                   onScanAction={onBscanAction}
+                />
+              )}
+              {activePanel === 'projdemo' && (
+                <ProjectorDemoPanel
+                  demo={projectorDemo}
+                  roverConnected={roverConnected}
+                  roverStatus={roverStatus}
+                  isConnected={isConnected}
+                  handheldPose={handheldPose}
+                  handheldOrigin={handheldOrigin}
+                  onHandheldOriginChange={onHandheldOriginChange}
+                />
+              )}
+              {activePanel === 'hhcapture' && handheldCapture && (
+                <HandheldCapturePanel
+                  capture={handheldCapture}
+                  rough={handheldRough}
+                  isConnected={isConnected}
+                  sdrConnected={sdrConnected}
+                  sfcwRunning={sfcwRunning}
+                  handheldPose={handheldPose}
+                  handheldOrigin={handheldOrigin}
+                  onHandheldOriginChange={onHandheldOriginChange}
                 />
               )}
               {activePanel === 'map' && (

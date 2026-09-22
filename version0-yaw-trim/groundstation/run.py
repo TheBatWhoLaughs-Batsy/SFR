@@ -34,7 +34,7 @@ def main():
     npm_cmd = 'npm.cmd' if IS_WINDOWS else 'npm'
 
     print('[run] starting Flask backend on http://localhost:5000')
-    backend = subprocess.Popen([sys.executable, 'app.py'], cwd=ROOT)
+    backend = subprocess.Popen([sys.executable, 'app.py', '--debug'], cwd=ROOT)
 
     print('[run] starting Vite dev server on http://localhost:5173')
     frontend = subprocess.Popen([npm_cmd, 'run', 'dev'], cwd=FRONTEND_DIR)
