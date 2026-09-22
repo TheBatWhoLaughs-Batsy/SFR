@@ -538,6 +538,16 @@ function YawAuto({ yaw, onZero, onHoldStandoff, onInvert, onStandoffInvert, disa
           IMU stale — holding the last alpha, not steering.
         </span>
       )}
+      {!imuStale && yaw?.state === 'stationary' && (
+        <span className="text-[10px] text-[#777] text-center">
+          Parked — alpha follows the heading; the bias only learns while driving along X.
+        </span>
+      )}
+      {!imuStale && yaw?.state === 'no_reference' && (
+        <span className="text-[10px] text-[#a06a2a] text-center">
+          No heading reference — press re-zero heading.
+        </span>
+      )}
       {track && lidarStale && (
         <span className="text-[10px] text-[#a06a2a] text-center">
           LiDAR stale — holding heading only, distance is not being corrected.

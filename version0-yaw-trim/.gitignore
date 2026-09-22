@@ -19,3 +19,13 @@ data/
 recordings/
 pi/sensors/imu_cal.json
 groundstation/models
+pi/rover/rover_state.json
+groundstation/frontend/bench/out-*.json
+
+# secrets / personal
+id_raspi
+rover/secrets.h
+id_raspi.pub
+
+# scan sets (large, kept outside git)
+*.rar

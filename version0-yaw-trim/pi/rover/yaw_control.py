@@ -119,6 +119,8 @@ class YawController:
         self.d_err = 0.0              # standoff error, mm
         self._standoff_seq = None
         self._outliers = 0
+        self._last_dir = 1.0          # sign of the last X travel; used while parked
+        self.state = 'manual'         # why alpha is / is not moving, for the panel
         self._last_update = None
         self._last_sent = None
         self._last_sent_ts = None
@@ -227,6 +229,7 @@ class YawController:
     def snapshot(self, now=None):
         return {
             'mode': self.mode,
+            'state': self.state if self.mode != MODE_MANUAL else 'manual',
             'alpha': int(round(self.alpha)),
             'alpha_raw': round(self.alpha, 2),
             'bias': round(self.bias, 2),
@@ -249,20 +252,28 @@ class YawController:
     def update(self, x_speed_mm_s, now=None):
         """Advance the controller. Returns the integer alpha to send to the
         board, or None if nothing should be sent (manual, sensor stale,
-        stationary, unchanged, or inside the send interval)."""
+        unchanged, or inside the send interval).
+
+        Stationary, the error and the proportional term stay LIVE (so alpha
+        follows the heading and is already right when the traverse starts), but
+        the integrator is frozen: a parked rover cannot turn, so learning bias
+        from its error would only wind up. Direction while stationary is the
+        last direction travelled (forward before any travel)."""
         if self.mode == MODE_MANUAL:
+            self.state = 'manual'
             return None
         now = time.monotonic() if now is None else now
         if not self.imu_ok(now) or self.yaw_ref is None:
             self._last_update = None          # never steer on a dead sensor
+            self.state = 'imu_stale' if self.yaw_ref is not None else 'no_reference'
             return None
-        if abs(x_speed_mm_s) < self.min_speed:
-            self._last_update = None          # stationary: hold, learn nothing
-            return None
+        moving = abs(x_speed_mm_s) >= self.min_speed
+        if moving:
+            self._last_dir = 1.0 if x_speed_mm_s > 0 else -1.0
+        travel = self._last_dir
+        self.state = 'moving' if moving else 'stationary'
 
-        d = 1.0 if x_speed_mm_s > 0 else -1.0
-        if self.invert:
-            d = -d
+        d = -travel if self.invert else travel
 
         # ---- outer loop: how far off the wall are we, and which way to lean
         self.psi = 0.0
@@ -272,7 +283,6 @@ class YawController:
             s = -1.0 if self.standoff_invert else 1.0
             # dir appears here for the heading->lateral relationship, separately
             # from its appearance below for the alpha->heading relationship.
-            travel = 1.0 if x_speed_mm_s > 0 else -1.0
             self.psi = clamp(-self.kd * de * travel * s, -self.psi_max, self.psi_max)
         else:
             self.d_err = 0.0
@@ -282,11 +292,14 @@ class YawController:
         e = self.error if abs(self.error) > self.deadband else 0.0
         drive = e * d
 
-        if self._last_update is not None:
-            dt = clamp(now - self._last_update, 0.0, 0.5)
-            self.bias = clamp(self.bias + self.ki * drive * dt,
-                              -self.ALPHA_MAX, self.ALPHA_MAX)
-        self._last_update = now
+        if moving:
+            if self._last_update is not None:
+                dt = clamp(now - self._last_update, 0.0, 0.5)
+                self.bias = clamp(self.bias + self.ki * drive * dt,
+                                  -self.ALPHA_MAX, self.ALPHA_MAX)
+            self._last_update = now
+        else:
+            self._last_update = None          # integrator frozen while parked
 
         self.alpha = clamp(self.kp * drive + self.bias, -self.ALPHA_MAX, self.ALPHA_MAX)
         out = int(round(self.alpha))
